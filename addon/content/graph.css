@@ -1,0 +1,247 @@
+.citation-map-window-mount {
+  display: flex;
+  flex: 1;
+  width: 100%;
+  min-width: 720px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.citation-map-window-loading {
+  margin: 24px;
+  color: var(--fill-secondary, rgba(0, 0, 0, 0.55));
+  font: menu;
+}
+
+.citation-map-root {
+  --cm-background: var(--color-background, #ffffff);
+  --cm-surface: var(--color-background, #ffffff);
+  --cm-surface-secondary: var(--color-sidepane, #f2f2f2);
+  --cm-toolbar: var(--color-toolbar, #f9f9f9);
+
+  --cm-text-primary: var(--fill-primary, rgba(0, 0, 0, 0.85));
+  --cm-text-secondary: var(--fill-secondary, rgba(0, 0, 0, 0.55));
+  --cm-text-tertiary: var(--fill-tertiary, rgba(0, 0, 0, 0.35));
+
+  --cm-border: var(--color-border, rgba(0, 0, 0, 0.15));
+  --cm-border-subtle: var(--color-border50, rgba(0, 0, 0, 0.08));
+  --cm-accent: var(--accent-blue, #4072e5);
+  --cm-input-background: var(--color-control, #ffffff);
+
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  min-width: 720px;
+  min-height: 0;
+  overflow: hidden;
+
+  color-scheme: light;
+  color: var(--cm-text-primary);
+  background: var(--cm-background);
+
+  font-family:
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  .citation-map-root {
+    --cm-background: var(--color-background, #1e1e1e);
+    --cm-surface: var(--color-background, #1e1e1e);
+    --cm-surface-secondary: var(--color-sidepane, #303030);
+    --cm-toolbar: var(--color-toolbar, #272727);
+
+    --cm-text-primary: var(--fill-primary, rgba(255, 255, 255, 0.9));
+    --cm-text-secondary: var(--fill-secondary, rgba(255, 255, 255, 0.55));
+    --cm-text-tertiary: var(--fill-tertiary, rgba(255, 255, 255, 0.3));
+
+    --cm-border: var(--color-border, rgba(255, 255, 255, 0.18));
+    --cm-border-subtle: var(--color-border50, rgba(255, 255, 255, 0.09));
+    --cm-accent: var(--accent-blue, #66adff);
+    --cm-input-background: var(--color-sidepane, #303030);
+
+    color-scheme: dark;
+  }
+}
+
+.citation-map-root,
+.citation-map-root * {
+  box-sizing: border-box;
+}
+
+.citation-map-root input {
+  color: inherit;
+  font: inherit;
+}
+
+.citation-map-root .cm-page-header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+
+  padding: 14px 20px;
+
+  background: var(--cm-toolbar);
+  border-bottom: 1px solid var(--cm-border);
+}
+
+.citation-map-root .cm-heading-group {
+  min-width: 0;
+}
+
+.citation-map-root .cm-title-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.citation-map-root .cm-title-icon {
+  width: 24px;
+  height: 24px;
+  flex: none;
+}
+
+.citation-map-root h1,
+.citation-map-root h2,
+.citation-map-root p {
+  margin-top: 0;
+}
+
+.citation-map-root h1 {
+  margin-bottom: 3px;
+  font-size: 23px;
+}
+
+.citation-map-root .cm-subtitle {
+  margin-bottom: 2px;
+  overflow: hidden;
+  color: var(--cm-text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.citation-map-root .cm-statistics-summary {
+  margin-bottom: 0;
+  color: var(--cm-text-tertiary);
+  font-size: 12px;
+}
+
+.citation-map-root .cm-header-actions {
+  display: grid;
+  flex: 0 1 420px;
+  gap: 4px;
+  min-width: 260px;
+}
+
+.citation-map-root .cm-search-input {
+  width: 100%;
+  padding: 7px 10px;
+
+  color: var(--cm-text-primary);
+  background: var(--cm-input-background);
+  border: 1px solid var(--cm-border);
+  border-radius: 6px;
+}
+
+.citation-map-root .cm-search-input::placeholder {
+  color: var(--cm-text-secondary);
+}
+
+.citation-map-root .cm-search-input:focus {
+  border-color: var(--cm-accent);
+  outline: 2px solid color-mix(in srgb, var(--cm-accent) 25%, transparent);
+}
+
+.citation-map-root .cm-search-status {
+  min-height: 16px;
+  color: var(--cm-text-secondary);
+  font-size: 12px;
+  text-align: right;
+}
+
+.citation-map-root .cm-main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  padding: 14px;
+  background: var(--cm-background);
+}
+
+.citation-map-root .cm-graph-shell {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+
+  background: var(--cm-surface);
+  border: 1px solid var(--cm-border);
+  border-radius: 8px;
+}
+
+.citation-map-root .cm-graph-surface {
+  position: relative;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  outline: none;
+
+  background-image:
+    linear-gradient(var(--cm-border-subtle) 1px, transparent 1px),
+    linear-gradient(90deg, var(--cm-border-subtle) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.citation-map-root .cm-graph-surface:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--cm-accent);
+}
+
+.citation-map-root .cm-graph-empty-state {
+  max-width: 480px;
+  padding: 24px;
+  text-align: center;
+
+  background: color-mix(in srgb, var(--cm-surface-secondary) 88%, transparent);
+  border: 1px solid var(--cm-border);
+  border-radius: 10px;
+  backdrop-filter: blur(4px);
+}
+
+.citation-map-root .cm-graph-empty-state h2 {
+  margin-bottom: 8px;
+  font-size: 18px;
+}
+
+.citation-map-root .cm-graph-empty-state p {
+  margin-bottom: 0;
+  color: var(--cm-text-secondary);
+}
+
+@media (max-width: 900px) {
+  .citation-map-root .cm-page-header {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .citation-map-root .cm-header-actions {
+    flex-basis: auto;
+    min-width: 0;
+  }
+
+  .citation-map-root .cm-search-status {
+    text-align: left;
+  }
+}

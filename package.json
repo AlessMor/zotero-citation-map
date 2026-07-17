@@ -1,20 +1,20 @@
 {
-  "name": "zotero-plugin-template",
+  "name": "zotero-citation-map",
   "type": "module",
-  "version": "3.1.0",
-  "description": "Zotero Plugin Template",
+  "version": "0.1.0",
+  "description": "Zotero Citation Map",
   "config": {
-    "addonName": "Zotero Plugin Template",
-    "addonID": "addontemplate@euclpts.com",
-    "addonRef": "addontemplate",
-    "addonInstance": "AddonTemplate",
-    "prefsPrefix": "extensions.zotero.addontemplate"
+    "addonName": "Zotero Citation Map",
+    "addonID": "citation-map@alessmor",
+    "addonRef": "citationmap",
+    "addonInstance": "CitationMap",
+    "prefsPrefix": "extensions.zotero.citationmap"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/windingwind/zotero-plugin-template.git"
   },
-  "author": "windingwind",
+  "author": "AlessMor",
   "bugs": {
     "url": "https://github.com/windingwind/zotero-plugin-template/issues"
   },
@@ -42,7 +42,7 @@
     "mocha": "^11.7.5",
     "prettier": "^3.7.4",
     "typescript": "^5.9.3",
-    "zotero-plugin-scaffold": "^0.8.2",
+    "zotero-plugin-scaffold": "^0.8.7",
     "zotero-types": "^4.1.0-beta.4"
   },
   "prettier": {

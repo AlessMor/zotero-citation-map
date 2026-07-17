@@ -1,11 +1,35 @@
-item-section-example1-head-text =
-    .label = Plugin Template: Item Info
-item-section-example1-sidenav-tooltip =
-    .tooltiptext = This is Plugin Template section (item info)
-item-section-example2-head-text =
-    .label = Plugin Template: Reader [{$status}]
-item-section-example2-sidenav-tooltip =
-    .tooltiptext = This is Plugin Template section (reader)
-item-section-example2-button-tooltip =
-    .tooltiptext = Unregister this section
-item-info-row-example-label = Example Row
+tools-submenu =
+    .label = Citation Map
+
+open-command =
+    .label = Open Citation Map
+
+update-library-command =
+    .label = Update citation and reference counts for whole library
+
+update-items-command =
+    .label = Update citation and reference counts
+
+automatic-updates-command =
+    .label = { $marker }Automatic citation updates
+
+provider-submenu =
+    .label = Citation data provider
+
+provider-auto-command =
+    .label = { $marker }Automatic (recommended)
+
+provider-openalex-command =
+    .label = { $marker }OpenAlex
+
+provider-semantic-scholar-command =
+    .label = { $marker }Semantic Scholar
+
+provider-crossref-command =
+    .label = { $marker }Crossref
+
+provider-opencitations-command =
+    .label = { $marker }OpenCitations
+
+provider-inspire-command =
+    .label = { $marker }INSPIRE-HEP

@@ -1,5 +1,4 @@
 import { config } from "../package.json";
-import { ColumnOptions, DialogHelper } from "zotero-plugin-toolkit";
 import hooks from "./hooks";
 import { createZToolkit } from "./utils/ztoolkit";
 
@@ -7,24 +6,24 @@ class Addon {
   public data: {
     alive: boolean;
     config: typeof config;
-    // Env type, see build.js
     env: "development" | "production";
-    initialized?: boolean;
+    initialized: boolean;
     ztoolkit: ZToolkit;
+
+    /** Zotero tab containing Citation Map. */
+    graphTabID: string | null;
+
+    /** Optional detached Citation Map window. */
+    graphWindow: Window | null;
+
     locale?: {
       current: any;
     };
-    prefs?: {
-      window: Window;
-      columns: Array<ColumnOptions>;
-      rows: Array<{ [dataKey: string]: string }>;
-    };
-    dialog?: DialogHelper;
   };
-  // Lifecycle hooks
+
   public hooks: typeof hooks;
-  // APIs
-  public api: object;
+
+  public api: Record<string, unknown>;
 
   constructor() {
     this.data = {
@@ -33,7 +32,10 @@ class Addon {
       env: __env__,
       initialized: false,
       ztoolkit: createZToolkit(),
+      graphTabID: null,
+      graphWindow: null,
     };
+
     this.hooks = hooks;
     this.api = {};
   }

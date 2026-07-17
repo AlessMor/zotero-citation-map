@@ -1,0 +1,33 @@
+@namespace html url("http://www.w3.org/1999/xhtml");
+
+.citation-map-preferences {
+  max-width: 760px;
+}
+
+.citation-map-preferences description {
+  margin: 0 0 12px;
+  line-height: 1.45;
+}
+
+.citation-map-pref-row {
+  gap: 12px;
+  margin: 8px 0 4px;
+}
+
+.citation-map-pref-row html|label {
+  min-width: 190px;
+}
+
+.citation-map-pref-row menulist {
+  min-width: 230px;
+}
+
+.citation-map-pref-row html|input[type="number"] {
+  width: 88px;
+}
+
+.citation-map-pref-help {
+  max-width: 680px;
+  color: var(--fill-secondary, rgba(0, 0, 0, 0.58));
+  font-size: 0.95em;
+}

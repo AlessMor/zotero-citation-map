@@ -1,3 +1,7 @@
-.makeItRed {
-  background-color: tomato;
+/* Citation Map icon used by Zotero's tab bar and tab-list menu. */
+.icon-item-type[data-item-type="citation-map-network"] {
+  background-image: url("chrome://citationmap/content/icons/network.svg") !important;
+  background-position: center !important;
+  background-repeat: no-repeat !important;
+  background-size: contain !important;
 }

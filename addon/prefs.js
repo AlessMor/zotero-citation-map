@@ -1,2 +1,3 @@
-pref("enable", true);
-pref("input", "This is input");
+pref("provider", "auto");
+pref("automaticUpdates", true);
+pref("cacheDays", 30);

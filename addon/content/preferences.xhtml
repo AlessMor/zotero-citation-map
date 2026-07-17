@@ -1,33 +1,73 @@
 <linkset>
   <html:link rel="localization" href="__addonRef__-preferences.ftl" />
-</linkset>
-<groupbox
-  onload="Zotero.__addonInstance__.hooks.onPrefsEvent('load', { window })"
->
-  <label><html:h2 data-l10n-id="pref-title"></html:h2></label>
-  <checkbox
-    id="zotero-prefpane-__addonRef__-enable"
-    preference="enable"
-    data-l10n-id="pref-enable"
+  <html:link
+    rel="stylesheet"
+    href="chrome://__addonRef__/content/preferences.css"
   />
-  <hbox>
+</linkset>
+
+<groupbox class="citation-map-preferences">
+  <label>
+    <html:h2 data-l10n-id="pref-citation-data-heading"></html:h2>
+  </label>
+
+  <description data-l10n-id="pref-citation-data-description" />
+
+  <checkbox
+    id="zotero-prefpane-__addonRef__-automatic-updates"
+    preference="automaticUpdates"
+    data-l10n-id="pref-automatic-updates"
+  />
+
+  <hbox class="citation-map-pref-row" align="center">
     <html:label
-      for="zotero-prefpane-__addonRef__-input"
-      data-l10n-id="pref-input"
+      for="zotero-prefpane-__addonRef__-provider"
+      data-l10n-id="pref-provider"
+    ></html:label>
+    <menulist
+      id="zotero-prefpane-__addonRef__-provider"
+      preference="provider"
+      native="true"
+    >
+      <menupopup>
+        <menuitem value="auto" data-l10n-id="pref-provider-auto" />
+        <menuitem value="openalex" data-l10n-id="pref-provider-openalex" />
+        <menuitem
+          value="semantic-scholar"
+          data-l10n-id="pref-provider-semantic-scholar"
+        />
+        <menuitem value="crossref" data-l10n-id="pref-provider-crossref" />
+        <menuitem
+          value="opencitations"
+          data-l10n-id="pref-provider-opencitations"
+        />
+        <menuitem value="inspire" data-l10n-id="pref-provider-inspire" />
+      </menupopup>
+    </menulist>
+  </hbox>
+
+  <description
+    class="citation-map-pref-help"
+    data-l10n-id="pref-provider-help"
+  />
+
+  <hbox class="citation-map-pref-row" align="center">
+    <html:label
+      for="zotero-prefpane-__addonRef__-cache-days"
+      data-l10n-id="pref-cache-days"
     ></html:label>
     <html:input
-      type="text"
-      id="zotero-prefpane-__addonRef__-input"
-      preference="input"
-    ></html:input>
+      id="zotero-prefpane-__addonRef__-cache-days"
+      type="number"
+      min="1"
+      max="3650"
+      step="1"
+      preference="cacheDays"
+    />
   </hbox>
-  <hbox class="virtualized-table-container" flex="1" height="300px">
-    <html:div id="__addonRef__-table-container" />
-  </hbox>
+
+  <description
+    class="citation-map-pref-help"
+    data-l10n-id="pref-reference-count-note"
+  />
 </groupbox>
-<vbox>
-  <html:label
-    data-l10n-id="pref-help"
-    data-l10n-args='{"time": "__buildTime__","name": "__addonName__","version":"__buildVersion__"}'
-  ></html:label>
-</vbox>

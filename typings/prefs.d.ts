@@ -7,8 +7,9 @@
 declare namespace _ZoteroTypes {
   interface Prefs {
     PluginPrefsMap: {
-      "enable": boolean;
-      "input": string;
+      "provider": string;
+      "automaticUpdates": boolean;
+      "cacheDays": number;
     };
   }
 }
