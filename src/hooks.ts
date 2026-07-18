@@ -124,45 +124,16 @@ async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
             candidate !== win && !(candidate as any).closed,
         );
         if (otherOpenMainWindows.length === 0) {
+          // Do not enumerate or close Zotero-owned auxiliary windows here.
+          // Zotero maintains its own hidden application window on Windows;
+          // closing it from a plugin can leave a small orphan window and keep
+          // the Zotero process alive after the main window is closed.
           beginRuntimeTeardown(false);
-          closeAuxiliaryWindowsAtAppShutdown(win);
         } else {
           closeCitationMapWindow();
         }
       },
       { once: true },
-    );
-  }
-}
-
-function closeAuxiliaryWindowsAtAppShutdown(
-  closingWindow: _ZoteroTypes.MainWindow,
-): void {
-  try {
-    const enumerator = (globalThis as any).Services?.wm?.getEnumerator?.(null);
-    if (!enumerator) {
-      return;
-    }
-
-    const windows: Window[] = [];
-    while (enumerator.hasMoreElements()) {
-      windows.push(enumerator.getNext() as Window);
-    }
-
-    for (const candidate of windows) {
-      if (!candidate || candidate === closingWindow || candidate.closed) {
-        continue;
-      }
-
-      try {
-        candidate.close();
-      } catch {
-        // Zotero may already be tearing down this auxiliary window.
-      }
-    }
-  } catch (error) {
-    Zotero.debug(
-      `Citation Map: auxiliary-window shutdown sweep failed: ${error}`,
     );
   }
 }
@@ -179,8 +150,9 @@ async function onMainWindowUnload(win: _ZoteroTypes.MainWindow): Promise<void> {
     Zotero.debug(
       "Citation Map: last main window unloading; beginning teardown",
     );
+    // Only tear down Citation Map resources. Zotero owns every other
+    // top-level/hidden window and must close them through its normal shutdown.
     beginRuntimeTeardown(false);
-    closeAuxiliaryWindowsAtAppShutdown(win);
   } else {
     closeCitationMapWindow();
   }

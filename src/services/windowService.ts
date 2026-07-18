@@ -9,6 +9,7 @@ import { loadWholeLibrary } from "./zoteroLibraryService";
 const TAB_TYPE = "citationmap";
 const TAB_STATE_FILTER_MARKER = "__citationMapStateFilterInstalled";
 const WINDOW_MOUNT_ID = "citation-map-window-mount";
+const LEGACY_GRAPH_URI = `chrome://${config.addonRef}/content/graph.xhtml`;
 const NETWORK_ICON_TYPE = "citation-map-network";
 
 function getDefaultMainWindow(): _ZoteroTypes.MainWindow {
@@ -247,15 +248,15 @@ function closeEnumeratedPluginWindows(): void {
         const document = candidate.document;
         const root = document?.documentElement;
         const windowType = root?.getAttribute?.("windowtype") ?? "";
-        const title = String(
-          document?.title ?? root?.getAttribute?.("title") ?? "",
-        ).trim();
+        const documentURI = String(document?.documentURI ?? "");
         const isCitationMapWindow =
           windowType === "citationmap:window" ||
+          documentURI.startsWith(LEGACY_GRAPH_URI) ||
           Boolean(document?.getElementById?.(WINDOW_MOUNT_ID));
-        const isCitationMapProgressWindow = title === config.addonName;
 
-        if (isCitationMapWindow || isCitationMapProgressWindow) {
+        // Never close a window based on its title alone. In particular, do not
+        // touch Zotero's own hidden or auxiliary application windows.
+        if (isCitationMapWindow) {
           candidate.close();
         }
       } catch {
@@ -278,6 +279,20 @@ export function closeCitationMapWindow(closeTab = true): void {
   const tabID = addon.data.graphTabID;
 
   if (!closeTab) {
+    // The main Zotero window is already closing. Destroy the graph renderer and
+    // its observers, but do not call Zotero_Tabs.close() during native teardown.
+    if (tabID) {
+      for (const mainWindow of Zotero.getMainWindows()) {
+        try {
+          const container = getTabs(mainWindow).getTabContent(tabID);
+          if (container) {
+            destroyCitationMapView(container);
+          }
+        } catch {
+          // The main window or tab content may already be unloading.
+        }
+      }
+    }
     addon.data.graphTabID = null;
     closeEnumeratedPluginWindows();
     return;
