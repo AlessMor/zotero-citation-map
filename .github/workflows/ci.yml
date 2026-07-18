@@ -17,8 +17,6 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      NPM_CONFIG_STRICT_ALLOW_SCRIPTS: "true"
 
     steps:
       - name: Check out repository
@@ -32,7 +30,17 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Pin npm
+        run: npm install --global npm@11.18.0
+
+      - name: Show tool versions
+        run: |
+          node --version
+          npm --version
+
       - name: Install locked dependencies
+        env:
+          NPM_CONFIG_STRICT_ALLOW_SCRIPTS: "false"
         run: npm ci
 
       - name: Verify and build
