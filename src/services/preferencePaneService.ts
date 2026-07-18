@@ -18,7 +18,7 @@ export async function registerCitationMapPreferencePane(): Promise<void> {
     pluginID: config.addonID,
     src: rootURI + "content/preferences.xhtml",
     label: config.addonName,
-    image: rootURI + "content/icons/network.svg",
+    image: `chrome://${config.addonRef}/content/icons/network.svg`,
   });
 
   automaticObserverID = Zotero.Prefs.registerObserver(

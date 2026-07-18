@@ -25,7 +25,7 @@ const MAIN_WINDOW_TEARDOWN_MARKER = `__${config.addonRef}RuntimeTeardownListener
 
 let runtimeTeardownStarted = false;
 
-function beginRuntimeTeardown(): void {
+function beginRuntimeTeardown(closeGraphTab = true): void {
   if (runtimeTeardownStarted) {
     return;
   }
@@ -43,7 +43,7 @@ function beginRuntimeTeardown(): void {
     Zotero.debug(`Citation Map: preference cleanup failed: ${error}`);
   }
   try {
-    closeCitationMapWindow();
+    closeCitationMapWindow(closeGraphTab);
   } catch (error) {
     Zotero.debug(`Citation Map: window cleanup failed: ${error}`);
   }
@@ -56,20 +56,6 @@ function beginRuntimeTeardown(): void {
     unregisterCitationColumns();
   } catch (error) {
     Zotero.debug(`Citation Map: column cleanup failed: ${error}`);
-  }
-}
-
-function handleMainWindowClosing(win: _ZoteroTypes.MainWindow): void {
-  const otherOpenMainWindows = Zotero.getMainWindows().filter(
-    (candidate: _ZoteroTypes.MainWindow) =>
-      candidate !== win && !(candidate as any).closed,
-  );
-
-  if (otherOpenMainWindows.length === 0) {
-    Zotero.debug("Citation Map: last main window closing; beginning teardown");
-    beginRuntimeTeardown();
-  } else {
-    closeCitationMapWindow();
   }
 }
 
@@ -130,21 +116,74 @@ async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
   const runtimeWindow = win as any;
   if (!runtimeWindow[MAIN_WINDOW_TEARDOWN_MARKER]) {
     runtimeWindow[MAIN_WINDOW_TEARDOWN_MARKER] = true;
-    // The direct listeners run before a dependent progress window can become
-    // Zotero's final top-level window. The scaffold hook below remains as a
-    // second, idempotent cleanup path.
-    win.addEventListener("close", () => handleMainWindowClosing(win), {
-      once: true,
-    });
-    win.addEventListener("unload", () => handleMainWindowClosing(win), {
-      once: true,
-    });
+    win.addEventListener(
+      "close",
+      () => {
+        const otherOpenMainWindows = Zotero.getMainWindows().filter(
+          (candidate: _ZoteroTypes.MainWindow) =>
+            candidate !== win && !(candidate as any).closed,
+        );
+        if (otherOpenMainWindows.length === 0) {
+          beginRuntimeTeardown(false);
+          closeAuxiliaryWindowsAtAppShutdown(win);
+        } else {
+          closeCitationMapWindow();
+        }
+      },
+      { once: true },
+    );
+  }
+}
+
+function closeAuxiliaryWindowsAtAppShutdown(
+  closingWindow: _ZoteroTypes.MainWindow,
+): void {
+  try {
+    const enumerator = (globalThis as any).Services?.wm?.getEnumerator?.(null);
+    if (!enumerator) {
+      return;
+    }
+
+    const windows: Window[] = [];
+    while (enumerator.hasMoreElements()) {
+      windows.push(enumerator.getNext() as Window);
+    }
+
+    for (const candidate of windows) {
+      if (!candidate || candidate === closingWindow || candidate.closed) {
+        continue;
+      }
+
+      try {
+        candidate.close();
+      } catch {
+        // Zotero may already be tearing down this auxiliary window.
+      }
+    }
+  } catch (error) {
+    Zotero.debug(
+      `Citation Map: auxiliary-window shutdown sweep failed: ${error}`,
+    );
   }
 }
 
 async function onMainWindowUnload(win: _ZoteroTypes.MainWindow): Promise<void> {
-  // Idempotent fallback for hosts where the direct close listener is skipped.
-  handleMainWindowClosing(win);
+  // Start synchronous teardown before Zotero begins destroying the last main
+  // window. This cancels requests and closes plugin-owned top-level windows
+  // without waiting for the later asynchronous add-on shutdown hook.
+  const otherOpenMainWindows = Zotero.getMainWindows().filter(
+    (candidate: _ZoteroTypes.MainWindow) =>
+      candidate !== win && !(candidate as any).closed,
+  );
+  if (otherOpenMainWindows.length === 0) {
+    Zotero.debug(
+      "Citation Map: last main window unloading; beginning teardown",
+    );
+    beginRuntimeTeardown(false);
+    closeAuxiliaryWindowsAtAppShutdown(win);
+  } else {
+    closeCitationMapWindow();
+  }
   win.document.getElementById(MAIN_WINDOW_STYLESHEET_ID)?.remove();
 }
 

@@ -1,8 +1,10 @@
 import { config } from "../../package.json";
 import type { CitationMetricSummary } from "../domain/citationTypes";
+import type { GraphAxisMetric } from "../domain/graphTypes";
 import type { CitationDerivedAnalytics } from "./citationAnalyticsService";
 import { getItemCitationAnalytics } from "./citationAnalyticsService";
 import { getItemCitationMetrics } from "./citationMetricsStore";
+import { graphMetricDescription } from "./graphMetricDefinitions";
 
 const registeredDataKeys: string[] = [];
 const VALUE_SEPARATOR = "\u001f";
@@ -22,7 +24,7 @@ interface ColumnSpec {
   kind: ColumnKind;
   decimals?: number;
   value: (context: ColumnContext) => ColumnValue;
-  title?: (context: ColumnContext, display: string) => string;
+  metric?: GraphAxisMetric;
   primary?: boolean;
 }
 
@@ -69,9 +71,10 @@ function encodeCell(spec: ColumnSpec, item: Zotero.Item): string {
   const value = spec.value(context);
   if (value === null || !Number.isFinite(value)) return "";
   const display = formatValue(value, spec.kind, spec.decimals);
+  const description = spec.metric ? graphMetricDescription(spec.metric) : null;
   const encoded: EncodedCell = {
     display,
-    title: spec.title?.(context, display) ?? display,
+    title: description ? `${description}\nValue: ${display}` : display,
   };
   return `${floatSortKey(value)}${VALUE_SEPARATOR}${JSON.stringify(encoded)}`;
 }
@@ -104,6 +107,20 @@ function renderCell(
   return span;
 }
 
+function escapeHTMLAttribute(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function columnHTMLLabel(spec: ColumnSpec): string | undefined {
+  const description = spec.metric ? graphMetricDescription(spec.metric) : null;
+  if (!description) return undefined;
+  return `<span title="${escapeHTMLAttribute(description)}">${spec.label} <span aria-hidden="true">ⓘ</span></span>`;
+}
+
 const COLUMN_SPECS: ColumnSpec[] = [
   {
     dataKey: "citationCount",
@@ -124,32 +141,29 @@ const COLUMN_SPECS: ColumnSpec[] = [
   {
     dataKey: "libraryCoverage",
     label: "Library Coverage",
-    width: 112,
+    width: 124,
     kind: "percentage",
     decimals: 1,
+    metric: "library-coverage",
     value: ({ analytics }) => analytics?.libraryCoverage ?? null,
-    title: (_context, display) =>
-      `${display} of declared references connect to items in this Zotero library`,
   },
   {
     dataKey: "citationVelocity",
     label: "Citation Velocity",
-    width: 116,
+    width: 128,
     kind: "decimal",
     decimals: 2,
+    metric: "citation-velocity",
     value: ({ metrics }) => metrics.citationVelocity,
-    title: (_context, display) =>
-      `${display} citations/year averaged over the last three complete years`,
   },
   {
     dataKey: "citationAcceleration",
     label: "Citation Acceleration",
-    width: 130,
+    width: 142,
     kind: "decimal",
     decimals: 2,
+    metric: "citation-acceleration",
     value: ({ metrics }) => metrics.citationAcceleration,
-    title: (_context, display) =>
-      `${display}: citations last complete year minus the preceding year`,
   },
 ];
 
@@ -159,6 +173,7 @@ export async function registerCitationColumns(): Promise<void> {
     const dataKey = await Zotero.ItemTreeManager.registerColumn({
       dataKey: spec.dataKey,
       label: spec.label,
+      htmlLabel: columnHTMLLabel(spec),
       pluginID: config.addonID,
       enabledTreeIDs: ["main"],
       width: String(spec.width),

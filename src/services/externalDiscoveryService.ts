@@ -13,6 +13,7 @@ export interface ExternalWork {
   citationCount: number | null;
   referenceCount: number | null;
   recommendationScore?: number;
+  citingNodeKeys?: string[];
 }
 
 interface OpenAlexWork {
@@ -28,6 +29,11 @@ interface OpenAlexWork {
 
 interface OpenAlexListResponse {
   results?: OpenAlexWork[];
+}
+
+interface RecommendationCandidate {
+  score: number;
+  citingNodeKeys: Set<string>;
 }
 
 const workCache = new Map<string, ExternalWork | null>();
@@ -121,7 +127,7 @@ export async function getExternalReferences(
     const embedded = metadataToExternal(reference);
     const resolved =
       embedded ??
-      (reference.providerWorkID
+      (record.provider === "openalex" && reference.providerWorkID
         ? await fetchOpenAlexWork(reference.providerWorkID)
         : null);
     if (resolved) results.push(resolved);
@@ -133,6 +139,7 @@ export async function getExternalCitedBy(
   node: CitationGraphNode,
   maximum = 50,
 ): Promise<ExternalWork[]> {
+  if (node.provider !== "openalex") return [];
   const id = shortID(node.providerWorkID);
   if (!id) return [];
   const select = [
@@ -156,37 +163,83 @@ export async function getExternalCitedBy(
 }
 
 export async function getMissingPaperRecommendations(
-  nodes: CitationGraphNode[],
+  visibleNodes: CitationGraphNode[],
+  libraryNodes: CitationGraphNode[],
   maximum = 25,
 ): Promise<ExternalWork[]> {
-  const localIDs = new Set(
-    nodes.map((node) => shortID(node.providerWorkID)).filter(Boolean),
+  const libraryOpenAlexIDs = new Set(
+    libraryNodes
+      .filter((node) => node.provider === "openalex")
+      .map((node) => shortID(node.providerWorkID))
+      .filter((id): id is string => Boolean(id)),
   );
-  const scores = new Map<string, number>();
-  for (const node of nodes) {
+  const libraryDOIs = new Set(
+    libraryNodes
+      .map((node) => normalizeDOI(node.doi))
+      .filter((doi): doi is string => Boolean(doi)),
+  );
+
+  const candidates = new Map<string, RecommendationCandidate>();
+  for (const node of visibleNodes) {
     const record = getCitationMetricRecord(
       Zotero.Libraries.userLibraryID,
       node.itemKey,
     );
-    if (!record) continue;
+    if (!record || record.provider !== "openalex") continue;
+
     const seenForPaper = new Set<string>();
     for (const reference of record.references) {
       const id = shortID(reference.providerWorkID);
-      if (!id || localIDs.has(id) || seenForPaper.has(id)) continue;
+      const doi = normalizeDOI(reference.doi);
+      if (
+        !id ||
+        libraryOpenAlexIDs.has(id) ||
+        (doi !== null && libraryDOIs.has(doi)) ||
+        seenForPaper.has(id)
+      ) {
+        continue;
+      }
       seenForPaper.add(id);
-      scores.set(id, (scores.get(id) ?? 0) + 1);
+      const candidate = candidates.get(id) ?? {
+        score: 0,
+        citingNodeKeys: new Set<string>(),
+      };
+      candidate.score += 1;
+      candidate.citingNodeKeys.add(node.key);
+      candidates.set(id, candidate);
     }
   }
 
-  const ranked = [...scores.entries()]
-    .sort((left, right) => right[1] - left[1])
-    .slice(0, maximum);
-  const results: ExternalWork[] = [];
-  for (const [id, score] of ranked) {
+  const shortlistSize = Math.max(maximum * 2, 40);
+  const shortlist = [...candidates.entries()]
+    .sort(
+      ([leftID, left], [rightID, right]) =>
+        right.score - left.score || leftID.localeCompare(rightID),
+    )
+    .slice(0, shortlistSize);
+
+  const resolved: ExternalWork[] = [];
+  for (const [id, candidate] of shortlist) {
     const work = await fetchOpenAlexWork(id);
-    if (work) results.push({ ...work, recommendationScore: score });
+    if (!work) continue;
+    const doi = normalizeDOI(work.doi);
+    if (doi && libraryDOIs.has(doi)) continue;
+    resolved.push({
+      ...work,
+      recommendationScore: candidate.score,
+      citingNodeKeys: [...candidate.citingNodeKeys],
+    });
   }
-  return results;
+
+  return resolved
+    .sort(
+      (left, right) =>
+        (right.recommendationScore ?? 0) - (left.recommendationScore ?? 0) ||
+        (right.citationCount ?? -1) - (left.citationCount ?? -1) ||
+        (right.year ?? -1) - (left.year ?? -1) ||
+        left.title.localeCompare(right.title),
+    )
+    .slice(0, maximum);
 }
 
 export async function importExternalWork(
@@ -194,8 +247,9 @@ export async function importExternalWork(
   libraryID: number,
   collectionIDs: number[] = [],
 ): Promise<Zotero.Item[]> {
-  if (!work.doi)
+  if (!work.doi) {
     throw new Error("This work has no DOI available for Zotero import.");
+  }
   const translate = new (Zotero.Translate as any).Search();
   translate.setIdentifier({ DOI: work.doi });
   const translators = await translate.getTranslators();

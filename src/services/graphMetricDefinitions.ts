@@ -26,8 +26,27 @@ const LABELS = new Map(
   GRAPH_AXIS_OPTIONS.map((option) => [option.metric, option.label]),
 );
 
+const DESCRIPTIONS = new Map<GraphAxisMetric, string>([
+  [
+    "library-coverage",
+    "Library coverage = references linked to items anywhere in this Zotero library / provider-declared reference count.",
+  ],
+  [
+    "citation-velocity",
+    "Citation velocity = [C(Y - 3) + C(Y - 2) + C(Y - 1)] / 3, where Y is the current calendar year and C(y) is citations received in year y.",
+  ],
+  [
+    "citation-acceleration",
+    "Citation acceleration = C(Y - 1) - C(Y - 2), where Y is the current calendar year and C(y) is citations received in year y.",
+  ],
+]);
+
 export function graphMetricLabel(metric: GraphAxisMetric): string {
   return LABELS.get(metric) ?? metric;
+}
+
+export function graphMetricDescription(metric: GraphAxisMetric): string | null {
+  return DESCRIPTIONS.get(metric) ?? null;
 }
 
 export function graphMetricValue(

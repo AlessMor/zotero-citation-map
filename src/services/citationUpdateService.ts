@@ -117,13 +117,17 @@ function createProgressWindow(
 
   try {
     const document = hostWindow.document;
+    const mount =
+      document.getElementById("zotero-pane") ??
+      document.getElementById("main-window") ??
+      document.documentElement;
     const root = createHtmlElement(document, "div");
     root.dataset.citationMapProgress = "true";
     root.setAttribute("role", "status");
     root.setAttribute("aria-live", "polite");
     Object.assign(root.style, {
-      position: "fixed",
-      insetInlineEnd: "18px",
+      position: "absolute",
+      right: "18px",
       bottom: "18px",
       zIndex: "2147483647",
       width: "min(380px, calc(100vw - 36px))",
@@ -136,6 +140,9 @@ function createProgressWindow(
       boxShadow: "0 8px 28px rgba(0, 0, 0, 0.28)",
       font: "menu",
       pointerEvents: "none",
+      display: "block",
+      visibility: "visible",
+      opacity: "1",
     });
 
     const heading = createHtmlElement(document, "div");
@@ -176,7 +183,14 @@ function createProgressWindow(
 
     track.appendChild(progressBar);
     root.append(heading, label, track);
-    document.documentElement.appendChild(root);
+    mount.appendChild(root);
+    hostWindow.requestAnimationFrame(() => {
+      if (root.isConnected) {
+        root.style.setProperty("display", "block", "important");
+        root.style.setProperty("visibility", "visible", "important");
+        root.style.setProperty("opacity", "1", "important");
+      }
+    });
 
     const card: UpdateProgressCard = {
       hostWindow,

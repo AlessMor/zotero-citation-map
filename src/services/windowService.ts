@@ -106,10 +106,25 @@ function renderTab(
 ): void {
   prepareTabContainer(container);
 
-  renderCitationMapView(mainWindow.document, container, snapshot, {
-    mode: "tab",
-    onSelectPaper: (itemID) => selectPaperInZotero(mainWindow, itemID),
-  });
+  let remainingAttempts = 10;
+  const render = (): void => {
+    if (mainWindow.closed) {
+      return;
+    }
+
+    if (!container?.isConnected && remainingAttempts > 0) {
+      remainingAttempts -= 1;
+      mainWindow.setTimeout(() => mainWindow.requestAnimationFrame(render), 50);
+      return;
+    }
+
+    renderCitationMapView(mainWindow.document, container, snapshot, {
+      mode: "tab",
+      onSelectPaper: (itemID) => selectPaperInZotero(mainWindow, itemID),
+    });
+  };
+
+  mainWindow.requestAnimationFrame(render);
 }
 
 function findExistingGraphTab(tabs: any): any | null {
@@ -252,7 +267,7 @@ function closeEnumeratedPluginWindows(): void {
   }
 }
 
-export function closeCitationMapWindow(): void {
+export function closeCitationMapWindow(closeTab = true): void {
   if (addon.data.graphWindow && !addon.data.graphWindow.closed) {
     addon.data.graphWindow.close();
   }
@@ -261,6 +276,12 @@ export function closeCitationMapWindow(): void {
   closeEnumeratedPluginWindows();
 
   const tabID = addon.data.graphTabID;
+
+  if (!closeTab) {
+    addon.data.graphTabID = null;
+    closeEnumeratedPluginWindows();
+    return;
+  }
 
   if (!tabID) {
     closeEnumeratedPluginWindows();

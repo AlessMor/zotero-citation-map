@@ -67,6 +67,15 @@ export interface CitationGraphRendererOptions {
   onOpenNode: (node: CitationGraphNode) => void | Promise<void>;
 }
 
+export interface CitationGraphGhostPreview {
+  key: string;
+  title: string;
+  year: number | null;
+  citationCount: number | null;
+  referenceCount: number | null;
+  sourceKeys: string[];
+}
+
 const DEFAULT_LAYOUT: GraphLayoutOptions = {
   xMetric: "none",
   xScale: "linear",
@@ -178,8 +187,8 @@ function createAxisDomain(
   };
 }
 
-function axisPosition(
-  node: LayoutNode,
+function axisPositionForValue(
+  value: number | null,
   domain: AxisDomain | null,
   minimum: number,
   maximum: number,
@@ -190,7 +199,6 @@ function axisPosition(
     return null;
   }
 
-  const value = graphMetricValue(node, domain.metric);
   if (value === null || !Number.isFinite(value)) {
     return missing;
   }
@@ -204,6 +212,24 @@ function axisPosition(
     ratio = 1 - ratio;
   }
   return minimum + ratio * (maximum - minimum);
+}
+
+function axisPosition(
+  node: LayoutNode,
+  domain: AxisDomain | null,
+  minimum: number,
+  maximum: number,
+  missing: number,
+  invert = false,
+): number | null {
+  return axisPositionForValue(
+    domain ? graphMetricValue(node, domain.metric) : null,
+    domain,
+    minimum,
+    maximum,
+    missing,
+    invert,
+  );
 }
 
 function axisValueAtRatio(domain: AxisDomain, ratio: number): number {
@@ -250,6 +276,7 @@ export class CitationGraphRenderer {
 
   private visibleKeys = new Set<string>();
   private searchMatches: Set<string> | null = null;
+  private ghostPreview: CitationGraphGhostPreview | null = null;
   private layout: GraphLayoutOptions = { ...DEFAULT_LAYOUT };
   private nodeSizeMetric: GraphNodeSizeMetric;
   private nodeLabelMode: GraphNodeLabelMode;
@@ -262,6 +289,10 @@ export class CitationGraphRenderer {
   private hoveredKey: string | null = null;
   private transform = { x: 0, y: 0, scale: 1 };
   private animationFrame: number | null = null;
+  private resizeFrame: number | null = null;
+  private resizeObserver: ResizeObserver | null = null;
+  private lastCanvasWidth = 0;
+  private lastCanvasHeight = 0;
   private alpha = 0;
   private destroyed = false;
 
@@ -350,8 +381,10 @@ export class CitationGraphRenderer {
     this.visibleKeys = new Set(this.nodes.map((node) => node.key));
     this.canvas.tabIndex = 0;
     this.bindEvents();
+    this.installResizeObserver();
     this.resizeCanvas();
     this.resetLayout(true);
+    this.schedulePostMountLayout();
   }
 
   destroy(): void {
@@ -360,6 +393,12 @@ export class CitationGraphRenderer {
       this.window.cancelAnimationFrame(this.animationFrame);
       this.animationFrame = null;
     }
+    if (this.resizeFrame !== null) {
+      this.window.cancelAnimationFrame(this.resizeFrame);
+      this.resizeFrame = null;
+    }
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
     this.window.removeEventListener("resize", this.resizeListener);
     this.hideTooltip();
   }
@@ -374,6 +413,13 @@ export class CitationGraphRenderer {
 
   setSearchMatches(keys: Iterable<string> | null): void {
     this.searchMatches = keys ? new Set(keys) : null;
+    this.draw();
+  }
+
+  setGhostPreview(preview: CitationGraphGhostPreview | null): void {
+    this.ghostPreview = preview
+      ? { ...preview, sourceKeys: [...preview.sourceKeys] }
+      : null;
     this.draw();
   }
 
@@ -972,6 +1018,86 @@ export class CitationGraphRenderer {
     }
   }
 
+  private installResizeObserver(): void {
+    const ResizeObserverConstructor = (
+      this.window as Window & {
+        ResizeObserver?: typeof ResizeObserver;
+      }
+    ).ResizeObserver;
+    if (!ResizeObserverConstructor) {
+      return;
+    }
+
+    const observer = new ResizeObserverConstructor(() => {
+      this.scheduleCanvasResize();
+    });
+    observer.observe(this.canvas.parentElement ?? this.canvas);
+    this.resizeObserver = observer;
+  }
+
+  private scheduleCanvasResize(): void {
+    if (this.destroyed || this.resizeFrame !== null) {
+      return;
+    }
+
+    this.resizeFrame = this.window.requestAnimationFrame(() => {
+      this.resizeFrame = null;
+      const width = this.canvas.clientWidth;
+      const height = this.canvas.clientHeight;
+      if (width <= 1 || height <= 1) {
+        return;
+      }
+
+      const firstVisibleSize =
+        this.lastCanvasWidth <= 1 || this.lastCanvasHeight <= 1;
+      const sizeChanged =
+        width !== this.lastCanvasWidth || height !== this.lastCanvasHeight;
+      this.lastCanvasWidth = width;
+      this.lastCanvasHeight = height;
+
+      if (!sizeChanged) {
+        return;
+      }
+
+      this.resizeCanvas();
+      if (firstVisibleSize) {
+        this.resetLayout(true);
+      } else {
+        this.draw();
+      }
+    });
+  }
+
+  private schedulePostMountLayout(): void {
+    const retry = (remaining: number): void => {
+      if (this.destroyed) {
+        return;
+      }
+
+      this.window.requestAnimationFrame(() => {
+        if (this.destroyed) {
+          return;
+        }
+
+        const width = this.canvas.clientWidth;
+        const height = this.canvas.clientHeight;
+        if (width > 1 && height > 1) {
+          this.lastCanvasWidth = width;
+          this.lastCanvasHeight = height;
+          this.resizeCanvas();
+          this.resetLayout(true);
+          return;
+        }
+
+        if (remaining > 0) {
+          this.window.setTimeout(() => retry(remaining - 1), 50);
+        }
+      });
+    };
+
+    retry(8);
+  }
+
   private resizeCanvas(): void {
     this.resizeCanvasElement(this.canvas);
     this.resizeCanvasElement(this.xAxisCanvas);
@@ -1031,7 +1157,9 @@ export class CitationGraphRenderer {
     context.scale(this.transform.scale, this.transform.scale);
 
     this.drawEdges(context, colors);
+    this.drawGhostEdges(context, colors);
     this.drawNodes(context, colors);
+    this.drawGhostNode(context, colors);
 
     context.restore();
     this.drawAxesOnGraph(context, colors, width, height);
@@ -1190,6 +1318,175 @@ export class CitationGraphRenderer {
       context.fill();
       context.restore();
     }
+  }
+
+  private ghostMetricValue(
+    preview: CitationGraphGhostPreview,
+    metric: GraphAxisMetric,
+  ): number | null {
+    switch (metric) {
+      case "none":
+        return null;
+      case "year":
+        return preview.year;
+      case "citations":
+        return preview.citationCount;
+      case "references":
+        return preview.referenceCount;
+      case "library-coverage":
+      case "citation-velocity":
+      case "citation-acceleration":
+        return null;
+    }
+  }
+
+  private getGhostPosition(): {
+    x: number;
+    y: number;
+    radius: number;
+    sources: LayoutNode[];
+  } | null {
+    const preview = this.ghostPreview;
+    if (!preview) return null;
+
+    const sources = preview.sourceKeys
+      .map((key) => this.nodeByKey.get(key))
+      .filter(
+        (node): node is LayoutNode =>
+          node !== undefined && this.visibleKeys.has(node.key),
+      );
+    if (sources.length === 0) return null;
+
+    const centroidX =
+      sources.reduce((sum, node) => sum + node.x, 0) / sources.length;
+    const centroidY =
+      sources.reduce((sum, node) => sum + node.y, 0) / sources.length;
+    const angle = seededUnit(preview.key, 31) * Math.PI * 2;
+    const offset = 48 + Math.min(36, Math.sqrt(sources.length) * 8);
+
+    const xValue = this.xDomain
+      ? this.ghostMetricValue(preview, this.xDomain.metric)
+      : null;
+    const yValue = this.yDomain
+      ? this.ghostMetricValue(preview, this.yDomain.metric)
+      : null;
+    const xPosition =
+      this.xDomain && xValue !== null
+        ? axisPositionForValue(
+            xValue,
+            this.xDomain,
+            this.xRange.minimum,
+            this.xRange.maximum,
+            this.xRange.missing,
+          )
+        : null;
+    const yPosition =
+      this.yDomain && yValue !== null
+        ? axisPositionForValue(
+            yValue,
+            this.yDomain,
+            this.yRange.minimum,
+            this.yRange.maximum,
+            this.yRange.missing,
+            true,
+          )
+        : null;
+    const x =
+      xPosition ??
+      centroidX + (yPosition === null ? Math.cos(angle) * offset : 0);
+    const y =
+      yPosition ??
+      centroidY + (xPosition === null ? Math.sin(angle) * offset : 0);
+
+    return { x, y, radius: 11, sources };
+  }
+
+  private drawGhostEdges(
+    context: CanvasRenderingContext2D,
+    colors: Record<string, string>,
+  ): void {
+    const ghost = this.getGhostPosition();
+    if (!ghost) return;
+
+    const inverseScale = 1 / this.transform.scale;
+    for (const source of ghost.sources) {
+      const dx = ghost.x - source.x;
+      const dy = ghost.y - source.y;
+      const distance = Math.max(1, Math.hypot(dx, dy));
+      const ux = dx / distance;
+      const uy = dy / distance;
+      const startX = source.x + ux * source.radius;
+      const startY = source.y + uy * source.radius;
+      const endX = ghost.x - ux * (ghost.radius + 3 * inverseScale);
+      const endY = ghost.y - uy * (ghost.radius + 3 * inverseScale);
+
+      context.save();
+      context.globalAlpha = 0.78;
+      context.strokeStyle = colors.edgeHighlight;
+      context.fillStyle = colors.edgeHighlight;
+      context.lineWidth = 1.7 * inverseScale;
+      context.setLineDash([6 * inverseScale, 4 * inverseScale]);
+      context.beginPath();
+      context.moveTo(startX, startY);
+      context.lineTo(endX, endY);
+      context.stroke();
+      context.setLineDash([]);
+
+      const arrowSize = 6.5 * inverseScale;
+      const angle = Math.atan2(dy, dx);
+      context.beginPath();
+      context.moveTo(endX, endY);
+      context.lineTo(
+        endX - Math.cos(angle - Math.PI / 6) * arrowSize,
+        endY - Math.sin(angle - Math.PI / 6) * arrowSize,
+      );
+      context.lineTo(
+        endX - Math.cos(angle + Math.PI / 6) * arrowSize,
+        endY - Math.sin(angle + Math.PI / 6) * arrowSize,
+      );
+      context.closePath();
+      context.fill();
+      context.restore();
+    }
+  }
+
+  private drawGhostNode(
+    context: CanvasRenderingContext2D,
+    colors: Record<string, string>,
+  ): void {
+    const preview = this.ghostPreview;
+    const ghost = this.getGhostPosition();
+    if (!preview || !ghost) return;
+
+    const inverseScale = 1 / this.transform.scale;
+    context.save();
+    context.beginPath();
+    context.arc(ghost.x, ghost.y, ghost.radius, 0, Math.PI * 2);
+    context.fillStyle = colors.background;
+    context.globalAlpha = 0.92;
+    context.fill();
+    context.globalAlpha = 1;
+    context.strokeStyle = colors.edgeHighlight;
+    context.lineWidth = 2.2 * inverseScale;
+    context.setLineDash([4.5 * inverseScale, 3 * inverseScale]);
+    context.stroke();
+    context.setLineDash([]);
+
+    const maximumLength = 54;
+    const label =
+      preview.title.length > maximumLength
+        ? `${preview.title.slice(0, maximumLength - 1)}…`
+        : preview.title;
+    const labelX = ghost.x + ghost.radius + 5 * inverseScale;
+    context.font = `600 ${12 * inverseScale}px system-ui, sans-serif`;
+    context.textBaseline = "middle";
+    context.lineJoin = "round";
+    context.lineWidth = 3.5 * inverseScale;
+    context.strokeStyle = colors.background;
+    context.strokeText(label, labelX, ghost.y);
+    context.fillStyle = colors.edgeHighlight;
+    context.fillText(label, labelX, ghost.y);
+    context.restore();
   }
 
   private firstAuthorLabel(node: CitationGraphNode): string {

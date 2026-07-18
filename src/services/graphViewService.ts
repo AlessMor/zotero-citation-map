@@ -26,6 +26,7 @@ import {
 import {
   formatGraphMetricValue,
   GRAPH_AXIS_OPTIONS,
+  graphMetricDescription,
   graphMetricLabel,
   graphMetricSupportsLog,
 } from "./graphMetricDefinitions";
@@ -103,20 +104,13 @@ function ensureGraphStyle(document: Document): void {
     return;
   }
 
-  const stylesheetURL = `chrome://${config.addonRef}/content/graph.css`;
-
-  if (document.head) {
+  const stylesheetID = `${config.addonRef}-graph-stylesheet`;
+  if (!document.getElementById(stylesheetID)) {
     const link = createHTMLElement(document, "link");
+    link.id = stylesheetID;
     link.rel = "stylesheet";
-    link.href = stylesheetURL;
-    document.head.appendChild(link);
-  } else {
-    const processingInstruction = document.createProcessingInstruction(
-      "xml-stylesheet",
-      `href="${stylesheetURL}" type="text/css"`,
-    );
-
-    document.insertBefore(processingInstruction, document.documentElement);
+    link.href = `chrome://${config.addonRef}/content/graph.css`;
+    (document.head ?? document.documentElement).appendChild(link);
   }
 
   styledDocuments.add(document);
@@ -136,6 +130,21 @@ function createTextElement<K extends keyof HTMLElementTagNameMap>(
   }
 
   return element;
+}
+
+function createMetricInfoIndicator(
+  document: Document,
+  metric: GraphAxisMetric,
+): HTMLSpanElement | null {
+  const description = graphMetricDescription(metric);
+  if (!description) return null;
+
+  const indicator = createHTMLElement(document, "span");
+  indicator.className = "cm-metric-info";
+  indicator.textContent = "ⓘ";
+  indicator.title = description;
+  indicator.setAttribute("aria-label", description);
+  return indicator;
 }
 
 function formatCount(value: number): string {
@@ -317,13 +326,17 @@ function createAxisPicker(
 
   const metricText = createHTMLElement(document, "span");
   metricText.className = "cm-axis-label-metric";
+  const metricInfo = createHTMLElement(document, "span");
+  metricInfo.className = "cm-metric-info cm-axis-label-info";
+  metricInfo.textContent = "ⓘ";
+  metricInfo.hidden = true;
   const scaleText = createHTMLElement(document, "span");
   scaleText.className = "cm-axis-label-scale";
   const chevron = createHTMLElement(document, "span");
   chevron.className = "cm-axis-label-chevron";
   chevron.textContent = "⌄";
   chevron.setAttribute("aria-hidden", "true");
-  button.append(metricText, scaleText, chevron);
+  button.append(metricText, metricInfo, scaleText, chevron);
 
   const popover = createHTMLElement(document, "div");
   popover.className = "cm-axis-popover";
@@ -377,7 +390,16 @@ function createAxisPicker(
     const option = createHTMLElement(document, "button");
     option.type = "button";
     option.className = "cm-axis-option";
-    option.textContent = definition.label;
+    option.appendChild(
+      createTextElement(
+        document,
+        "span",
+        definition.label,
+        "cm-axis-option-label",
+      ),
+    );
+    const info = createMetricInfoIndicator(document, definition.metric);
+    if (info) option.appendChild(info);
     option.dataset.value = definition.metric;
     option.addEventListener("click", () => {
       metric = definition.metric;
@@ -429,6 +451,10 @@ function createAxisPicker(
 
   const updateDisplay = (): void => {
     metricText.textContent = graphMetricLabel(metric);
+    const metricDescription = graphMetricDescription(metric);
+    metricInfo.hidden = metricDescription === null;
+    metricInfo.title = metricDescription ?? "";
+    metricInfo.setAttribute("aria-label", metricDescription ?? "");
     scaleText.textContent = metric === "none" ? "" : scaleLabel(scale);
     scaleText.hidden = metric === "none";
     for (const [value, option] of metricButtons) {
@@ -556,12 +582,18 @@ function createDetailRow(
   document: Document,
   label: string,
   value: string,
+  metric?: GraphAxisMetric,
 ): HTMLDivElement {
   const row = createHTMLElement(document, "div");
   row.className = "cm-detail-row";
-  row.appendChild(
-    createTextElement(document, "span", label, "cm-detail-label"),
-  );
+  const labelElement = createHTMLElement(document, "span");
+  labelElement.className = "cm-detail-label";
+  labelElement.appendChild(document.createTextNode(label));
+  if (metric) {
+    const info = createMetricInfoIndicator(document, metric);
+    if (info) labelElement.append(" ", info);
+  }
+  row.appendChild(labelElement);
   row.appendChild(
     createTextElement(document, "span", value, "cm-detail-value"),
   );
@@ -573,146 +605,6 @@ function formatNullableMetric(
   value: number | null,
 ): string {
   return value === null ? "—" : formatGraphMetricValue(metric, value);
-}
-
-function downloadTextFile(
-  document: Document,
-  filename: string,
-  content: string,
-  mimeType: string,
-): void {
-  const view = document.defaultView;
-  if (!view) return;
-  const blob = new view.Blob([content], { type: mimeType });
-  const url = view.URL.createObjectURL(blob);
-  const anchor = createHTMLElement(document, "a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.hidden = true;
-  document.documentElement.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  view.setTimeout(() => view.URL.revokeObjectURL(url), 1000);
-}
-
-function csvCell(value: unknown): string {
-  const text = value === null || value === undefined ? "" : String(value);
-  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
-}
-
-function exportGraphJSON(
-  document: Document,
-  snapshot: LibrarySnapshot,
-  graph: ReturnType<typeof buildCitationGraph>,
-): void {
-  downloadTextFile(
-    document,
-    `citation-map-${new Date().toISOString().slice(0, 10)}.json`,
-    JSON.stringify(
-      {
-        format: "zotero-citation-map",
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        library: { id: snapshot.libraryID, name: snapshot.libraryName },
-        nodes: graph.nodes,
-        edges: graph.edges,
-      },
-      null,
-      2,
-    ),
-    "application/json",
-  );
-}
-
-function exportGraphCSV(
-  document: Document,
-  graph: ReturnType<typeof buildCitationGraph>,
-): void {
-  const nodeByKey = new Map(graph.nodes.map((node) => [node.key, node]));
-  const lines = [
-    ["source_key", "source_title", "target_key", "target_title"].join(","),
-    ...graph.edges.map((edge) => {
-      const source = nodeByKey.get(edge.source);
-      const target = nodeByKey.get(edge.target);
-      return [
-        edge.source,
-        source?.title ?? "",
-        edge.target,
-        target?.title ?? "",
-      ]
-        .map(csvCell)
-        .join(",");
-    }),
-  ];
-  downloadTextFile(
-    document,
-    `citation-map-edges-${new Date().toISOString().slice(0, 10)}.csv`,
-    lines.join("\n"),
-    "text/csv;charset=utf-8",
-  );
-}
-
-async function importGraphJSON(
-  document: Document,
-  snapshot: LibrarySnapshot,
-): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const input = createHTMLElement(document, "input");
-    input.type = "file";
-    input.accept = ".json,application/json";
-    input.hidden = true;
-    document.documentElement.appendChild(input);
-    input.addEventListener(
-      "change",
-      async () => {
-        try {
-          const file = input.files?.[0];
-          if (!file) {
-            resolve(0);
-            return;
-          }
-          const parsed = JSON.parse(await file.text()) as {
-            nodes?: Array<{
-              doi?: string | null;
-              title?: string;
-              providerWorkID?: string;
-            }>;
-          };
-          const localDOIs = new Set(
-            snapshot.papers
-              .map((paper) => normalizeSearchText(paper.doi ?? ""))
-              .filter(Boolean),
-          );
-          let imported = 0;
-          for (const node of parsed.nodes ?? []) {
-            const doi = node.doi?.trim() ?? "";
-            if (!doi || localDOIs.has(normalizeSearchText(doi))) continue;
-            const work: ExternalWork = {
-              providerWorkID: node.providerWorkID ?? "imported-json",
-              doi,
-              title: node.title?.trim() || doi,
-              year: null,
-              authors: [],
-              citationCount: null,
-              referenceCount: null,
-            };
-            const items = await importExternalWork(work, snapshot.libraryID);
-            if (items.length > 0) {
-              imported += items.length;
-              localDOIs.add(normalizeSearchText(doi));
-            }
-          }
-          resolve(imported);
-        } catch (error) {
-          reject(error);
-        } finally {
-          input.remove();
-        }
-      },
-      { once: true },
-    );
-    input.click();
-  });
 }
 
 export function destroyCitationMapView(mount: Element): void {
@@ -847,21 +739,9 @@ export function renderCitationMapView(
   const recommendationsButton = createHTMLElement(document, "button");
   recommendationsButton.type = "button";
   recommendationsButton.textContent = "Missing papers";
-  const exportJSONButton = createHTMLElement(document, "button");
-  exportJSONButton.type = "button";
-  exportJSONButton.textContent = "Export JSON";
-  const exportCSVButton = createHTMLElement(document, "button");
-  exportCSVButton.type = "button";
-  exportCSVButton.textContent = "Export CSV";
-  const importJSONButton = createHTMLElement(document, "button");
-  importJSONButton.type = "button";
-  importJSONButton.textContent = "Import JSON";
-  discoveryActions.append(
-    recommendationsButton,
-    exportJSONButton,
-    exportCSVButton,
-    importJSONButton,
-  );
+  recommendationsButton.title =
+    "Rank papers absent from the whole Zotero library by how many papers in the current graph view cite them.";
+  discoveryActions.appendChild(recommendationsButton);
   toolbar.appendChild(discoveryActions);
 
   const graphStatus = createTextElement(
@@ -977,12 +857,14 @@ export function renderCitationMapView(
   detailPanel.setAttribute("aria-label", "Selected paper details");
 
   let selectedNode: CitationGraphNode | null = null;
+  let graphRenderer: CitationGraphRenderer | null = null;
 
   const renderExternalWorks = (
     title: string,
     works: ExternalWork[],
     backNode: CitationGraphNode | null,
   ): void => {
+    graphRenderer?.setGhostPreview(null);
     clearElement(detailPanel);
     const heading = createHTMLElement(document, "div");
     heading.className = "cm-external-heading";
@@ -1015,6 +897,22 @@ export function renderCitationMapView(
     for (const work of works) {
       const card = createHTMLElement(document, "article");
       card.className = "cm-external-work";
+      if (work.citingNodeKeys?.length) {
+        card.classList.add("cm-missing-work");
+        card.addEventListener("mouseenter", () => {
+          graphRenderer?.setGhostPreview({
+            key: work.providerWorkID,
+            title: work.title,
+            year: work.year,
+            citationCount: work.citationCount,
+            referenceCount: work.referenceCount,
+            sourceKeys: work.citingNodeKeys ?? [],
+          });
+        });
+        card.addEventListener("mouseleave", () => {
+          graphRenderer?.setGhostPreview(null);
+        });
+      }
       card.appendChild(createTextElement(document, "h3", work.title));
       const metadata = [
         work.authors.slice(0, 3).join(", "),
@@ -1079,6 +977,7 @@ export function renderCitationMapView(
   };
 
   const showLoading = (title: string): void => {
+    graphRenderer?.setGhostPreview(null);
     clearElement(detailPanel);
     detailPanel.appendChild(createTextElement(document, "h2", title));
     detailPanel.appendChild(
@@ -1093,6 +992,7 @@ export function renderCitationMapView(
 
   const renderDetails = (node: CitationGraphNode | null): void => {
     selectedNode = node;
+    graphRenderer?.setGhostPreview(null);
     clearElement(detailPanel);
     if (!node) {
       detailPanel.appendChild(
@@ -1136,11 +1036,13 @@ export function renderCitationMapView(
         document,
         "Library coverage",
         formatNullableMetric("library-coverage", node.libraryCoverage),
+        "library-coverage",
       ),
       createDetailRow(
         document,
         "Citation velocity",
         formatNullableMetric("citation-velocity", node.citationVelocity),
+        "citation-velocity",
       ),
       createDetailRow(
         document,
@@ -1149,6 +1051,7 @@ export function renderCitationMapView(
           "citation-acceleration",
           node.citationAcceleration,
         ),
+        "citation-acceleration",
       ),
     );
     detailPanel.appendChild(rows);
@@ -1177,7 +1080,8 @@ export function renderCitationMapView(
     const citedByButton = createHTMLElement(document, "button");
     citedByButton.type = "button";
     citedByButton.textContent = "Cited by";
-    citedByButton.disabled = !node.providerWorkID;
+    citedByButton.disabled =
+      node.provider !== "openalex" || !node.providerWorkID;
     citedByButton.addEventListener("click", async () => {
       showLoading("Cited by");
       const works = await getExternalCitedBy(node);
@@ -1220,6 +1124,8 @@ export function renderCitationMapView(
     onOpenNode: (node) => options.onSelectPaper(node.itemID),
   });
 
+  graphRenderer = renderer;
+
   const nodeKeyByItemID = new Map(
     graph.nodes.map((node) => [node.itemID, node.key]),
   );
@@ -1234,7 +1140,10 @@ export function renderCitationMapView(
       const visibleNodes = graph.nodes.filter((node) =>
         visibleNodeKeys.has(node.key),
       );
-      const works = await getMissingPaperRecommendations(visibleNodes);
+      const works = await getMissingPaperRecommendations(
+        visibleNodes,
+        graph.nodes,
+      );
       renderExternalWorks("Missing papers", works, selectedNode);
     } catch (error) {
       Zotero.logError(
@@ -1243,33 +1152,6 @@ export function renderCitationMapView(
       renderExternalWorks("Missing papers", [], selectedNode);
     } finally {
       recommendationsButton.disabled = false;
-    }
-  });
-
-  exportJSONButton.addEventListener("click", () =>
-    exportGraphJSON(document, snapshot, graph),
-  );
-  exportCSVButton.addEventListener("click", () =>
-    exportGraphCSV(document, graph),
-  );
-  importJSONButton.addEventListener("click", async () => {
-    importJSONButton.disabled = true;
-    const original = importJSONButton.textContent;
-    importJSONButton.textContent = "Importing…";
-    try {
-      const imported = await importGraphJSON(document, snapshot);
-      importJSONButton.textContent =
-        imported > 0 ? `Imported ${imported}` : "Nothing imported";
-    } catch (error) {
-      Zotero.logError(
-        error instanceof Error ? error : new Error(String(error)),
-      );
-      importJSONButton.textContent = "Import failed";
-    } finally {
-      document.defaultView?.setTimeout(() => {
-        importJSONButton.textContent = original;
-        importJSONButton.disabled = false;
-      }, 2500);
     }
   });
 
@@ -1291,6 +1173,7 @@ export function renderCitationMapView(
   };
 
   const applyFilters = (): void => {
+    renderer.setGhostPreview(null);
     const collection = getCollectionFilter();
     const selectedTag = tagControl.select.value;
 
