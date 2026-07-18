@@ -191,7 +191,9 @@ export function unregisterCitationColumns(): void {
     try {
       Zotero.ItemTreeManager.unregisterColumn(dataKey);
     } catch (error) {
-      Zotero.debug(`Citation Map: failed to unregister column ${dataKey}: ${error}`);
+      Zotero.debug(
+        `Citation Map: failed to unregister column ${dataKey}: ${error}`,
+      );
     }
   }
 }

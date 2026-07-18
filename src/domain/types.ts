@@ -12,6 +12,7 @@ export interface ZoteroPaper {
   citationCount: number | null;
   referenceCount: number | null;
   metricsUpdatedAt: string | null;
+  metadataCompleteness: number;
 }
 
 export interface LibraryCollectionFilter {

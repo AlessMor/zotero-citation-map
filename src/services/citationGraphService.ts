@@ -1,54 +1,32 @@
 import type {
-  CitationGraphEdge,
   CitationGraphModel,
   CitationGraphNode,
 } from "../domain/graphTypes";
 import type { LibrarySnapshot } from "../domain/types";
-import type {
-  CitationMetricRecord,
-  CitationProviderID,
-} from "../domain/citationTypes";
-import { getCitationMetricRecord } from "./citationMetricsStore";
+import type { CitationMetricRecord } from "../domain/citationTypes";
+import {
+  calculateFutureReferenceCount,
+  calculateRecordReferenceAgeStats,
+  calculateSelfCitationEstimate,
+} from "./citationAnalyticsService";
+import {
+  computeNetworkAnalytics,
+  resolveRecordCitationEdges,
+} from "./citationNetworkAnalytics";
+import {
+  getCitationMetricRecord,
+  getItemCitationMetrics,
+} from "./citationMetricsStore";
+import { normalizeDOI } from "./citationIdentifiers";
 
-function normalizeDOI(value: string | null | undefined): string | null {
-  const normalized = String(value ?? "")
-    .trim()
-    .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "")
-    .replace(/^doi:\s*/i, "")
-    .replace(/[\s.,;]+$/g, "")
-    .toLocaleLowerCase();
-
-  return normalized || null;
-}
-
-function normalizeProviderWorkID(
-  provider: CitationProviderID,
-  value: string | null | undefined,
-): string | null {
-  let normalized = String(value ?? "").trim();
-
-  if (!normalized) {
+function ratio(numerator: number, denominator: number | null): number | null {
+  if (denominator === null || denominator < 0) {
     return null;
   }
-
-  if (provider === "openalex") {
-    normalized = normalized.replace(/^https?:\/\/openalex\.org\//i, "");
-  } else if (provider === "semantic-scholar") {
-    normalized = normalized.replace(
-      /^https?:\/\/(?:www\.)?semanticscholar\.org\/paper\//i,
-      "",
-    );
+  if (denominator === 0) {
+    return numerator === 0 ? 1 : null;
   }
-
-  return normalized.toLocaleLowerCase();
-}
-
-function providerIdentityKey(
-  provider: CitationProviderID,
-  providerWorkID: string | null | undefined,
-): string | null {
-  const normalized = normalizeProviderWorkID(provider, providerWorkID);
-  return normalized ? `${provider}:${normalized}` : null;
+  return numerator / denominator;
 }
 
 function createNode(
@@ -57,6 +35,10 @@ function createNode(
   record: CitationMetricRecord | null,
 ): CitationGraphNode {
   const paper = snapshot.papers[paperIndex];
+  const summary = getItemCitationMetrics(paper.libraryID, paper.itemKey);
+  const age = record
+    ? calculateRecordReferenceAgeStats(record)
+    : { mean: null, spread: null };
 
   return {
     key: paper.itemKey,
@@ -68,121 +50,89 @@ function createNode(
     doi: normalizeDOI(paper.doi ?? record?.doi),
     tags: [...paper.tags],
     collectionIDs: [...paper.collectionIDs],
-    citationCount: paper.citationCount,
-    referenceCount: paper.referenceCount,
-    metricsUpdatedAt: paper.metricsUpdatedAt,
-    provider: record?.provider ?? null,
+    citationCount: summary.citationCount,
+    referenceCount: summary.referenceCount,
+    resolvedReferenceCount: summary.resolvedReferenceCount,
+    referenceCoverage: ratio(
+      summary.resolvedReferenceCount,
+      summary.referenceCount,
+    ),
+    metricsUpdatedAt: summary.updatedAt,
+    dataAgeDays: summary.dataAgeDays,
+    provider: summary.provider,
+    citationCountProvider: summary.citationCountProvider,
+    referenceCountProvider: summary.referenceCountProvider,
     providerWorkID: record?.providerWorkID ?? null,
-    metricStatus: record?.status ?? null,
-    resolvedReferenceCount: record?.resolvedReferenceCount ?? 0,
+    matchedBy: summary.matchedBy,
+    matchConfidence: summary.matchConfidence,
+    metricStatus: summary.status,
+    fwci: summary.fwci,
+    citationPercentile: summary.citationPercentile,
+    isTop1Percent: summary.isTop1Percent,
+    isTop10Percent: summary.isTop10Percent,
+    citationsLastYear: summary.citationsLastYear,
+    citationVelocity: summary.citationVelocity,
+    citationAcceleration: summary.citationAcceleration,
+    influentialCitationCount: summary.influentialCitationCount,
+    isRetracted: summary.isRetracted,
+    openAccessStatus: summary.openAccessStatus,
+    isOpenAccess: summary.isOpenAccess,
+    publicationType: summary.publicationType,
+    metadataCompleteness: paper.metadataCompleteness,
     incomingLibraryCitations: 0,
     outgoingLibraryReferences: 0,
+    libraryCoverage: null,
+    localGlobalImpactRatio: null,
+    pageRank: 0,
+    betweennessCentrality: 0,
+    eigenvectorCentrality: 0,
+    componentSize: 1,
+    citationChainDepth: 0,
+    isIsolated: true,
+    referenceAgeMean: age.mean,
+    referenceAgeSpread: age.spread,
+    selfCitationEstimate: record ? calculateSelfCitationEstimate(record) : null,
+    futureReferenceCount: record ? calculateFutureReferenceCount(record) : null,
   };
 }
 
 export function buildCitationGraph(
   snapshot: LibrarySnapshot,
 ): CitationGraphModel {
-  const records = new Map<string, CitationMetricRecord | null>();
+  const records = new Map<string, CitationMetricRecord>();
   const nodes = snapshot.papers.map((paper, index) => {
     const record = getCitationMetricRecord(paper.libraryID, paper.itemKey);
-    records.set(paper.itemKey, record);
+    if (record) {
+      records.set(paper.itemKey, record);
+    }
     return createNode(snapshot, index, record);
   });
 
-  const nodeByKey = new Map(nodes.map((node) => [node.key, node]));
-  const keyByDOI = new Map<string, string>();
-  const keyByProviderIdentity = new Map<string, string>();
-  const genericProviderIDs = new Map<string, Set<string>>();
+  const nodeKeys = new Set(nodes.map((node) => node.key));
+  const edges = resolveRecordCitationEdges([...records.values()]).filter(
+    (edge) => nodeKeys.has(edge.source) && nodeKeys.has(edge.target),
+  );
+  const analytics = computeNetworkAnalytics(
+    nodes.map((node) => node.key),
+    edges,
+  );
 
   for (const node of nodes) {
-    if (node.doi && !keyByDOI.has(node.doi)) {
-      keyByDOI.set(node.doi, node.key);
-    }
-
-    if (node.provider && node.providerWorkID) {
-      const identity = providerIdentityKey(node.provider, node.providerWorkID);
-      if (identity && !keyByProviderIdentity.has(identity)) {
-        keyByProviderIdentity.set(identity, node.key);
-      }
-
-      const generic = normalizeProviderWorkID(
-        node.provider,
-        node.providerWorkID,
-      );
-      if (generic) {
-        const keys = genericProviderIDs.get(generic) ?? new Set<string>();
-        keys.add(node.key);
-        genericProviderIDs.set(generic, keys);
-      }
-    }
-  }
-
-  const edgeKeys = new Set<string>();
-  const edges: CitationGraphEdge[] = [];
-
-  for (const sourceNode of nodes) {
-    const record = records.get(sourceNode.key);
-    if (!record || record.status !== "success") {
+    const network = analytics.get(node.key);
+    if (!network) {
       continue;
     }
 
-    for (const reference of record.references) {
-      let targetKey: string | null = null;
-      const referenceDOI = normalizeDOI(reference.doi);
-
-      if (referenceDOI) {
-        targetKey = keyByDOI.get(referenceDOI) ?? null;
-      }
-
-      if (!targetKey && reference.providerWorkID) {
-        const identity = providerIdentityKey(
-          record.provider,
-          reference.providerWorkID,
-        );
-        if (identity) {
-          targetKey = keyByProviderIdentity.get(identity) ?? null;
-        }
-      }
-
-      if (!targetKey && reference.providerWorkID) {
-        const generic = normalizeProviderWorkID(
-          record.provider,
-          reference.providerWorkID,
-        );
-        const candidates = generic
-          ? genericProviderIDs.get(generic)
-          : undefined;
-
-        if (candidates?.size === 1) {
-          targetKey = [...candidates][0];
-        }
-      }
-
-      if (!targetKey || targetKey === sourceNode.key) {
-        continue;
-      }
-
-      const edgeKey = `${sourceNode.key}>${targetKey}`;
-      if (edgeKeys.has(edgeKey)) {
-        continue;
-      }
-
-      const targetNode = nodeByKey.get(targetKey);
-      if (!targetNode) {
-        continue;
-      }
-
-      edgeKeys.add(edgeKey);
-      edges.push({
-        key: edgeKey,
-        source: sourceNode.key,
-        target: targetKey,
-      });
-
-      sourceNode.outgoingLibraryReferences += 1;
-      targetNode.incomingLibraryCitations += 1;
-    }
+    node.incomingLibraryCitations = network.incoming;
+    node.outgoingLibraryReferences = network.outgoing;
+    node.libraryCoverage = ratio(network.outgoing, node.referenceCount);
+    node.localGlobalImpactRatio = ratio(network.incoming, node.citationCount);
+    node.pageRank = network.pageRank;
+    node.betweennessCentrality = network.betweennessCentrality;
+    node.eigenvectorCentrality = network.eigenvectorCentrality;
+    node.componentSize = network.componentSize;
+    node.citationChainDepth = network.citationChainDepth;
+    node.isIsolated = network.isIsolated;
   }
 
   return {
@@ -193,11 +143,7 @@ export function buildCitationGraph(
       resolvedNodes: nodes.filter((node) => node.metricStatus === "success")
         .length,
       edges: edges.length,
-      isolatedNodes: nodes.filter(
-        (node) =>
-          node.incomingLibraryCitations === 0 &&
-          node.outgoingLibraryReferences === 0,
-      ).length,
+      isolatedNodes: nodes.filter((node) => node.isIsolated).length,
     },
   };
 }

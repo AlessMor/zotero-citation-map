@@ -153,7 +153,10 @@
 
 .citation-map-root .cm-search-filter-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) minmax(150px, 220px) minmax(130px, 180px);
+  grid-template-columns: minmax(220px, 1fr) minmax(150px, 220px) minmax(
+      130px,
+      180px
+    );
   align-items: end;
   gap: 7px;
 }
@@ -488,9 +491,6 @@
   color: var(--cm-text-secondary);
 }
 
-
-
-
 .citation-map-root .cm-detail-panel {
   min-width: 0;
   min-height: 0;
@@ -566,7 +566,10 @@
 
 @media (max-width: 1100px) {
   .citation-map-root .cm-search-filter-row {
-    grid-template-columns: minmax(180px, 1fr) minmax(135px, 180px) minmax(120px, 150px);
+    grid-template-columns: minmax(180px, 1fr) minmax(135px, 180px) minmax(
+        120px,
+        150px
+      );
   }
 
   .citation-map-root .cm-graph-shell {
@@ -785,7 +788,9 @@
   font-weight: 650;
 }
 
-.citation-map-root .cm-axis-option-list .cm-axis-option[data-selected="true"]::after {
+.citation-map-root
+  .cm-axis-option-list
+  .cm-axis-option[data-selected="true"]::after {
   content: "✓";
   position: absolute;
   top: 50%;
@@ -873,8 +878,6 @@
   }
 }
 
-
-
 @media (max-width: 1100px) {
   .citation-map-root .cm-graph-stage {
     grid-template-columns: 70px minmax(0, 1fr);
@@ -889,7 +892,6 @@
 .citation-map-root .cm-graph-surface {
   z-index: 1;
 }
-
 
 /* Minimal, content-sized axis label gutters. Axis selectors live inside the graph. */
 .citation-map-root .cm-graph-stage {
@@ -939,7 +941,6 @@
 .citation-map-root .cm-y-axis-picker {
   left: 42px;
 }
-
 
 /* Large metric lists remain usable without expanding beyond the graph. */
 .citation-map-root .cm-axis-popover {

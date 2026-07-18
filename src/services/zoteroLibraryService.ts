@@ -83,6 +83,36 @@ function getCollectionIDs(item: any): number[] {
     .filter(Number.isFinite);
 }
 
+export function calculateItemMetadataCompleteness(item: any): number {
+  const title = String(item.getField?.("title") ?? "").trim();
+  const creators = item.getCreators?.() ?? [];
+  const date = String(item.getField?.("date") ?? "").trim();
+  const venue = String(
+    item.getField?.("publicationTitle") ??
+      item.getField?.("conferenceName") ??
+      item.getField?.("publisher") ??
+      "",
+  ).trim();
+  const abstract = String(item.getField?.("abstractNote") ?? "").trim();
+  const identifiers = [
+    item.getField?.("DOI"),
+    item.getField?.("ISBN"),
+    item.getField?.("ISSN"),
+    item.getField?.("url"),
+  ].some((value) => String(value ?? "").trim().length > 0);
+
+  const checks = [
+    title.length > 0,
+    creators.length > 0,
+    extractYear(date) !== null,
+    venue.length > 0,
+    abstract.length > 0,
+    identifiers,
+  ];
+
+  return checks.filter(Boolean).length / checks.length;
+}
+
 function convertItemToPaper(item: any): ZoteroPaper {
   const itemID = Number(item.id);
   const libraryID = Number(item.libraryID);
@@ -108,6 +138,7 @@ function convertItemToPaper(item: any): ZoteroPaper {
     citationCount: metrics.citationCount,
     referenceCount: metrics.referenceCount,
     metricsUpdatedAt: metrics.updatedAt,
+    metadataCompleteness: calculateItemMetadataCompleteness(item),
   };
 }
 

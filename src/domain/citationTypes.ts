@@ -28,6 +28,11 @@ export interface WorkIdentifiers {
   authors: string[];
 }
 
+export interface CitationYearCount {
+  year: number;
+  count: number;
+}
+
 export interface RelatedWorkMetadata {
   providerWorkID: string | null;
   doi: string | null;
@@ -59,6 +64,21 @@ export interface ProviderLookupSuccess {
   /** Number of structured outgoing reference records saved for the graph. */
   resolvedReferenceCount: number;
   references: RelatedWorkMetadata[];
+
+  /** Optional provider-enriched bibliometric and status fields. */
+  fwci?: number | null;
+  citationPercentile?: number | null;
+  isTop1Percent?: boolean | null;
+  isTop10Percent?: boolean | null;
+  citationCountsByYear?: CitationYearCount[];
+  citationsLastYear?: number | null;
+  citationVelocity?: number | null;
+  citationAcceleration?: number | null;
+  influentialCitationCount?: number | null;
+  isRetracted?: boolean | null;
+  openAccessStatus?: string | null;
+  isOpenAccess?: boolean | null;
+  publicationType?: string | null;
 }
 
 export interface ProviderLookupFailure {
@@ -93,6 +113,20 @@ export interface CitationMetricRecord {
   resolvedReferenceCount: number;
   references: RelatedWorkMetadata[];
 
+  fwci: number | null;
+  citationPercentile: number | null;
+  isTop1Percent: boolean | null;
+  isTop10Percent: boolean | null;
+  citationCountsByYear: CitationYearCount[];
+  citationsLastYear: number | null;
+  citationVelocity: number | null;
+  citationAcceleration: number | null;
+  influentialCitationCount: number | null;
+  isRetracted: boolean | null;
+  openAccessStatus: string | null;
+  isOpenAccess: boolean | null;
+  publicationType: string | null;
+
   status: CitationMetricStatus;
   fetchedAt: string | null;
   lastAttemptAt: string;
@@ -108,7 +142,24 @@ export interface CitationMetricSummary {
   referenceCountProvider: CitationProviderID | null;
   resolvedReferenceCount: number;
   provider: CitationProviderID | null;
+  matchedBy: IdentifierKind | null;
+  matchConfidence: number | null;
+
+  fwci: number | null;
+  citationPercentile: number | null;
+  isTop1Percent: boolean | null;
+  isTop10Percent: boolean | null;
+  citationsLastYear: number | null;
+  citationVelocity: number | null;
+  citationAcceleration: number | null;
+  influentialCitationCount: number | null;
+  isRetracted: boolean | null;
+  openAccessStatus: string | null;
+  isOpenAccess: boolean | null;
+  publicationType: string | null;
+
   updatedAt: string | null;
+  dataAgeDays: number | null;
   status: CitationMetricStatus | null;
 }
 

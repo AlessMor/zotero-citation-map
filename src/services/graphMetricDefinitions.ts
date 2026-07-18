@@ -22,7 +22,9 @@ export const GRAPH_AXIS_OPTIONS: GraphMetricOption[] = [
   },
 ];
 
-const LABELS = new Map(GRAPH_AXIS_OPTIONS.map((option) => [option.metric, option.label]));
+const LABELS = new Map(
+  GRAPH_AXIS_OPTIONS.map((option) => [option.metric, option.label]),
+);
 
 export function graphMetricLabel(metric: GraphAxisMetric): string {
   return LABELS.get(metric) ?? metric;
@@ -83,7 +85,9 @@ export function formatGraphMetricValue(
     }).format(value);
   }
   if (metric === "citation-velocity" || metric === "citation-acceleration") {
-    return new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(value);
+    return new Intl.NumberFormat(undefined, {
+      maximumFractionDigits: 2,
+    }).format(value);
   }
   return new Intl.NumberFormat(undefined, {
     maximumFractionDigits: value >= 100 ? 0 : 1,

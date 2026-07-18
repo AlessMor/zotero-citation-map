@@ -10,6 +10,12 @@ import type {
   GraphNodeSizeMetric,
   GraphScaleType,
 } from "../domain/graphTypes";
+import {
+  formatGraphMetricValue,
+  graphMetricAllowsNegative,
+  graphMetricIsBoolean,
+  graphMetricValue,
+} from "./graphMetricDefinitions";
 
 interface LayoutNode extends CitationGraphNode {
   x: number;
@@ -89,28 +95,6 @@ function seededUnit(key: string, salt: number): number {
   return ((hashString(`${key}:${salt}`) % 100000) + 0.5) / 100000;
 }
 
-function formatMetric(value: number): string {
-  return new Intl.NumberFormat(undefined, {
-    maximumFractionDigits: value >= 100 ? 0 : 1,
-  }).format(value);
-}
-
-function metricValue(
-  node: CitationGraphNode,
-  metric: GraphAxisMetric,
-): number | null {
-  switch (metric) {
-    case "year":
-      return node.year;
-    case "citations":
-      return node.citationCount;
-    case "references":
-      return node.referenceCount;
-    case "none":
-      return null;
-  }
-}
-
 function transformMetric(value: number, scale: GraphScaleType): number {
   if (scale === "log") {
     return value >= 0 ? Math.log1p(value) : -Math.log1p(Math.abs(value));
@@ -135,7 +119,7 @@ function createAxisDomain(
   }
 
   const values = nodes
-    .map((node) => metricValue(node, metric))
+    .map((node) => graphMetricValue(node, metric))
     .filter(
       (value): value is number => value !== null && Number.isFinite(value),
     );
@@ -164,9 +148,14 @@ function createAxisDomain(
     const padding = Math.max(1, dataSpan * 0.04);
     minimum = Math.floor(dataMinimum - padding);
     maximum = Math.ceil(dataMaximum + padding);
+  } else if (graphMetricIsBoolean(metric)) {
+    minimum = 0;
+    maximum = 1;
   } else {
-    const padding = Math.max(1, dataSpan * 0.05);
-    minimum = Math.max(0, dataMinimum - padding);
+    const padding = Math.max(dataSpan * 0.05, dataSpan === 0 ? 0.05 : 0);
+    minimum = graphMetricAllowsNegative(metric)
+      ? dataMinimum - padding
+      : Math.max(0, dataMinimum - padding);
     maximum = dataMaximum + padding;
   }
   if (maximum <= minimum) {
@@ -201,7 +190,7 @@ function axisPosition(
     return null;
   }
 
-  const value = metricValue(node, domain.metric);
+  const value = graphMetricValue(node, domain.metric);
   if (value === null || !Number.isFinite(value)) {
     return missing;
   }
@@ -224,11 +213,7 @@ function axisValueAtRatio(domain: AxisDomain, ratio: number): number {
   return inverseTransformMetric(transformed, domain.scale);
 }
 
-function createAxisRange(
-  _nodes: LayoutNode[],
-  domain: AxisDomain | null,
-  orientation: "x" | "y",
-): AxisRange {
+function createAxisRange(orientation: "x" | "y"): AxisRange {
   const span = orientation === "x" ? DEFAULT_X_SPAN : DEFAULT_Y_SPAN;
   return {
     minimum: -span / 2,
@@ -250,7 +235,6 @@ export class CitationGraphRenderer {
   private readonly xAxisCanvas: HTMLCanvasElement;
   private readonly yAxisCanvas: HTMLCanvasElement;
   private readonly tooltip: HTMLElement;
-  private readonly model: CitationGraphModel;
   private readonly collectionColorByNodeKey: ReadonlyMap<string, string>;
   private readonly collectionLabelByNodeKey: ReadonlyMap<string, string>;
   private readonly context: CanvasRenderingContext2D;
@@ -271,8 +255,8 @@ export class CitationGraphRenderer {
   private nodeLabelMode: GraphNodeLabelMode;
   private xDomain: AxisDomain | null = null;
   private yDomain: AxisDomain | null = null;
-  private xRange: AxisRange = createAxisRange([], null, "x");
-  private yRange: AxisRange = createAxisRange([], null, "y");
+  private xRange: AxisRange = createAxisRange("x");
+  private yRange: AxisRange = createAxisRange("y");
 
   private selectedKey: string | null = null;
   private hoveredKey: string | null = null;
@@ -299,7 +283,6 @@ export class CitationGraphRenderer {
     this.xAxisCanvas = options.xAxisCanvas;
     this.yAxisCanvas = options.yAxisCanvas;
     this.tooltip = options.tooltip;
-    this.model = options.model;
     this.nodeSizeMetric = options.nodeSizeMetric;
     this.nodeLabelMode = options.nodeLabelMode;
     this.collectionColorByNodeKey = options.collectionColorByNodeKey;
@@ -430,10 +413,18 @@ export class CitationGraphRenderer {
   }
 
   private formatAxisValue(domain: AxisDomain, ratio: number): string {
-    const value = axisValueAtRatio(domain, ratio);
-    return domain.metric === "year"
-      ? String(Math.round(value))
-      : formatMetric(value);
+    return formatGraphMetricValue(
+      domain.metric,
+      axisValueAtRatio(domain, ratio),
+    );
+  }
+
+  private axisTickRatios(domain: AxisDomain, suggestedCount: number): number[] {
+    if (graphMetricIsBoolean(domain.metric)) {
+      return [0, 1];
+    }
+    const count = Math.max(2, suggestedCount);
+    return Array.from({ length: count + 1 }, (_value, index) => index / count);
   }
 
   private getAxisInsets(): {
@@ -449,11 +440,10 @@ export class CitationGraphRenderer {
     let left = 14;
     if (this.yDomain) {
       let widest = 0;
-      for (let index = 0; index <= 6; index += 1) {
+      for (const ratio of this.axisTickRatios(this.yDomain, 6)) {
         widest = Math.max(
           widest,
-          context.measureText(this.formatAxisValue(this.yDomain, index / 6))
-            .width,
+          context.measureText(this.formatAxisValue(this.yDomain, ratio)).width,
         );
       }
       left = Math.ceil(widest) + 15;
@@ -497,7 +487,7 @@ export class CitationGraphRenderer {
     // when it is actually occupied.
     if (this.xDomain) {
       const hasMissingX = visible.some(
-        (node) => metricValue(node, this.xDomain!.metric) === null,
+        (node) => graphMetricValue(node, this.xDomain!.metric) === null,
       );
       minimumX = hasMissingX
         ? Math.min(this.xRange.minimum, this.xRange.missing)
@@ -506,7 +496,7 @@ export class CitationGraphRenderer {
     }
     if (this.yDomain) {
       const hasMissingY = visible.some(
-        (node) => metricValue(node, this.yDomain!.metric) === null,
+        (node) => graphMetricValue(node, this.yDomain!.metric) === null,
       );
       minimumY = this.yRange.minimum;
       maximumY = hasMissingY
@@ -576,7 +566,7 @@ export class CitationGraphRenderer {
 
   private metricGroupKey(node: LayoutNode, domain: AxisDomain | null): string {
     if (!domain) return "free";
-    const value = metricValue(node, domain.metric);
+    const value = graphMetricValue(node, domain.metric);
     return value === null || !Number.isFinite(value)
       ? "missing"
       : String(value);
@@ -713,8 +703,8 @@ export class CitationGraphRenderer {
       this.layout.yMetric,
       this.layout.yScale,
     );
-    this.xRange = createAxisRange(visible, this.xDomain, "x");
-    this.yRange = createAxisRange(visible, this.yDomain, "y");
+    this.xRange = createAxisRange("x");
+    this.yRange = createAxisRange("y");
     this.configureAxisTargets(visible);
 
     const nodeCount = Math.max(visible.length, 1);
@@ -1079,8 +1069,7 @@ export class CitationGraphRenderer {
       const labelY = height - 1;
       const tickCount = Math.max(2, Math.min(8, Math.floor(width / 110)));
 
-      for (let index = 0; index <= tickCount; index += 1) {
-        const ratio = index / tickCount;
+      for (const ratio of this.axisTickRatios(this.xDomain, tickCount)) {
         const worldX =
           this.xRange.minimum +
           ratio * (this.xRange.maximum - this.xRange.minimum);
@@ -1105,8 +1094,7 @@ export class CitationGraphRenderer {
       const tickRight = insets.left;
       const tickCount = Math.max(2, Math.min(8, Math.floor(height / 82)));
 
-      for (let index = 0; index <= tickCount; index += 1) {
-        const ratio = index / tickCount;
+      for (const ratio of this.axisTickRatios(this.yDomain, tickCount)) {
         const worldY =
           this.yRange.maximum -
           ratio * (this.yRange.maximum - this.yRange.minimum);

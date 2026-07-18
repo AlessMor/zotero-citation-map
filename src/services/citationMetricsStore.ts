@@ -4,6 +4,7 @@ import type {
   CitationMetricSummary,
   CitationProviderID,
   CitationProviderPreference,
+  CitationYearCount,
   IdentifierKind,
   RelatedWorkMetadata,
 } from "../domain/citationTypes";
@@ -24,6 +25,19 @@ interface CitationMetricRow {
   reference_count_provider?: string | null;
   resolved_reference_count?: number | null;
   references_json: string;
+  fwci?: number | null;
+  citation_percentile?: number | null;
+  top_1_percent?: number | null;
+  top_10_percent?: number | null;
+  citation_counts_by_year_json?: string | null;
+  citations_last_year?: number | null;
+  citation_velocity?: number | null;
+  citation_acceleration?: number | null;
+  influential_citation_count?: number | null;
+  is_retracted?: number | null;
+  open_access_status?: string | null;
+  is_open_access?: number | null;
+  publication_type?: string | null;
   status: string;
   fetched_at: string | null;
   last_attempt_at: string;
@@ -34,27 +48,40 @@ interface CitationMetricRow {
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS citation_metrics (
-  library_id               INTEGER NOT NULL,
-  item_key                TEXT NOT NULL,
-  provider                TEXT NOT NULL,
-  provider_work_id        TEXT,
-  matched_by              TEXT,
-  doi                     TEXT,
-  title                   TEXT,
-  publication_year        INTEGER,
-  authors_json            TEXT NOT NULL DEFAULT '[]',
-  citation_count          INTEGER,
-  citation_count_provider TEXT,
-  reference_count         INTEGER,
-  reference_count_provider TEXT,
-  resolved_reference_count INTEGER NOT NULL DEFAULT 0,
-  references_json         TEXT NOT NULL DEFAULT '[]',
-  status                  TEXT NOT NULL,
-  fetched_at              TEXT,
-  last_attempt_at         TEXT NOT NULL,
-  error_message           TEXT,
-  failure_count           INTEGER NOT NULL DEFAULT 0,
-  next_retry_at           TEXT,
+  library_id                  INTEGER NOT NULL,
+  item_key                   TEXT NOT NULL,
+  provider                   TEXT NOT NULL,
+  provider_work_id           TEXT,
+  matched_by                 TEXT,
+  doi                        TEXT,
+  title                      TEXT,
+  publication_year           INTEGER,
+  authors_json               TEXT NOT NULL DEFAULT '[]',
+  citation_count             INTEGER,
+  citation_count_provider    TEXT,
+  reference_count            INTEGER,
+  reference_count_provider   TEXT,
+  resolved_reference_count   INTEGER NOT NULL DEFAULT 0,
+  references_json            TEXT NOT NULL DEFAULT '[]',
+  fwci                       REAL,
+  citation_percentile        REAL,
+  top_1_percent              INTEGER,
+  top_10_percent             INTEGER,
+  citation_counts_by_year_json TEXT NOT NULL DEFAULT '[]',
+  citations_last_year        INTEGER,
+  citation_velocity          REAL,
+  citation_acceleration      REAL,
+  influential_citation_count INTEGER,
+  is_retracted               INTEGER,
+  open_access_status         TEXT,
+  is_open_access             INTEGER,
+  publication_type           TEXT,
+  status                     TEXT NOT NULL,
+  fetched_at                 TEXT,
+  last_attempt_at            TEXT NOT NULL,
+  error_message              TEXT,
+  failure_count              INTEGER NOT NULL DEFAULT 0,
+  next_retry_at              TEXT,
   PRIMARY KEY (library_id, item_key)
 )
 `;
@@ -76,13 +103,26 @@ INSERT OR REPLACE INTO citation_metrics (
   reference_count_provider,
   resolved_reference_count,
   references_json,
+  fwci,
+  citation_percentile,
+  top_1_percent,
+  top_10_percent,
+  citation_counts_by_year_json,
+  citations_last_year,
+  citation_velocity,
+  citation_acceleration,
+  influential_citation_count,
+  is_retracted,
+  open_access_status,
+  is_open_access,
+  publication_type,
   status,
   fetched_at,
   last_attempt_at,
   error_message,
   failure_count,
   next_retry_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (${Array.from({ length: 34 }, () => "?").join(", ")})
 `;
 
 const MAX_STORED_REFERENCES = 2000;
@@ -92,6 +132,7 @@ let db: _ZoteroTypes.DBConnection | null = null;
 let initialized = false;
 let initPromise: Promise<void> | null = null;
 let mirror = new Map<string, CitationMetricRecord>();
+let mirrorRevision = 0;
 const writeTails = new Map<string, Promise<void>>();
 
 function mirrorKey(libraryID: number, itemKey: string): string {
@@ -111,10 +152,57 @@ function safeParseArray<T>(value: string | null | undefined): T[] {
   }
 }
 
+function safeCitationYearCounts(
+  value: string | null | undefined,
+): CitationYearCount[] {
+  return safeParseArray<CitationYearCount>(value)
+    .map((entry) => ({
+      year: Number(entry.year),
+      count: Number(entry.count),
+    }))
+    .filter(
+      (entry) =>
+        Number.isInteger(entry.year) &&
+        entry.year > 0 &&
+        Number.isFinite(entry.count) &&
+        entry.count >= 0,
+    );
+}
+
 function providerOrNull(value: unknown): CitationProviderID | null {
   return typeof value === "string" && value.length > 0
     ? (value as CitationProviderID)
     : null;
+}
+
+function numberOrNull(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function booleanOrNull(value: unknown): boolean | null {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  return Number(value) !== 0;
+}
+
+function matchConfidence(matchedBy: IdentifierKind | null): number | null {
+  return matchedBy ? 1 : null;
+}
+
+function dataAgeDays(fetchedAt: string | null): number | null {
+  if (!fetchedAt) {
+    return null;
+  }
+  const timestamp = Date.parse(fetchedAt);
+  if (!Number.isFinite(timestamp)) {
+    return null;
+  }
+  return Math.max(0, (Date.now() - timestamp) / (24 * 60 * 60 * 1000));
 }
 
 function rowToRecord(row: CitationMetricRow): CitationMetricRecord {
@@ -131,12 +219,10 @@ function rowToRecord(row: CitationMetricRow): CitationMetricRecord {
     title: row.title,
     year: row.publication_year === null ? null : Number(row.publication_year),
     authors: safeParseArray<string>(row.authors_json),
-    citationCount:
-      row.citation_count === null ? null : Number(row.citation_count),
+    citationCount: numberOrNull(row.citation_count),
     citationCountProvider:
       providerOrNull(row.citation_count_provider) ?? provider,
-    referenceCount:
-      row.reference_count === null ? null : Number(row.reference_count),
+    referenceCount: numberOrNull(row.reference_count),
     referenceCountProvider:
       providerOrNull(row.reference_count_provider) ?? provider,
     resolvedReferenceCount:
@@ -145,6 +231,21 @@ function rowToRecord(row: CitationMetricRow): CitationMetricRecord {
         ? references.length
         : Number(row.resolved_reference_count),
     references,
+    fwci: numberOrNull(row.fwci),
+    citationPercentile: numberOrNull(row.citation_percentile),
+    isTop1Percent: booleanOrNull(row.top_1_percent),
+    isTop10Percent: booleanOrNull(row.top_10_percent),
+    citationCountsByYear: safeCitationYearCounts(
+      row.citation_counts_by_year_json,
+    ),
+    citationsLastYear: numberOrNull(row.citations_last_year),
+    citationVelocity: numberOrNull(row.citation_velocity),
+    citationAcceleration: numberOrNull(row.citation_acceleration),
+    influentialCitationCount: numberOrNull(row.influential_citation_count),
+    isRetracted: booleanOrNull(row.is_retracted),
+    openAccessStatus: row.open_access_status ?? null,
+    isOpenAccess: booleanOrNull(row.is_open_access),
+    publicationType: row.publication_type ?? null,
     status: row.status as CitationMetricStatus,
     fetchedAt: row.fetched_at,
     lastAttemptAt: row.last_attempt_at,
@@ -171,6 +272,19 @@ function recordToParams(record: CitationMetricRecord): unknown[] {
     record.referenceCountProvider,
     record.resolvedReferenceCount,
     JSON.stringify(record.references.slice(0, MAX_STORED_REFERENCES)),
+    record.fwci,
+    record.citationPercentile,
+    record.isTop1Percent === null ? null : Number(record.isTop1Percent),
+    record.isTop10Percent === null ? null : Number(record.isTop10Percent),
+    JSON.stringify(record.citationCountsByYear),
+    record.citationsLastYear,
+    record.citationVelocity,
+    record.citationAcceleration,
+    record.influentialCitationCount,
+    record.isRetracted === null ? null : Number(record.isRetracted),
+    record.openAccessStatus,
+    record.isOpenAccess === null ? null : Number(record.isOpenAccess),
+    record.publicationType,
     record.status,
     record.fetchedAt,
     record.lastAttemptAt,
@@ -200,6 +314,19 @@ async function ensureSchemaColumns(
     ["citation_count_provider", "TEXT"],
     ["reference_count_provider", "TEXT"],
     ["resolved_reference_count", "INTEGER NOT NULL DEFAULT 0"],
+    ["fwci", "REAL"],
+    ["citation_percentile", "REAL"],
+    ["top_1_percent", "INTEGER"],
+    ["top_10_percent", "INTEGER"],
+    ["citation_counts_by_year_json", "TEXT NOT NULL DEFAULT '[]'"],
+    ["citations_last_year", "INTEGER"],
+    ["citation_velocity", "REAL"],
+    ["citation_acceleration", "REAL"],
+    ["influential_citation_count", "INTEGER"],
+    ["is_retracted", "INTEGER"],
+    ["open_access_status", "TEXT"],
+    ["is_open_access", "INTEGER"],
+    ["publication_type", "TEXT"],
   ];
 
   for (const [name, definition] of additions) {
@@ -210,19 +337,17 @@ async function ensureSchemaColumns(
     }
   }
 
-  // Existing records predate the explicit resolved-reference field. Preserve
-  // their already cached relationship arrays as the initial resolved count.
   await connection
     .queryAsync(
       `
-    UPDATE citation_metrics
-    SET resolved_reference_count =
-      CASE
-        WHEN resolved_reference_count IS NULL OR resolved_reference_count = 0
-        THEN json_array_length(references_json)
-        ELSE resolved_reference_count
-      END
-  `,
+      UPDATE citation_metrics
+      SET resolved_reference_count =
+        CASE
+          WHEN resolved_reference_count IS NULL OR resolved_reference_count = 0
+          THEN json_array_length(references_json)
+          ELSE resolved_reference_count
+        END
+    `,
     )
     .catch(() => undefined);
 }
@@ -254,6 +379,7 @@ export function initCitationMetricsStore(): Promise<void> {
 
     db = connection;
     mirror = nextMirror;
+    mirrorRevision += 1;
     initialized = true;
 
     Zotero.debug(
@@ -303,6 +429,7 @@ export async function closeCitationMetricsStore(): Promise<void> {
 
   db = null;
   mirror = new Map();
+  mirrorRevision += 1;
   writeTails.clear();
   initialized = false;
 }
@@ -312,6 +439,19 @@ export function getCitationMetricRecord(
   itemKey: string,
 ): CitationMetricRecord | null {
   return mirror.get(mirrorKey(libraryID, itemKey)) ?? null;
+}
+
+export function getCitationMetricRecords(
+  libraryID?: number,
+): CitationMetricRecord[] {
+  const records = [...mirror.values()];
+  return libraryID === undefined
+    ? records
+    : records.filter((record) => record.libraryID === libraryID);
+}
+
+export function getCitationMetricsRevision(): number {
+  return mirrorRevision;
 }
 
 export function getItemCitationMetrics(
@@ -327,7 +467,22 @@ export function getItemCitationMetrics(
     referenceCountProvider: record?.referenceCountProvider ?? null,
     resolvedReferenceCount: record?.resolvedReferenceCount ?? 0,
     provider: record?.provider ?? null,
+    matchedBy: record?.matchedBy ?? null,
+    matchConfidence: matchConfidence(record?.matchedBy ?? null),
+    fwci: record?.fwci ?? null,
+    citationPercentile: record?.citationPercentile ?? null,
+    isTop1Percent: record?.isTop1Percent ?? null,
+    isTop10Percent: record?.isTop10Percent ?? null,
+    citationsLastYear: record?.citationsLastYear ?? null,
+    citationVelocity: record?.citationVelocity ?? null,
+    citationAcceleration: record?.citationAcceleration ?? null,
+    influentialCitationCount: record?.influentialCitationCount ?? null,
+    isRetracted: record?.isRetracted ?? null,
+    openAccessStatus: record?.openAccessStatus ?? null,
+    isOpenAccess: record?.isOpenAccess ?? null,
+    publicationType: record?.publicationType ?? null,
     updatedAt: record?.fetchedAt ?? null,
+    dataAgeDays: dataAgeDays(record?.fetchedAt ?? null),
     status: record?.status ?? null,
   };
 }
@@ -369,6 +524,9 @@ export async function saveCitationMetricRecord(
     mirror.set(mirrorKey(record.libraryID, record.itemKey), {
       ...record,
       authors: [...record.authors],
+      citationCountsByYear: record.citationCountsByYear.map((entry) => ({
+        ...entry,
+      })),
       references: record.references
         .slice(0, MAX_STORED_REFERENCES)
         .map((reference) => ({
@@ -376,6 +534,7 @@ export async function saveCitationMetricRecord(
           authors: [...reference.authors],
         })),
     });
+    mirrorRevision += 1;
   });
 }
 
@@ -408,6 +567,19 @@ export async function saveCitationMetricFailure(
       existing?.referenceCountProvider ?? existing?.provider ?? null,
     resolvedReferenceCount: existing?.resolvedReferenceCount ?? 0,
     references: existing?.references ?? [],
+    fwci: existing?.fwci ?? null,
+    citationPercentile: existing?.citationPercentile ?? null,
+    isTop1Percent: existing?.isTop1Percent ?? null,
+    isTop10Percent: existing?.isTop10Percent ?? null,
+    citationCountsByYear: existing?.citationCountsByYear ?? [],
+    citationsLastYear: existing?.citationsLastYear ?? null,
+    citationVelocity: existing?.citationVelocity ?? null,
+    citationAcceleration: existing?.citationAcceleration ?? null,
+    influentialCitationCount: existing?.influentialCitationCount ?? null,
+    isRetracted: existing?.isRetracted ?? null,
+    openAccessStatus: existing?.openAccessStatus ?? null,
+    isOpenAccess: existing?.isOpenAccess ?? null,
+    publicationType: existing?.publicationType ?? null,
     status,
     fetchedAt: existing?.fetchedAt ?? null,
     lastAttemptAt: now,
@@ -448,6 +620,21 @@ export function shouldRefreshCitationMetrics(
     return true;
   }
 
+  // Refresh successful rows created before enriched provider fields were
+  // introduced. OpenAlex always reports work type/retraction status and
+  // Semantic Scholar reports open-access state when the newer field set is
+  // requested, so both are reliable migration sentinels.
+  if (
+    (record.provider === "openalex" &&
+      record.publicationType === null &&
+      record.isRetracted === null) ||
+    (record.provider === "semantic-scholar" &&
+      record.publicationType === null &&
+      record.isOpenAccess === null)
+  ) {
+    return true;
+  }
+
   const maxAge = cacheDays * 24 * 60 * 60 * 1000;
   return Date.now() - Date.parse(record.fetchedAt) >= maxAge;
 }
@@ -462,5 +649,6 @@ export async function deleteCitationMetricRecord(
       [libraryID, itemKey],
     );
     mirror.delete(mirrorKey(libraryID, itemKey));
+    mirrorRevision += 1;
   });
 }

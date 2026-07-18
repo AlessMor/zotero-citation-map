@@ -7,8 +7,7 @@ import {
 import { loadWholeLibrary } from "./zoteroLibraryService";
 
 const TAB_TYPE = "citationmap";
-const TAB_STATE_FILTER_MARKER =
-  "__citationMapStateFilterInstalled";
+const TAB_STATE_FILTER_MARKER = "__citationMapStateFilterInstalled";
 const WINDOW_MOUNT_ID = "citation-map-window-mount";
 const NETWORK_ICON_TYPE = "citation-map-network";
 
@@ -42,17 +41,12 @@ function installTabStateFilter(tabs: any): void {
   const originalGetState = tabs.getState.bind(tabs);
 
   tabs.getState = (): any[] =>
-    originalGetState().filter(
-      (tab: any) => tab.type !== TAB_TYPE,
-    );
+    originalGetState().filter((tab: any) => tab.type !== TAB_TYPE);
 
   tabs[TAB_STATE_FILTER_MARKER] = true;
 }
 
-function focusGraphTab(
-  mainWindow: _ZoteroTypes.MainWindow,
-  tab: any,
-): void {
+function focusGraphTab(mainWindow: _ZoteroTypes.MainWindow, tab: any): void {
   try {
     const container = getTabs(mainWindow).getTabContent(tab.id);
     const focusTarget = container?.querySelector(
@@ -61,15 +55,11 @@ function focusGraphTab(
 
     focusTarget?.focus();
   } catch (error) {
-    Zotero.debug(
-      `Citation Map: could not focus graph tab: ${error}`,
-    );
+    Zotero.debug(`Citation Map: could not focus graph tab: ${error}`);
   }
 }
 
-function installTabHooks(
-  mainWindow: _ZoteroTypes.MainWindow,
-): void {
+function installTabHooks(mainWindow: _ZoteroTypes.MainWindow): void {
   const tabs = getTabs(mainWindow);
   installTabStateFilter(tabs);
 
@@ -82,8 +72,7 @@ function installTabHooks(
     itemID: null,
   });
 
-  tabs.tabHooks.getTitle[TAB_TYPE] = async () =>
-    "Citation Map";
+  tabs.tabHooks.getTitle[TAB_TYPE] = async () => "Citation Map";
 
   tabs.tabHooks.focusFirst[TAB_TYPE] = async (tab: any) => {
     focusGraphTab(mainWindow, tab);
@@ -92,8 +81,6 @@ function installTabHooks(
   tabs.tabHooks.refocus[TAB_TYPE] = async (tab: any) => {
     focusGraphTab(mainWindow, tab);
   };
-
-
 }
 
 async function selectPaperInZotero(
@@ -119,16 +106,10 @@ function renderTab(
 ): void {
   prepareTabContainer(container);
 
-  renderCitationMapView(
-    mainWindow.document,
-    container,
-    snapshot,
-    {
-      mode: "tab",
-      onSelectPaper: (itemID) =>
-        selectPaperInZotero(mainWindow, itemID),
-    },
-  );
+  renderCitationMapView(mainWindow.document, container, snapshot, {
+    mode: "tab",
+    onSelectPaper: (itemID) => selectPaperInZotero(mainWindow, itemID),
+  });
 }
 
 function findExistingGraphTab(tabs: any): any | null {
@@ -144,9 +125,7 @@ function findExistingGraphTab(tabs: any): any | null {
     }
   }
 
-  const existingTab = tabs._tabs?.find(
-    (tab: any) => tab.type === TAB_TYPE,
-  );
+  const existingTab = tabs._tabs?.find((tab: any) => tab.type === TAB_TYPE);
 
   if (existingTab) {
     addon.data.graphTabID = existingTab.id;
@@ -163,9 +142,7 @@ export async function openCitationMapWindow(
   const mainWindow = hostWindow ?? getDefaultMainWindow();
   installTabHooks(mainWindow);
 
-  const snapshot = await loadWholeLibrary(
-    Zotero.Libraries.userLibraryID,
-  );
+  const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
 
   const tabs = getTabs(mainWindow);
   const existingTab = findExistingGraphTab(tabs);
@@ -216,7 +193,6 @@ export async function detachCitationMapTab(
   );
 }
 
-
 export async function refreshOpenCitationMapViews(): Promise<void> {
   if (!addon.data.graphTabID) return;
 
@@ -234,7 +210,6 @@ export async function refreshOpenCitationMapViews(): Promise<void> {
     }
   }
 }
-
 
 function closeEnumeratedPluginWindows(): void {
   try {
@@ -257,7 +232,9 @@ function closeEnumeratedPluginWindows(): void {
         const document = candidate.document;
         const root = document?.documentElement;
         const windowType = root?.getAttribute?.("windowtype") ?? "";
-        const title = String(document?.title ?? root?.getAttribute?.("title") ?? "").trim();
+        const title = String(
+          document?.title ?? root?.getAttribute?.("title") ?? "",
+        ).trim();
         const isCitationMapWindow =
           windowType === "citationmap:window" ||
           Boolean(document?.getElementById?.(WINDOW_MOUNT_ID));
@@ -276,10 +253,7 @@ function closeEnumeratedPluginWindows(): void {
 }
 
 export function closeCitationMapWindow(): void {
-  if (
-    addon.data.graphWindow &&
-    !addon.data.graphWindow.closed
-  ) {
+  if (addon.data.graphWindow && !addon.data.graphWindow.closed) {
     addon.data.graphWindow.close();
   }
 

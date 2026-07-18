@@ -14,7 +14,10 @@ interface SemanticScholarPaper {
   title?: string | null;
   year?: number | null;
   citationCount?: number | null;
+  influentialCitationCount?: number | null;
   referenceCount?: number | null;
+  isOpenAccess?: boolean | null;
+  publicationTypes?: string[] | null;
   authors?: Array<{ name?: string | null }>;
   externalIds?: {
     DOI?: string | null;
@@ -102,7 +105,10 @@ export const semanticScholarProvider: CitationProvider = {
       "authors",
       "externalIds",
       "citationCount",
+      "influentialCitationCount",
       "referenceCount",
+      "isOpenAccess",
+      "publicationTypes",
       "references.paperId",
       "references.title",
       "references.year",
@@ -129,7 +135,6 @@ export const semanticScholarProvider: CitationProvider = {
 
     const paper = response.data;
     const references = mapReferences(paper.references);
-    const declaredReferenceCount = numberOrNull(paper.referenceCount);
 
     return {
       status: "success",
@@ -142,13 +147,20 @@ export const semanticScholarProvider: CitationProvider = {
       authors: getAuthors(paper),
       citationCount: numberOrNull(paper.citationCount),
       citationCountProvider: "semantic-scholar",
-      referenceCount:
-        declaredReferenceCount === null
-          ? references.length
-          : Math.max(declaredReferenceCount, references.length),
+      referenceCount: numberOrNull(paper.referenceCount),
       referenceCountProvider: "semantic-scholar",
       resolvedReferenceCount: references.length,
       references,
+      influentialCitationCount: numberOrNull(paper.influentialCitationCount),
+      isOpenAccess:
+        typeof paper.isOpenAccess === "boolean" ? paper.isOpenAccess : null,
+      openAccessStatus:
+        typeof paper.isOpenAccess === "boolean"
+          ? paper.isOpenAccess
+            ? "open"
+            : "closed"
+          : null,
+      publicationType: stringOrNull(paper.publicationTypes?.[0]),
     };
   },
 };

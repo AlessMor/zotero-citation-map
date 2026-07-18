@@ -1,4 +1,5 @@
 import type {
+  CitationYearCount,
   IdentifierKind,
   ProviderLookupResult,
   RelatedWorkMetadata,
@@ -18,6 +19,22 @@ interface OpenAlexWork {
   cited_by_count?: number | null;
   referenced_works_count?: number | null;
   referenced_works?: string[];
+  fwci?: number | null;
+  citation_normalized_percentile?: {
+    value?: number | null;
+    is_in_top_1_percent?: boolean | null;
+    is_in_top_10_percent?: boolean | null;
+  } | null;
+  counts_by_year?: Array<{
+    year?: number | null;
+    cited_by_count?: number | null;
+  }>;
+  is_retracted?: boolean | null;
+  open_access?: {
+    is_oa?: boolean | null;
+    oa_status?: string | null;
+  } | null;
+  type?: string | null;
   authorships?: Array<{
     author?: {
       display_name?: string | null;
@@ -61,6 +78,57 @@ function mapReferences(work: OpenAlexWork): RelatedWorkMetadata[] {
     }));
 }
 
+function mapCitationCountsByYear(work: OpenAlexWork): CitationYearCount[] {
+  return (work.counts_by_year ?? [])
+    .map((entry) => ({
+      year: Number(entry.year),
+      count: Number(entry.cited_by_count),
+    }))
+    .filter(
+      (entry) =>
+        Number.isInteger(entry.year) &&
+        entry.year > 0 &&
+        Number.isFinite(entry.count) &&
+        entry.count >= 0,
+    )
+    .sort((left, right) => left.year - right.year);
+}
+
+function deriveRecentCitationMetrics(counts: CitationYearCount[]): {
+  citationsLastYear: number | null;
+  citationVelocity: number | null;
+  citationAcceleration: number | null;
+} {
+  if (counts.length === 0) {
+    return {
+      citationsLastYear: null,
+      citationVelocity: null,
+      citationAcceleration: null,
+    };
+  }
+
+  const countByYear = new Map(counts.map((entry) => [entry.year, entry.count]));
+  const latestCompleteYear = new Date().getUTCFullYear() - 1;
+  const previousYear = latestCompleteYear - 1;
+  const recentYears = [
+    latestCompleteYear - 2,
+    previousYear,
+    latestCompleteYear,
+  ];
+  const citationsLastYear = countByYear.get(latestCompleteYear) ?? 0;
+  const citationVelocity =
+    recentYears.reduce((sum, year) => sum + (countByYear.get(year) ?? 0), 0) /
+    recentYears.length;
+  const citationAcceleration =
+    citationsLastYear - (countByYear.get(previousYear) ?? 0);
+
+  return {
+    citationsLastYear,
+    citationVelocity,
+    citationAcceleration,
+  };
+}
+
 export const openAlexProvider: CitationProvider = {
   id: "openalex",
   label: "OpenAlex",
@@ -95,6 +163,12 @@ export const openAlexProvider: CitationProvider = {
       "referenced_works_count",
       "referenced_works",
       "authorships",
+      "fwci",
+      "citation_normalized_percentile",
+      "counts_by_year",
+      "is_retracted",
+      "open_access",
+      "type",
     ].join(",");
 
     const url =
@@ -115,11 +189,12 @@ export const openAlexProvider: CitationProvider = {
     }
 
     const work = response.data;
-    const references = mapReferences(work);
-    const declaredReferenceCount = numberOrNull(work.referenced_works_count);
     const authors = (work.authorships ?? [])
       .map((entry) => stringOrNull(entry.author?.display_name))
       .filter((name): name is string => Boolean(name));
+    const references = mapReferences(work);
+    const citationCountsByYear = mapCitationCountsByYear(work);
+    const recentMetrics = deriveRecentCitationMetrics(citationCountsByYear);
 
     return {
       status: "success",
@@ -132,13 +207,34 @@ export const openAlexProvider: CitationProvider = {
       authors,
       citationCount: numberOrNull(work.cited_by_count),
       citationCountProvider: "openalex",
-      referenceCount:
-        declaredReferenceCount === null
-          ? references.length
-          : Math.max(declaredReferenceCount, references.length),
+      referenceCount: numberOrNull(work.referenced_works_count),
       referenceCountProvider: "openalex",
       resolvedReferenceCount: references.length,
       references,
+      fwci: numberOrNull(work.fwci),
+      citationPercentile: numberOrNull(
+        work.citation_normalized_percentile?.value,
+      ),
+      isTop1Percent:
+        typeof work.citation_normalized_percentile?.is_in_top_1_percent ===
+        "boolean"
+          ? work.citation_normalized_percentile.is_in_top_1_percent
+          : null,
+      isTop10Percent:
+        typeof work.citation_normalized_percentile?.is_in_top_10_percent ===
+        "boolean"
+          ? work.citation_normalized_percentile.is_in_top_10_percent
+          : null,
+      citationCountsByYear,
+      ...recentMetrics,
+      isRetracted:
+        typeof work.is_retracted === "boolean" ? work.is_retracted : null,
+      openAccessStatus: stringOrNull(work.open_access?.oa_status),
+      isOpenAccess:
+        typeof work.open_access?.is_oa === "boolean"
+          ? work.open_access.is_oa
+          : null,
+      publicationType: stringOrNull(work.type),
     };
   },
 };

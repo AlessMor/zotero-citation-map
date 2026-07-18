@@ -64,7 +64,9 @@ function toExternalWork(work: OpenAlexWork): ExternalWork | null {
   };
 }
 
-async function fetchOpenAlexWork(providerWorkID: string): Promise<ExternalWork | null> {
+async function fetchOpenAlexWork(
+  providerWorkID: string,
+): Promise<ExternalWork | null> {
   const id = shortID(providerWorkID);
   if (!id) return null;
   if (workCache.has(id)) return workCache.get(id) ?? null;
@@ -82,12 +84,15 @@ async function fetchOpenAlexWork(providerWorkID: string): Promise<ExternalWork |
     "openalex",
     `https://api.openalex.org/works/${encodeURIComponent(id)}?select=${encodeURIComponent(select)}`,
   );
-  const result = response.ok && response.data ? toExternalWork(response.data) : null;
+  const result =
+    response.ok && response.data ? toExternalWork(response.data) : null;
   workCache.set(id, result);
   return result;
 }
 
-function metadataToExternal(reference: RelatedWorkMetadata): ExternalWork | null {
+function metadataToExternal(
+  reference: RelatedWorkMetadata,
+): ExternalWork | null {
   const id = shortID(reference.providerWorkID);
   if (!id || !reference.title) return null;
   return {
@@ -114,8 +119,11 @@ export async function getExternalReferences(
   const results: ExternalWork[] = [];
   for (const reference of record.references.slice(0, maximum)) {
     const embedded = metadataToExternal(reference);
-    const resolved = embedded ??
-      (reference.providerWorkID ? await fetchOpenAlexWork(reference.providerWorkID) : null);
+    const resolved =
+      embedded ??
+      (reference.providerWorkID
+        ? await fetchOpenAlexWork(reference.providerWorkID)
+        : null);
     if (resolved) results.push(resolved);
   }
   return results;
@@ -156,7 +164,10 @@ export async function getMissingPaperRecommendations(
   );
   const scores = new Map<string, number>();
   for (const node of nodes) {
-    const record = getCitationMetricRecord(Zotero.Libraries.userLibraryID, node.itemKey);
+    const record = getCitationMetricRecord(
+      Zotero.Libraries.userLibraryID,
+      node.itemKey,
+    );
     if (!record) continue;
     const seenForPaper = new Set<string>();
     for (const reference of record.references) {
@@ -183,7 +194,8 @@ export async function importExternalWork(
   libraryID: number,
   collectionIDs: number[] = [],
 ): Promise<Zotero.Item[]> {
-  if (!work.doi) throw new Error("This work has no DOI available for Zotero import.");
+  if (!work.doi)
+    throw new Error("This work has no DOI available for Zotero import.");
   const translate = new (Zotero.Translate as any).Search();
   translate.setIdentifier({ DOI: work.doi });
   const translators = await translate.getTranslators();
