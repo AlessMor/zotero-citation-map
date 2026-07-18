@@ -1,6 +1,17 @@
-import type { CitationMetricStatus, CitationProviderID } from "./citationTypes";
+import type {
+  CitationMetricStatus,
+  CitationProviderID,
+  IdentifierKind,
+} from "./citationTypes";
 
-export type GraphAxisMetric = "none" | "year" | "citations" | "references";
+export type GraphAxisMetric =
+  | "none"
+  | "year"
+  | "citations"
+  | "references"
+  | "library-coverage"
+  | "citation-velocity"
+  | "citation-acceleration";
 
 export type GraphScaleType = "linear" | "log";
 
@@ -22,15 +33,48 @@ export interface CitationGraphNode {
 
   citationCount: number | null;
   referenceCount: number | null;
+  resolvedReferenceCount: number;
+  referenceCoverage: number | null;
   metricsUpdatedAt: string | null;
+  dataAgeDays: number | null;
 
   provider: CitationProviderID | null;
+  citationCountProvider: CitationProviderID | null;
+  referenceCountProvider: CitationProviderID | null;
   providerWorkID: string | null;
+  matchedBy: IdentifierKind | null;
+  matchConfidence: number | null;
   metricStatus: CitationMetricStatus | null;
-  resolvedReferenceCount: number;
+
+  fwci: number | null;
+  citationPercentile: number | null;
+  isTop1Percent: boolean | null;
+  isTop10Percent: boolean | null;
+  citationsLastYear: number | null;
+  citationVelocity: number | null;
+  citationAcceleration: number | null;
+  influentialCitationCount: number | null;
+  isRetracted: boolean | null;
+  openAccessStatus: string | null;
+  isOpenAccess: boolean | null;
+  publicationType: string | null;
+  metadataCompleteness: number;
 
   incomingLibraryCitations: number;
   outgoingLibraryReferences: number;
+  libraryCoverage: number | null;
+  localGlobalImpactRatio: number | null;
+  pageRank: number;
+  betweennessCentrality: number;
+  eigenvectorCentrality: number;
+  componentSize: number;
+  citationChainDepth: number;
+  isIsolated: boolean;
+
+  referenceAgeMean: number | null;
+  referenceAgeSpread: number | null;
+  selfCitationEstimate: number | null;
+  futureReferenceCount: number | null;
 }
 
 export interface CitationGraphEdge {

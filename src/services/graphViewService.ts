@@ -16,6 +16,19 @@ import type {
 } from "../domain/types";
 import { buildCitationGraph } from "./citationGraphService";
 import { CitationGraphRenderer } from "./citationGraphRenderer";
+import {
+  getExternalCitedBy,
+  getExternalReferences,
+  getMissingPaperRecommendations,
+  importExternalWork,
+  type ExternalWork,
+} from "./externalDiscoveryService";
+import {
+  formatGraphMetricValue,
+  GRAPH_AXIS_OPTIONS,
+  graphMetricLabel,
+  graphMetricSupportsLog,
+} from "./graphMetricDefinitions";
 
 const HTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
@@ -40,6 +53,7 @@ function createHTMLElement<K extends keyof HTMLElementTagNameMap>(
     tagName,
   ) as HTMLElementTagNameMap[K];
 }
+
 
 function createGraphControlIcon(
   document: Document,
@@ -90,7 +104,8 @@ function ensureGraphStyle(document: Document): void {
     return;
   }
 
-  const stylesheetURL = `chrome://${config.addonRef}/content/graph.css`;
+  const stylesheetURL =
+    `chrome://${config.addonRef}/content/graph.css`;
 
   if (document.head) {
     const link = createHTMLElement(document, "link");
@@ -98,12 +113,16 @@ function ensureGraphStyle(document: Document): void {
     link.href = stylesheetURL;
     document.head.appendChild(link);
   } else {
-    const processingInstruction = document.createProcessingInstruction(
-      "xml-stylesheet",
-      `href="${stylesheetURL}" type="text/css"`,
-    );
+    const processingInstruction =
+      document.createProcessingInstruction(
+        "xml-stylesheet",
+        `href="${stylesheetURL}" type="text/css"`,
+      );
 
-    document.insertBefore(processingInstruction, document.documentElement);
+    document.insertBefore(
+      processingInstruction,
+      document.documentElement,
+    );
   }
 
   styledDocuments.add(document);
@@ -129,7 +148,9 @@ function formatCount(value: number): string {
   return new Intl.NumberFormat().format(value);
 }
 
-function createStatisticsSummary(snapshot: LibrarySnapshot): string {
+function createStatisticsSummary(
+  snapshot: LibrarySnapshot,
+): string {
   const statistics = snapshot.statistics;
 
   return [
@@ -160,8 +181,13 @@ function getFallbackSearchText(paper: ZoteroPaper): string {
   );
 }
 
-function fallbackSearch(query: string, papers: ZoteroPaper[]): number[] {
-  const tokens = normalizeSearchText(query).split(/\s+/).filter(Boolean);
+function fallbackSearch(
+  query: string,
+  papers: ZoteroPaper[],
+): number[] {
+  const tokens = normalizeSearchText(query)
+    .split(/\s+/)
+    .filter(Boolean);
 
   if (tokens.length === 0) {
     return papers.map((paper) => paper.itemID);
@@ -179,12 +205,18 @@ async function runZoteroSearch(
   query: string,
   snapshot: LibrarySnapshot,
 ): Promise<number[]> {
-  const allowedItemIDs = new Set(snapshot.papers.map((paper) => paper.itemID));
+  const allowedItemIDs = new Set(
+    snapshot.papers.map((paper) => paper.itemID),
+  );
 
   try {
     const search = new Zotero.Search();
     Reflect.set(search, "libraryID", snapshot.libraryID);
-    search.addCondition("quicksearch-fields", "contains", query);
+    search.addCondition(
+      "quicksearch-fields",
+      "contains",
+      query,
+    );
 
     const itemIDs = await search.search();
 
@@ -284,19 +316,6 @@ function readNodeLabelMode(): GraphNodeLabelMode {
   return value === "author-year" ? "author-year" : "title";
 }
 
-function metricLabel(metric: GraphAxisMetric): string {
-  switch (metric) {
-    case "year":
-      return "Publication year";
-    case "citations":
-      return "Citations";
-    case "references":
-      return "References";
-    case "none":
-      return "Force layout";
-  }
-}
-
 function scaleLabel(scale: GraphScaleType): string {
   return scale === "log" ? "Log" : "Linear";
 }
@@ -329,10 +348,7 @@ function createAxisPicker(
   popover.className = "cm-axis-popover";
   popover.hidden = true;
   popover.setAttribute("role", "dialog");
-  popover.setAttribute(
-    "aria-label",
-    `${orientation.toUpperCase()} axis options`,
-  );
+  popover.setAttribute("aria-label", `${orientation.toUpperCase()} axis options`);
   root.appendChild(popover);
 
   popover.appendChild(
@@ -344,12 +360,7 @@ function createAxisPicker(
     ),
   );
   popover.appendChild(
-    createTextElement(
-      document,
-      "div",
-      "Position",
-      "cm-axis-popover-section-title",
-    ),
+    createTextElement(document, "div", "Position", "cm-axis-popover-section-title"),
   );
 
   let metric: GraphAxisMetric = "none";
@@ -360,24 +371,34 @@ function createAxisPicker(
 
   const metricList = createHTMLElement(document, "div");
   metricList.className = "cm-axis-option-list";
-  const metricOptions: Array<[GraphAxisMetric, string]> = [
-    ["none", "Force layout"],
-    ["year", "Publication year"],
-    ["citations", "Citations"],
-    ["references", "References"],
-  ];
-  for (const [value, label] of metricOptions) {
+  let currentGroup = "";
+  for (const definition of GRAPH_AXIS_OPTIONS) {
+    if (definition.group !== currentGroup) {
+      currentGroup = definition.group;
+      metricList.appendChild(
+        createTextElement(
+          document,
+          "div",
+          currentGroup,
+          "cm-axis-option-group",
+        ),
+      );
+    }
+
     const option = createHTMLElement(document, "button");
     option.type = "button";
     option.className = "cm-axis-option";
-    option.textContent = label;
-    option.dataset.value = value;
+    option.textContent = definition.label;
+    option.dataset.value = definition.metric;
     option.addEventListener("click", () => {
-      metric = value;
+      metric = definition.metric;
+      if (!graphMetricSupportsLog(metric)) {
+        scale = "linear";
+      }
       updateDisplay();
       changeListener?.();
     });
-    metricButtons.set(value, option);
+    metricButtons.set(definition.metric, option);
     metricList.appendChild(option);
   }
   popover.appendChild(metricList);
@@ -385,12 +406,7 @@ function createAxisPicker(
   const scaleSection = createHTMLElement(document, "div");
   scaleSection.className = "cm-axis-scale-section";
   scaleSection.appendChild(
-    createTextElement(
-      document,
-      "div",
-      "Scale",
-      "cm-axis-popover-section-title",
-    ),
+    createTextElement(document, "div", "Scale", "cm-axis-popover-section-title"),
   );
   const scaleList = createHTMLElement(document, "div");
   scaleList.className = "cm-axis-scale-options";
@@ -404,6 +420,9 @@ function createAxisPicker(
     option.textContent = label;
     option.dataset.value = value;
     option.addEventListener("click", () => {
+      if (value === "log" && !graphMetricSupportsLog(metric)) {
+        return;
+      }
       scale = value;
       updateDisplay();
       changeListener?.();
@@ -415,17 +434,18 @@ function createAxisPicker(
   popover.appendChild(scaleSection);
 
   const updateDisplay = (): void => {
-    metricText.textContent = metricLabel(metric);
+    metricText.textContent = graphMetricLabel(metric);
     scaleText.textContent = metric === "none" ? "" : scaleLabel(scale);
     scaleText.hidden = metric === "none";
     for (const [value, option] of metricButtons) {
       option.dataset.selected = String(value === metric);
       option.setAttribute("aria-pressed", String(value === metric));
     }
+    const supportsLog = graphMetricSupportsLog(metric);
     for (const [value, option] of scaleButtons) {
       option.dataset.selected = String(value === scale);
       option.setAttribute("aria-pressed", String(value === scale));
-      option.disabled = metric === "none";
+      option.disabled = metric === "none" || (value === "log" && !supportsLog);
     }
     scaleSection.dataset.disabled = String(metric === "none");
   };
@@ -462,10 +482,7 @@ function buildCollectionVisuals(
   nodes: CitationGraphNode[],
 ): CollectionVisuals {
   const collectionsByID = new Map(
-    snapshot.collections.map((collection) => [
-      collection.collectionID,
-      collection,
-    ]),
+    snapshot.collections.map((collection) => [collection.collectionID, collection]),
   );
   const topLevelCollections = snapshot.collections
     .filter((collection) => collectionDepth(collection.path) === 1)
@@ -484,9 +501,7 @@ function buildCollectionVisuals(
   for (const node of nodes) {
     const directCollections = node.collectionIDs
       .map((collectionID) => collectionsByID.get(collectionID))
-      .filter((collection): collection is LibraryCollectionFilter =>
-        Boolean(collection),
-      )
+      .filter((collection): collection is LibraryCollectionFilter => Boolean(collection))
       .sort((left, right) => left.path.localeCompare(right.path));
 
     const topLevelMatches = topLevelCollections.filter((topLevel) =>
@@ -496,10 +511,8 @@ function buildCollectionVisuals(
     );
     const primary = topLevelMatches[0] ?? directCollections[0] ?? null;
     const color = primary
-      ? (colorByCollectionID.get(primary.collectionID) ??
-        COLLECTION_PALETTE[
-          hashCollection(primary.path) % COLLECTION_PALETTE.length
-        ])
+      ? colorByCollectionID.get(primary.collectionID) ??
+        COLLECTION_PALETTE[hashCollection(primary.path) % COLLECTION_PALETTE.length]
       : UNFILED_COLOR;
     const label =
       directCollections.length > 0
@@ -560,7 +573,188 @@ function formatDate(value: string | null): string {
   }
 
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString();
+}
+
+function formatNullableMetric(
+  metric: GraphAxisMetric,
+  value: number | null,
+): string {
+  return value === null ? "—" : formatGraphMetricValue(metric, value);
+}
+
+function formatBoolean(value: boolean | null): string {
+  return value === null ? "—" : value ? "Yes" : "No";
+}
+
+function formatProvider(value: string | null): string {
+  switch (value) {
+    case "openalex":
+      return "OpenAlex";
+    case "semantic-scholar":
+      return "Semantic Scholar";
+    case "crossref":
+      return "Crossref";
+    case "opencitations":
+      return "OpenCitations";
+    case "inspire":
+      return "INSPIRE-HEP";
+    default:
+      return value ?? "—";
+  }
+}
+
+function formatStatus(value: string | null): string {
+  return value ? value.replaceAll("-", " ") : "—";
+}
+
+function formatIdentifier(value: string | null): string {
+  if (!value) {
+    return "—";
+  }
+  return value === "pmid"
+    ? "PMID"
+    : value === "isbn"
+      ? "ISBN"
+      : value === "doi"
+        ? "DOI"
+        : value === "arxiv"
+          ? "arXiv"
+          : value;
+}
+
+
+function downloadTextFile(
+  document: Document,
+  filename: string,
+  content: string,
+  mimeType: string,
+): void {
+  const view = document.defaultView;
+  if (!view) return;
+  const blob = new view.Blob([content], { type: mimeType });
+  const url = view.URL.createObjectURL(blob);
+  const anchor = createHTMLElement(document, "a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.hidden = true;
+  document.documentElement.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  view.setTimeout(() => view.URL.revokeObjectURL(url), 1000);
+}
+
+function csvCell(value: unknown): string {
+  const text = value === null || value === undefined ? "" : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function exportGraphJSON(
+  document: Document,
+  snapshot: LibrarySnapshot,
+  graph: ReturnType<typeof buildCitationGraph>,
+): void {
+  downloadTextFile(
+    document,
+    `citation-map-${new Date().toISOString().slice(0, 10)}.json`,
+    JSON.stringify(
+      {
+        format: "zotero-citation-map",
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        library: { id: snapshot.libraryID, name: snapshot.libraryName },
+        nodes: graph.nodes,
+        edges: graph.edges,
+      },
+      null,
+      2,
+    ),
+    "application/json",
+  );
+}
+
+function exportGraphCSV(
+  document: Document,
+  graph: ReturnType<typeof buildCitationGraph>,
+): void {
+  const nodeByKey = new Map(graph.nodes.map((node) => [node.key, node]));
+  const lines = [
+    ["source_key", "source_title", "target_key", "target_title"].join(","),
+    ...graph.edges.map((edge) => {
+      const source = nodeByKey.get(edge.source);
+      const target = nodeByKey.get(edge.target);
+      return [edge.source, source?.title ?? "", edge.target, target?.title ?? ""]
+        .map(csvCell)
+        .join(",");
+    }),
+  ];
+  downloadTextFile(
+    document,
+    `citation-map-edges-${new Date().toISOString().slice(0, 10)}.csv`,
+    lines.join("\n"),
+    "text/csv;charset=utf-8",
+  );
+}
+
+async function importGraphJSON(
+  document: Document,
+  snapshot: LibrarySnapshot,
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const input = createHTMLElement(document, "input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.hidden = true;
+    document.documentElement.appendChild(input);
+    input.addEventListener(
+      "change",
+      async () => {
+        try {
+          const file = input.files?.[0];
+          if (!file) {
+            resolve(0);
+            return;
+          }
+          const parsed = JSON.parse(await file.text()) as {
+            nodes?: Array<{ doi?: string | null; title?: string; providerWorkID?: string }>;
+          };
+          const localDOIs = new Set(
+            snapshot.papers
+              .map((paper) => normalizeSearchText(paper.doi ?? ""))
+              .filter(Boolean),
+          );
+          let imported = 0;
+          for (const node of parsed.nodes ?? []) {
+            const doi = node.doi?.trim() ?? "";
+            if (!doi || localDOIs.has(normalizeSearchText(doi))) continue;
+            const work: ExternalWork = {
+              providerWorkID: node.providerWorkID ?? "imported-json",
+              doi,
+              title: node.title?.trim() || doi,
+              year: null,
+              authors: [],
+              citationCount: null,
+              referenceCount: null,
+            };
+            const items = await importExternalWork(work, snapshot.libraryID);
+            if (items.length > 0) {
+              imported += items.length;
+              localDOIs.add(normalizeSearchText(doi));
+            }
+          }
+          resolve(imported);
+        } catch (error) {
+          reject(error);
+        } finally {
+          input.remove();
+        }
+      },
+      { once: true },
+    );
+    input.click();
+  });
 }
 
 export function destroyCitationMapView(mount: Element): void {
@@ -597,7 +791,9 @@ export function renderCitationMapView(
   titleIcon.src = `chrome://${config.addonRef}/content/icons/network.svg`;
   titleIcon.alt = "";
   titleRow.appendChild(titleIcon);
-  titleRow.appendChild(createTextElement(document, "h1", "Citation Map"));
+  titleRow.appendChild(
+    createTextElement(document, "h1", "Citation Map"),
+  );
   headingGroup.appendChild(titleRow);
   headingGroup.appendChild(
     createTextElement(
@@ -643,7 +839,11 @@ export function renderCitationMapView(
   );
   for (const collection of snapshot.collections) {
     collectionControl.select.appendChild(
-      createOption(document, String(collection.collectionID), collection.path),
+      createOption(
+        document,
+        String(collection.collectionID),
+        collection.path,
+      ),
     );
   }
   searchFilterRow.appendChild(collectionControl.wrapper);
@@ -689,6 +889,28 @@ export function renderCitationMapView(
     missingReferences.wrapper,
   );
   toolbar.appendChild(missingControls);
+
+  const discoveryActions = createHTMLElement(document, "div");
+  discoveryActions.className = "cm-discovery-actions";
+  const recommendationsButton = createHTMLElement(document, "button");
+  recommendationsButton.type = "button";
+  recommendationsButton.textContent = "Missing papers";
+  const exportJSONButton = createHTMLElement(document, "button");
+  exportJSONButton.type = "button";
+  exportJSONButton.textContent = "Export JSON";
+  const exportCSVButton = createHTMLElement(document, "button");
+  exportCSVButton.type = "button";
+  exportCSVButton.textContent = "Export CSV";
+  const importJSONButton = createHTMLElement(document, "button");
+  importJSONButton.type = "button";
+  importJSONButton.textContent = "Import JSON";
+  discoveryActions.append(
+    recommendationsButton,
+    exportJSONButton,
+    exportCSVButton,
+    importJSONButton,
+  );
+  toolbar.appendChild(discoveryActions);
 
   const graphStatus = createTextElement(
     document,
@@ -751,6 +973,7 @@ export function renderCitationMapView(
   emptyState.appendChild(emptyStateText);
   graphSurface.appendChild(emptyState);
 
+
   graphSurface.append(yAxisPicker.root, xAxisPicker.root);
 
   const zoomControls = createHTMLElement(document, "div");
@@ -802,18 +1025,109 @@ export function renderCitationMapView(
   detailPanel.className = "cm-detail-panel";
   detailPanel.setAttribute("aria-label", "Selected paper details");
 
-  const renderDetails = (node: CitationGraphNode | null): void => {
-    clearElement(detailPanel);
+  let selectedNode: CitationGraphNode | null = null;
 
-    if (!node) {
+  const renderExternalWorks = (
+    title: string,
+    works: ExternalWork[],
+    backNode: CitationGraphNode | null,
+  ): void => {
+    clearElement(detailPanel);
+    const heading = createHTMLElement(document, "div");
+    heading.className = "cm-external-heading";
+    const backButton = createHTMLElement(document, "button");
+    backButton.type = "button";
+    backButton.textContent = "Back";
+    backButton.addEventListener("click", () => renderDetails(backNode));
+    heading.append(backButton, createTextElement(document, "h2", title));
+    detailPanel.appendChild(heading);
+
+    if (works.length === 0) {
       detailPanel.appendChild(
-        createTextElement(document, "h2", "Paper details"),
+        createTextElement(document, "p", "No external works were found.", "cm-detail-placeholder"),
       );
+      return;
+    }
+
+    const localDOIs = new Set(
+      snapshot.papers
+        .map((paper) => normalizeSearchText(paper.doi ?? ""))
+        .filter(Boolean),
+    );
+    const list = createHTMLElement(document, "div");
+    list.className = "cm-external-list";
+    for (const work of works) {
+      const card = createHTMLElement(document, "article");
+      card.className = "cm-external-work";
+      card.appendChild(createTextElement(document, "h3", work.title));
+      const metadata = [
+        work.authors.slice(0, 3).join(", "),
+        work.year ? String(work.year) : "",
+        work.citationCount === null ? "" : `${formatCount(work.citationCount)} citations`,
+        work.recommendationScore
+          ? `cited by ${work.recommendationScore} library papers`
+          : "",
+      ].filter(Boolean).join(" · ");
+      if (metadata) {
+        card.appendChild(createTextElement(document, "p", metadata, "cm-external-meta"));
+      }
+      const actions = createHTMLElement(document, "div");
+      actions.className = "cm-detail-actions";
+      if (work.doi) {
+        const openButton = createHTMLElement(document, "button");
+        openButton.type = "button";
+        openButton.textContent = "Open DOI";
+        openButton.addEventListener("click", () => {
+          Zotero.launchURL(`https://doi.org/${encodeURIComponent(work.doi ?? "")}`);
+        });
+        actions.appendChild(openButton);
+
+        const normalizedDOI = normalizeSearchText(work.doi);
+        const addButton = createHTMLElement(document, "button");
+        addButton.type = "button";
+        const alreadyLocal = localDOIs.has(normalizedDOI);
+        addButton.disabled = alreadyLocal;
+        addButton.textContent = alreadyLocal ? "Already in Zotero" : "Add to Zotero";
+        addButton.addEventListener("click", async () => {
+          addButton.disabled = true;
+          addButton.textContent = "Adding…";
+          try {
+            const items = await importExternalWork(work, snapshot.libraryID);
+            if (items.length === 0) throw new Error("No item was imported.");
+            localDOIs.add(normalizedDOI);
+            addButton.textContent = "Added";
+          } catch (error) {
+            Zotero.logError(error instanceof Error ? error : new Error(String(error)));
+            addButton.disabled = false;
+            addButton.textContent = "Import failed";
+          }
+        });
+        actions.appendChild(addButton);
+      }
+      card.appendChild(actions);
+      list.appendChild(card);
+    }
+    detailPanel.appendChild(list);
+  };
+
+  const showLoading = (title: string): void => {
+    clearElement(detailPanel);
+    detailPanel.appendChild(createTextElement(document, "h2", title));
+    detailPanel.appendChild(
+      createTextElement(document, "p", "Loading from OpenAlex…", "cm-detail-placeholder"),
+    );
+  };
+
+  const renderDetails = (node: CitationGraphNode | null): void => {
+    selectedNode = node;
+    clearElement(detailPanel);
+    if (!node) {
+      detailPanel.appendChild(createTextElement(document, "h2", "Paper details"));
       detailPanel.appendChild(
         createTextElement(
           document,
           "p",
-          "Select a node to inspect it. Double-click a node to show the paper in Zotero.",
+          "Select a node. Use References or Cited by to browse papers outside the current Zotero graph.",
           "cm-detail-placeholder",
         ),
       );
@@ -829,16 +1143,10 @@ export function renderCitationMapView(
         "cm-detail-authors",
       ),
     );
-
     const rows = createHTMLElement(document, "div");
     rows.className = "cm-detail-rows";
     rows.append(
       createDetailRow(document, "Year", node.year ? String(node.year) : "—"),
-      createDetailRow(
-        document,
-        "Collections",
-        collectionVisuals.labelByNodeKey.get(node.key) ?? "Unfiled",
-      ),
       createDetailRow(
         document,
         "Citations",
@@ -851,67 +1159,60 @@ export function renderCitationMapView(
       ),
       createDetailRow(
         document,
-        "Citations in graph",
-        formatCount(node.incomingLibraryCitations),
+        "Library coverage",
+        formatNullableMetric("library-coverage", node.libraryCoverage),
       ),
       createDetailRow(
         document,
-        "References in graph",
-        formatCount(node.outgoingLibraryReferences),
+        "Citation velocity",
+        formatNullableMetric("citation-velocity", node.citationVelocity),
       ),
       createDetailRow(
         document,
-        "Structured references cached",
-        formatCount(node.resolvedReferenceCount),
+        "Citation acceleration",
+        formatNullableMetric("citation-acceleration", node.citationAcceleration),
       ),
-      createDetailRow(document, "Updated", formatDate(node.metricsUpdatedAt)),
     );
     detailPanel.appendChild(rows);
 
-    if (node.doi) {
-      const doi = createTextElement(
-        document,
-        "p",
-        `DOI: ${node.doi}`,
-        "cm-detail-doi",
-      );
-      detailPanel.appendChild(doi);
-    }
-
-    if (node.tags.length > 0) {
-      const tags = createHTMLElement(document, "div");
-      tags.className = "cm-detail-tags";
-      for (const tag of node.tags.slice(0, 16)) {
-        tags.appendChild(
-          createTextElement(document, "span", tag, "cm-detail-tag"),
-        );
-      }
-      detailPanel.appendChild(tags);
-    }
-
     const actions = createHTMLElement(document, "div");
     actions.className = "cm-detail-actions";
-
     const showButton = createHTMLElement(document, "button");
     showButton.type = "button";
     showButton.textContent = "Show in Zotero";
-    showButton.addEventListener("click", () => {
-      void options.onSelectPaper(node.itemID);
-    });
+    showButton.addEventListener("click", () => void options.onSelectPaper(node.itemID));
     actions.appendChild(showButton);
+
+    const referencesButton = createHTMLElement(document, "button");
+    referencesButton.type = "button";
+    referencesButton.textContent = "References";
+    referencesButton.addEventListener("click", async () => {
+      showLoading("References");
+      const works = await getExternalReferences(node);
+      renderExternalWorks("References", works, node);
+    });
+    actions.appendChild(referencesButton);
+
+    const citedByButton = createHTMLElement(document, "button");
+    citedByButton.type = "button";
+    citedByButton.textContent = "Cited by";
+    citedByButton.disabled = !node.providerWorkID;
+    citedByButton.addEventListener("click", async () => {
+      showLoading("Cited by");
+      const works = await getExternalCitedBy(node);
+      renderExternalWorks("Cited by", works, node);
+    });
+    actions.appendChild(citedByButton);
 
     if (node.doi) {
       const doiButton = createHTMLElement(document, "button");
       doiButton.type = "button";
       doiButton.textContent = "Open DOI";
       doiButton.addEventListener("click", () => {
-        Zotero.launchURL(
-          `https://doi.org/${encodeURIComponent(node.doi ?? "")}`,
-        );
+        Zotero.launchURL(`https://doi.org/${encodeURIComponent(node.doi ?? "")}`);
       });
       actions.appendChild(doiButton);
     }
-
     detailPanel.appendChild(actions);
   };
 
@@ -943,12 +1244,47 @@ export function renderCitationMapView(
   let searchTimer: number | null = null;
   let searchGeneration = 0;
 
+  recommendationsButton.addEventListener("click", async () => {
+    showLoading("Missing papers");
+    recommendationsButton.disabled = true;
+    try {
+      const visibleNodes = graph.nodes.filter((node) => visibleNodeKeys.has(node.key));
+      const works = await getMissingPaperRecommendations(visibleNodes);
+      renderExternalWorks("Missing papers", works, selectedNode);
+    } catch (error) {
+      Zotero.logError(error instanceof Error ? error : new Error(String(error)));
+      renderExternalWorks("Missing papers", [], selectedNode);
+    } finally {
+      recommendationsButton.disabled = false;
+    }
+  });
+
+  exportJSONButton.addEventListener("click", () => exportGraphJSON(document, snapshot, graph));
+  exportCSVButton.addEventListener("click", () => exportGraphCSV(document, graph));
+  importJSONButton.addEventListener("click", async () => {
+    importJSONButton.disabled = true;
+    const original = importJSONButton.textContent;
+    importJSONButton.textContent = "Importing…";
+    try {
+      const imported = await importGraphJSON(document, snapshot);
+      importJSONButton.textContent = imported > 0 ? `Imported ${imported}` : "Nothing imported";
+    } catch (error) {
+      Zotero.logError(error instanceof Error ? error : new Error(String(error)));
+      importJSONButton.textContent = "Import failed";
+    } finally {
+      document.defaultView?.setTimeout(() => {
+        importJSONButton.textContent = original;
+        importJSONButton.disabled = false;
+      }, 2500);
+    }
+  });
+
   const getCollectionFilter = (): LibraryCollectionFilter | null => {
     const collectionID = Number(collectionControl.select.value);
     return Number.isFinite(collectionID)
-      ? (snapshot.collections.find(
+      ? snapshot.collections.find(
           (collection) => collection.collectionID === collectionID,
-        ) ?? null)
+        ) ?? null
       : null;
   };
 
@@ -979,10 +1315,7 @@ export function renderCitationMapView(
           if (!missingCitations.input.checked && node.citationCount === null) {
             return false;
           }
-          if (
-            !missingReferences.input.checked &&
-            node.referenceCount === null
-          ) {
+          if (!missingReferences.input.checked && node.referenceCount === null) {
             return false;
           }
           return true;
@@ -1044,9 +1377,10 @@ export function renderCitationMapView(
     );
 
     renderer.setSearchMatches(matchingKeys);
-    searchStatus.textContent = `${formatCount(visibleMatches.length)} match${
-      visibleMatches.length === 1 ? "" : "es"
-    } in current graph`;
+    searchStatus.textContent =
+      `${formatCount(visibleMatches.length)} match${
+        visibleMatches.length === 1 ? "" : "es"
+      } in current graph`;
   };
 
   const scheduleSearch = (): void => {
@@ -1054,26 +1388,31 @@ export function renderCitationMapView(
       document.defaultView?.clearTimeout(searchTimer);
     }
 
-    searchTimer =
-      document.defaultView?.setTimeout(() => {
+    searchTimer = document.defaultView?.setTimeout(
+      () => {
         searchTimer = null;
         void applySearch();
-      }, 250) ?? null;
+      },
+      250,
+    ) ?? null;
   };
 
   searchInput.addEventListener("input", scheduleSearch);
-  searchInput.addEventListener("keydown", (event: KeyboardEvent) => {
-    if (event.key === "Escape") {
-      searchInput.value = "";
-      void applySearch();
-    } else if (event.key === "Enter") {
-      if (searchTimer !== null) {
-        document.defaultView?.clearTimeout(searchTimer);
-        searchTimer = null;
+  searchInput.addEventListener(
+    "keydown",
+    (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        searchInput.value = "";
+        void applySearch();
+      } else if (event.key === "Enter") {
+        if (searchTimer !== null) {
+          document.defaultView?.clearTimeout(searchTimer);
+          searchTimer = null;
+        }
+        void applySearch();
       }
-      void applySearch();
-    }
-  });
+    },
+  );
 
   for (const control of [
     collectionControl.select,
@@ -1102,10 +1441,7 @@ export function renderCitationMapView(
 
   const documentPointerListener = (event: Event): void => {
     const target = event.target as Node | null;
-    if (
-      target &&
-      (xAxisPicker.root.contains(target) || yAxisPicker.root.contains(target))
-    ) {
+    if (target && (xAxisPicker.root.contains(target) || yAxisPicker.root.contains(target))) {
       return;
     }
     closeAxisMenus();
