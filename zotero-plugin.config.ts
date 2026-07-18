@@ -21,26 +21,26 @@ export default defineConfig({
       description: pkg.description,
       homepage: pkg.homepage,
       buildVersion: pkg.version,
-      buildTime: "{{buildTime}}"
+      buildTime: "{{buildTime}}",
     },
     prefs: {
-      prefix: pkg.config.prefsPrefix
+      prefix: pkg.config.prefsPrefix,
     },
     esbuildOptions: [
       {
         entryPoints: ["src/index.ts"],
         define: {
-          __env__: `"${process.env.NODE_ENV}"`
+          __env__: `"${process.env.NODE_ENV}"`,
         },
         bundle: true,
         target: "firefox140",
         sourcemap: process.env.NODE_ENV !== "production",
-        outfile: `.scaffold/build/addon/content/scripts/${pkg.config.addonRef}.js`
-      }
-    ]
+        outfile: `.scaffold/build/addon/content/scripts/${pkg.config.addonRef}.js`,
+      },
+    ],
   },
 
   test: {
-    waitForPlugin: `() => Zotero.${pkg.config.addonInstance}.data.initialized`
-  }
+    waitForPlugin: `() => Zotero.${pkg.config.addonInstance}.data.initialized`,
+  },
 });

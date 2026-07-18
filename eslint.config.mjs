@@ -13,11 +13,11 @@ export default zotero({
             argsIgnorePattern: "^_",
             caughtErrorsIgnorePattern: "^_",
             ignoreRestSiblings: true,
-            varsIgnorePattern: "^_"
-          }
+            varsIgnorePattern: "^_",
+          },
         ],
-        "no-console": "error"
-      }
-    }
-  ]
+        "no-console": "error",
+      },
+    },
+  ],
 });
