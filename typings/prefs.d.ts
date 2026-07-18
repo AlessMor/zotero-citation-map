@@ -10,6 +10,8 @@ declare namespace _ZoteroTypes {
       "provider": string;
       "automaticUpdates": boolean;
       "cacheDays": number;
+      "nodeSizeMetric": string;
+      "nodeLabelMode": string;
     };
   }
 }

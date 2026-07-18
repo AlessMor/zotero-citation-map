@@ -31,3 +31,9 @@
   color: var(--fill-secondary, rgba(0, 0, 0, 0.58));
   font-size: 0.95em;
 }
+
+.citation-map-appearance-preferences {
+  margin-top: 18px;
+  padding-top: 4px;
+  border-top: 1px solid var(--color-border50, rgba(0, 0, 0, 0.08));
+}

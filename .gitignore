@@ -1,16 +1,49 @@
-# dot files
+# Operating systems
 .DS_Store
+Thumbs.db
+Desktop.ini
 
-# Node.js
-node_modules
+# Editors and local workspaces
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+*.code-workspace
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Dependencies and alternate package managers
+node_modules/
 pnpm-lock.yaml
 yarn.lock
 
-# TSC
+# TypeScript, tests, logs, and build outputs
 tsconfig.tsbuildinfo
+.scaffold/
+build/
+dist/
+coverage/
+logs/
+*.log
+*.xpi
 
-# Scaffold
-.env
-.scaffold
-build
-logs
+# Plugin-owned local caches and databases
+.cache/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+citation-map-cache*.json
+zotero-citation-map-cache*.json
+
+# Disposable Zotero development profiles/data directories
+.zotero-profile/
+zotero-profile/
+zotero-data/

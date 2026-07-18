@@ -1,8 +1,18 @@
 {
   "name": "zotero-citation-map",
+  "private": true,
   "type": "module",
+  "packageManager": "npm@11.18.0",
   "version": "0.1.0",
-  "description": "Zotero Citation Map",
+  "description": "Citation and reference metrics with an interactive citation-network graph for Zotero 9.",
+  "keywords": [
+    "zotero",
+    "zotero-plugin",
+    "citations",
+    "references",
+    "bibliometrics",
+    "citation-network"
+  ],
   "config": {
     "addonName": "Zotero Citation Map",
     "addonID": "citation-map@alessmor",
@@ -12,25 +22,35 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/windingwind/zotero-plugin-template.git"
+    "url": "git+https://github.com/AlessMor/zotero-citation-map.git"
   },
   "author": "AlessMor",
   "bugs": {
-    "url": "https://github.com/windingwind/zotero-plugin-template/issues"
+    "url": "https://github.com/AlessMor/zotero-citation-map/issues"
   },
-  "homepage": "https://github.com/windingwind/zotero-plugin-template#readme",
+  "homepage": "https://github.com/AlessMor/zotero-citation-map#readme",
   "license": "AGPL-3.0-or-later",
+  "engines": {
+    "node": ">=24 <27",
+    "npm": ">=11.18"
+  },
   "scripts": {
     "start": "zotero-plugin serve",
-    "build": "zotero-plugin build && tsc --noEmit",
+    "typecheck": "tsc --noEmit",
     "lint:check": "prettier --check . && eslint .",
     "lint:fix": "prettier --write . && eslint . --fix",
-    "release": "zotero-plugin release",
+    "check": "npm run lint:check && npm run typecheck",
+    "build": "npm run check && zotero-plugin build",
+    "release": "npm run check && zotero-plugin release",
     "test": "zotero-plugin test",
+    "audit:signatures": "npm audit signatures",
+    "audit:runtime": "npm audit --omit=dev --audit-level=high",
     "update-deps": "npm update --save"
   },
-  "dependencies": {
-    "zotero-plugin-toolkit": "^5.1.0-beta.13"
+  "allowScripts": {
+    "@swc/core@1.15.43": true,
+    "es5-ext@0.10.64": true,
+    "esbuild@0.28.1": true
   },
   "devDependencies": {
     "@types/chai": "^5.2.3",

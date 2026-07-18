@@ -1,4 +1,5 @@
 import type {
+  LibraryCollectionFilter,
   LibrarySnapshot,
   LibraryStatistics,
   ZoteroPaper,
@@ -133,6 +134,124 @@ function calculateStatistics(papers: ZoteroPaper[]): LibraryStatistics {
   };
 }
 
+interface CollectionInfo {
+  collectionID: number;
+  name: string;
+  parentID: number | null;
+}
+
+function getCollectionInfo(collectionID: number): CollectionInfo | null {
+  try {
+    const collection = Zotero.Collections.get(collectionID);
+    if (!collection) {
+      return null;
+    }
+
+    const parentID = Number(
+      Reflect.get(collection as object, "parentID") ??
+        Reflect.get(collection as object, "parentCollectionID") ??
+        0,
+    );
+
+    return {
+      collectionID,
+      name: String(collection.name ?? `Collection ${collectionID}`),
+      parentID: Number.isFinite(parentID) && parentID > 0 ? parentID : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildCollectionFilters(
+  papers: ZoteroPaper[],
+): LibraryCollectionFilter[] {
+  const collectionInfo = new Map<number, CollectionInfo>();
+  const pending = new Set<number>(
+    papers.flatMap((paper) => paper.collectionIDs),
+  );
+
+  while (pending.size > 0) {
+    const [collectionID] = pending;
+    pending.delete(collectionID);
+
+    if (collectionInfo.has(collectionID)) {
+      continue;
+    }
+
+    const info = getCollectionInfo(collectionID);
+    if (!info) {
+      continue;
+    }
+
+    collectionInfo.set(collectionID, info);
+    if (info.parentID && !collectionInfo.has(info.parentID)) {
+      pending.add(info.parentID);
+    }
+  }
+
+  const children = new Map<number, number[]>();
+  for (const info of collectionInfo.values()) {
+    if (!info.parentID) {
+      continue;
+    }
+    const childIDs = children.get(info.parentID) ?? [];
+    childIDs.push(info.collectionID);
+    children.set(info.parentID, childIDs);
+  }
+
+  const getDescendants = (collectionID: number): number[] => {
+    const result: number[] = [collectionID];
+    const queue = [...(children.get(collectionID) ?? [])];
+    const seen = new Set<number>(result);
+
+    while (queue.length > 0) {
+      const childID = queue.shift();
+      if (!childID || seen.has(childID)) {
+        continue;
+      }
+      seen.add(childID);
+      result.push(childID);
+      queue.push(...(children.get(childID) ?? []));
+    }
+
+    return result;
+  };
+
+  const getPath = (collectionID: number): string => {
+    const parts: string[] = [];
+    const seen = new Set<number>();
+    let currentID: number | null = collectionID;
+
+    while (currentID && !seen.has(currentID)) {
+      seen.add(currentID);
+      const info = collectionInfo.get(currentID);
+      if (!info) {
+        break;
+      }
+      parts.unshift(info.name);
+      currentID = info.parentID;
+    }
+
+    return parts.join(" / ");
+  };
+
+  return [...collectionInfo.values()]
+    .map((info) => ({
+      collectionID: info.collectionID,
+      name: info.name,
+      path: getPath(info.collectionID),
+      includedCollectionIDs: getDescendants(info.collectionID),
+    }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function buildTags(papers: ZoteroPaper[]): string[] {
+  return [...new Set(papers.flatMap((paper) => paper.tags))].sort(
+    (left, right) => left.localeCompare(right),
+  );
+}
+
 /** Load every regular bibliographic item in one Zotero library. */
 export async function loadWholeLibrary(
   libraryID: number = Zotero.Libraries.userLibraryID,
@@ -156,6 +275,8 @@ export async function loadWholeLibrary(
     libraryName,
     generatedAt: new Date().toISOString(),
     papers,
+    collections: buildCollectionFilters(papers),
+    tags: buildTags(papers),
     statistics: calculateStatistics(papers),
   };
 }

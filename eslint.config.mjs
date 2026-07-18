@@ -1,4 +1,4 @@
-// @ts-check Let TS check this config file
+// @ts-check
 
 import zotero from "@zotero-plugin/eslint-config";
 
@@ -7,10 +7,17 @@ export default zotero({
     {
       files: ["**/*.ts"],
       rules: {
-        // We disable this rule here because the template
-        // contains some unused examples and variables
-        "@typescript-eslint/no-unused-vars": "off",
-      },
-    },
-  ],
+        "@typescript-eslint/no-unused-vars": [
+          "error",
+          {
+            argsIgnorePattern: "^_",
+            caughtErrorsIgnorePattern: "^_",
+            ignoreRestSiblings: true,
+            varsIgnorePattern: "^_"
+          }
+        ],
+        "no-console": "error"
+      }
+    }
+  ]
 });

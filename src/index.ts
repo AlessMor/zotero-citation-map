@@ -1,25 +1,11 @@
-import { BasicTool } from "zotero-plugin-toolkit";
-import Addon from "./addon";
 import { config } from "../package.json";
+import Addon from "./addon";
 
-const basicTool = new BasicTool();
-
-// @ts-expect-error - Plugin instance is not typed
-if (!basicTool.getGlobal("Zotero")[config.addonInstance]) {
-  _globalThis.addon = new Addon();
-  defineGlobal("ztoolkit", () => {
-    return _globalThis.addon.data.ztoolkit;
-  });
-  // @ts-expect-error - Plugin instance is not typed
-  Zotero[config.addonInstance] = addon;
-}
-
-function defineGlobal(name: Parameters<BasicTool["getGlobal"]>[0]): void;
-function defineGlobal(name: string, getter: () => any): void;
-function defineGlobal(name: string, getter?: () => any) {
-  Object.defineProperty(_globalThis, name, {
-    get() {
-      return getter ? getter() : basicTool.getGlobal(name);
-    },
-  });
+// Citation Map no longer needs zotero-plugin-toolkit at runtime. Creating the
+// toolkit initialized deprecated Gecko compatibility modules even though the
+// plugin did not use them, producing ChromeUtils.import() warnings.
+if (!(Zotero as any)[config.addonInstance]) {
+  const instance = new Addon();
+  _globalThis.addon = instance;
+  (Zotero as any)[config.addonInstance] = instance;
 }

@@ -1,6 +1,9 @@
 import { config } from "../../package.json";
 import type { LibrarySnapshot } from "../domain/types";
-import { renderCitationMapView } from "./graphViewService";
+import {
+  destroyCitationMapView,
+  renderCitationMapView,
+} from "./graphViewService";
 import { loadWholeLibrary } from "./zoteroLibraryService";
 
 const TAB_TYPE = "citationmap";
@@ -211,6 +214,11 @@ async function openDetachedCitationMapWindow(
   graphWindow.addEventListener(
     "unload",
     () => {
+      try {
+        destroyCitationMapView(getWindowMount(graphWindow.document));
+      } catch {
+        // The window document may already be tearing down.
+      }
       if (addon.data.graphWindow === graphWindow) {
         addon.data.graphWindow = null;
       }
@@ -258,6 +266,7 @@ export async function openCitationMapWindow(
     },
     select: true,
     onClose: () => {
+      destroyCitationMapView(tabResult.container);
       if (addon.data.graphTabID === tabResult.id) {
         addon.data.graphTabID = null;
       }
@@ -280,6 +289,7 @@ export async function detachCitationMapTab(
   await openDetachedCitationMapWindow(mainWindow, snapshot);
 
   if (!tabID) {
+    closeEnumeratedPluginWindows();
     return;
   }
 
@@ -294,16 +304,94 @@ export async function detachCitationMapTab(
   }
 }
 
+export async function refreshOpenCitationMapViews(): Promise<void> {
+  const hasTab = Boolean(addon.data.graphTabID);
+  const hasWindow = Boolean(
+    addon.data.graphWindow && !addon.data.graphWindow.closed,
+  );
+
+  if (!hasTab && !hasWindow) {
+    return;
+  }
+
+  const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
+
+  if (hasTab && addon.data.graphTabID) {
+    for (const mainWindow of Zotero.getMainWindows()) {
+      try {
+        const tabs = getTabs(mainWindow);
+        const tabInfo = tabs.getTabInfo(addon.data.graphTabID);
+        if (!tabInfo) {
+          continue;
+        }
+        const container = tabs.getTabContent(addon.data.graphTabID);
+        renderTab(mainWindow, container, snapshot);
+        break;
+      } catch {
+        // Try the next Zotero main window.
+      }
+    }
+  }
+
+  if (hasWindow && addon.data.graphWindow) {
+    const mainWindow = getDefaultMainWindow();
+    renderDetachedWindow(addon.data.graphWindow, mainWindow, snapshot);
+  }
+}
+
+function closeEnumeratedPluginWindows(): void {
+  try {
+    const services = (globalThis as any).Services;
+    const enumerator = services?.wm?.getEnumerator?.(null);
+    if (!enumerator) {
+      return;
+    }
+
+    const windows: Window[] = [];
+    while (enumerator.hasMoreElements()) {
+      windows.push(enumerator.getNext() as Window);
+    }
+
+    for (const candidate of windows) {
+      try {
+        if (!candidate || candidate.closed) {
+          continue;
+        }
+        const document = candidate.document;
+        const root = document?.documentElement;
+        const windowType = root?.getAttribute?.("windowtype") ?? "";
+        const title = String(
+          document?.title ?? root?.getAttribute?.("title") ?? "",
+        ).trim();
+        const isCitationMapWindow =
+          windowType === "citationmap:window" ||
+          Boolean(document?.getElementById?.(WINDOW_MOUNT_ID));
+        const isCitationMapProgressWindow = title === config.addonName;
+
+        if (isCitationMapWindow || isCitationMapProgressWindow) {
+          candidate.close();
+        }
+      } catch {
+        // A window may already be in the middle of native teardown.
+      }
+    }
+  } catch (error) {
+    Zotero.debug(`Citation Map: top-level window sweep failed: ${error}`);
+  }
+}
+
 export function closeCitationMapWindow(): void {
   if (addon.data.graphWindow && !addon.data.graphWindow.closed) {
     addon.data.graphWindow.close();
   }
 
   addon.data.graphWindow = null;
+  closeEnumeratedPluginWindows();
 
   const tabID = addon.data.graphTabID;
 
   if (!tabID) {
+    closeEnumeratedPluginWindows();
     return;
   }
 
@@ -321,6 +409,7 @@ export function closeCitationMapWindow(): void {
   }
 
   addon.data.graphTabID = null;
+  closeEnumeratedPluginWindows();
 }
 
 export function getDefaultHostWindow(): _ZoteroTypes.MainWindow {

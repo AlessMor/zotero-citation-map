@@ -21,34 +21,26 @@ export default defineConfig({
       description: pkg.description,
       homepage: pkg.homepage,
       buildVersion: pkg.version,
-      buildTime: "{{buildTime}}",
+      buildTime: "{{buildTime}}"
     },
     prefs: {
-      prefix: pkg.config.prefsPrefix,
+      prefix: pkg.config.prefsPrefix
     },
     esbuildOptions: [
       {
         entryPoints: ["src/index.ts"],
         define: {
-          __env__: `"${process.env.NODE_ENV}"`,
+          __env__: `"${process.env.NODE_ENV}"`
         },
         bundle: true,
         target: "firefox140",
-        outfile: `.scaffold/build/addon/content/scripts/${pkg.config.addonRef}.js`,
-      },
-      {
-        entryPoints: ["src/graph-entry.ts"],
-        bundle: true,
-        target: "firefox140",
-        outfile: `.scaffold/build/addon/content/scripts/${pkg.config.addonRef}-graph.js`,
-      },
-    ],
+        sourcemap: process.env.NODE_ENV !== "production",
+        outfile: `.scaffold/build/addon/content/scripts/${pkg.config.addonRef}.js`
+      }
+    ]
   },
 
   test: {
-    waitForPlugin: `() => Zotero.${pkg.config.addonInstance}.data.initialized`,
-  },
-
-  // If you need to see a more detailed log, uncomment the following line:
-  // logLevel: "trace",
+    waitForPlugin: `() => Zotero.${pkg.config.addonInstance}.data.initialized`
+  }
 });

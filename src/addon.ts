@@ -1,6 +1,5 @@
 import { config } from "../package.json";
 import hooks from "./hooks";
-import { createZToolkit } from "./utils/ztoolkit";
 
 class Addon {
   public data: {
@@ -8,7 +7,6 @@ class Addon {
     config: typeof config;
     env: "development" | "production";
     initialized: boolean;
-    ztoolkit: ZToolkit;
 
     /** Zotero tab containing Citation Map. */
     graphTabID: string | null;
@@ -31,7 +29,6 @@ class Addon {
       config,
       env: __env__,
       initialized: false,
-      ztoolkit: createZToolkit(),
       graphTabID: null,
       graphWindow: null,
     };

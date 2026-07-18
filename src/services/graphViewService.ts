@@ -1,17 +1,30 @@
 /// <reference lib="dom" />
 
 import { config } from "../../package.json";
-import type { LibrarySnapshot, ZoteroPaper } from "../domain/types";
+import type {
+  CitationGraphNode,
+  GraphAxisMetric,
+  GraphLayoutOptions,
+  GraphNodeLabelMode,
+  GraphNodeSizeMetric,
+  GraphScaleType,
+} from "../domain/graphTypes";
+import type {
+  LibraryCollectionFilter,
+  LibrarySnapshot,
+  ZoteroPaper,
+} from "../domain/types";
+import { buildCitationGraph } from "./citationGraphService";
+import { CitationGraphRenderer } from "./citationGraphRenderer";
 
 const HTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
+const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 const styledDocuments = new WeakSet<Document>();
+const cleanupByMount = new WeakMap<Element, () => void>();
+const NODE_SIZE_PREF = `${config.prefsPrefix}.nodeSizeMetric`;
+const NODE_LABEL_PREF = `${config.prefsPrefix}.nodeLabelMode`;
 
 export type GraphViewMode = "tab" | "window";
-
-export interface GraphSearchDetail {
-  query: string;
-  matchingItemIDs: number[];
-}
 
 export interface GraphViewOptions {
   mode: GraphViewMode;
@@ -26,6 +39,44 @@ function createHTMLElement<K extends keyof HTMLElementTagNameMap>(
     HTML_NAMESPACE,
     tagName,
   ) as HTMLElementTagNameMap[K];
+}
+
+function createGraphControlIcon(
+  document: Document,
+  kind: "zoom-in" | "zoom-out" | "fit",
+): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NAMESPACE, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+
+  const appendShape = (
+    tagName: "circle" | "path",
+    attributes: Record<string, string>,
+  ): void => {
+    const shape = document.createElementNS(SVG_NAMESPACE, tagName);
+    for (const [name, value] of Object.entries(attributes)) {
+      shape.setAttribute(name, value);
+    }
+    shape.setAttribute("fill", "none");
+    shape.setAttribute("stroke", "currentColor");
+    svg.appendChild(shape);
+  };
+
+  if (kind === "fit") {
+    appendShape("circle", { cx: "12", cy: "12", r: "6.5" });
+    appendShape("circle", { cx: "12", cy: "12", r: "2" });
+    appendShape("path", { d: "M12 2v3M12 19v3M2 12h3M19 12h3" });
+    return svg;
+  }
+
+  appendShape("circle", { cx: "10.5", cy: "10.5", r: "5.5" });
+  appendShape("path", { d: "M14.5 14.5 20 20" });
+  appendShape("path", { d: "M7.5 10.5h6" });
+  if (kind === "zoom-in") {
+    appendShape("path", { d: "M10.5 7.5v6" });
+  }
+  return svg;
 }
 
 function clearElement(element: Element): void {
@@ -148,14 +199,373 @@ async function runZoteroSearch(
   }
 }
 
-function dispatchSearchEvent(
+function createOption(
   document: Document,
-  root: HTMLElement,
-  detail: GraphSearchDetail,
-): void {
-  const event = document.createEvent("CustomEvent");
-  event.initCustomEvent("citationmap-search", true, false, detail);
-  root.dispatchEvent(event);
+  value: string,
+  label: string,
+): HTMLOptionElement {
+  const option = createHTMLElement(document, "option");
+  option.value = value;
+  option.textContent = label;
+  return option;
+}
+
+function createLabelledSelect(
+  document: Document,
+  labelText: string,
+  className: string,
+): { wrapper: HTMLLabelElement; select: HTMLSelectElement } {
+  const wrapper = createHTMLElement(document, "label");
+  wrapper.className = `cm-control ${className}`;
+  wrapper.appendChild(
+    createTextElement(document, "span", labelText, "cm-control-label"),
+  );
+  const select = createHTMLElement(document, "select");
+  select.className = "cm-select";
+  wrapper.appendChild(select);
+  return { wrapper, select };
+}
+
+function createCheckbox(
+  document: Document,
+  labelText: string,
+  checked: boolean,
+): { wrapper: HTMLLabelElement; input: HTMLInputElement } {
+  const wrapper = createHTMLElement(document, "label");
+  wrapper.className = "cm-checkbox-control";
+  const input = createHTMLElement(document, "input");
+  input.type = "checkbox";
+  input.checked = checked;
+  wrapper.appendChild(input);
+  wrapper.appendChild(createTextElement(document, "span", labelText));
+  return { wrapper, input };
+}
+
+const COLLECTION_PALETTE = [
+  "#4c78a8",
+  "#f58518",
+  "#54a24b",
+  "#e45756",
+  "#72b7b2",
+  "#b279a2",
+  "#ff9da6",
+  "#9d755d",
+  "#bab0ac",
+  "#7f6db0",
+  "#2f9c95",
+  "#d68c45",
+];
+
+const UNFILED_COLOR = "#8b8f98";
+
+interface AxisPicker {
+  root: HTMLDivElement;
+  button: HTMLButtonElement;
+  popover: HTMLDivElement;
+  getMetric: () => GraphAxisMetric;
+  getScale: () => GraphScaleType;
+  setOpen: (open: boolean) => void;
+  isOpen: () => boolean;
+  onChange: (listener: () => void) => void;
+}
+
+interface CollectionVisuals {
+  colorByNodeKey: Map<string, string>;
+  labelByNodeKey: Map<string, string>;
+}
+
+function readNodeSizeMetric(): GraphNodeSizeMetric {
+  const value = Zotero.Prefs.get(NODE_SIZE_PREF, true);
+  return value === "uniform" || value === "references" ? value : "citations";
+}
+
+function readNodeLabelMode(): GraphNodeLabelMode {
+  const value = Zotero.Prefs.get(NODE_LABEL_PREF, true);
+  return value === "author-year" ? "author-year" : "title";
+}
+
+function metricLabel(metric: GraphAxisMetric): string {
+  switch (metric) {
+    case "year":
+      return "Publication year";
+    case "citations":
+      return "Citations";
+    case "references":
+      return "References";
+    case "none":
+      return "Force layout";
+  }
+}
+
+function scaleLabel(scale: GraphScaleType): string {
+  return scale === "log" ? "Log" : "Linear";
+}
+
+function createAxisPicker(
+  document: Document,
+  orientation: "x" | "y",
+): AxisPicker {
+  const root = createHTMLElement(document, "div");
+  root.className = `cm-axis-picker cm-${orientation}-axis-picker`;
+
+  const button = createHTMLElement(document, "button");
+  button.type = "button";
+  button.className = "cm-axis-label-button";
+  button.setAttribute("aria-haspopup", "dialog");
+  button.setAttribute("aria-expanded", "false");
+  root.appendChild(button);
+
+  const metricText = createHTMLElement(document, "span");
+  metricText.className = "cm-axis-label-metric";
+  const scaleText = createHTMLElement(document, "span");
+  scaleText.className = "cm-axis-label-scale";
+  const chevron = createHTMLElement(document, "span");
+  chevron.className = "cm-axis-label-chevron";
+  chevron.textContent = "⌄";
+  chevron.setAttribute("aria-hidden", "true");
+  button.append(metricText, scaleText, chevron);
+
+  const popover = createHTMLElement(document, "div");
+  popover.className = "cm-axis-popover";
+  popover.hidden = true;
+  popover.setAttribute("role", "dialog");
+  popover.setAttribute(
+    "aria-label",
+    `${orientation.toUpperCase()} axis options`,
+  );
+  root.appendChild(popover);
+
+  popover.appendChild(
+    createTextElement(
+      document,
+      "div",
+      `${orientation.toUpperCase()} axis`,
+      "cm-axis-popover-title",
+    ),
+  );
+  popover.appendChild(
+    createTextElement(
+      document,
+      "div",
+      "Position",
+      "cm-axis-popover-section-title",
+    ),
+  );
+
+  let metric: GraphAxisMetric = "none";
+  let scale: GraphScaleType = "linear";
+  let changeListener: (() => void) | null = null;
+  const metricButtons = new Map<GraphAxisMetric, HTMLButtonElement>();
+  const scaleButtons = new Map<GraphScaleType, HTMLButtonElement>();
+
+  const metricList = createHTMLElement(document, "div");
+  metricList.className = "cm-axis-option-list";
+  const metricOptions: Array<[GraphAxisMetric, string]> = [
+    ["none", "Force layout"],
+    ["year", "Publication year"],
+    ["citations", "Citations"],
+    ["references", "References"],
+  ];
+  for (const [value, label] of metricOptions) {
+    const option = createHTMLElement(document, "button");
+    option.type = "button";
+    option.className = "cm-axis-option";
+    option.textContent = label;
+    option.dataset.value = value;
+    option.addEventListener("click", () => {
+      metric = value;
+      updateDisplay();
+      changeListener?.();
+    });
+    metricButtons.set(value, option);
+    metricList.appendChild(option);
+  }
+  popover.appendChild(metricList);
+
+  const scaleSection = createHTMLElement(document, "div");
+  scaleSection.className = "cm-axis-scale-section";
+  scaleSection.appendChild(
+    createTextElement(
+      document,
+      "div",
+      "Scale",
+      "cm-axis-popover-section-title",
+    ),
+  );
+  const scaleList = createHTMLElement(document, "div");
+  scaleList.className = "cm-axis-scale-options";
+  for (const [value, label] of [
+    ["linear", "Linear"],
+    ["log", "Logarithmic"],
+  ] as Array<[GraphScaleType, string]>) {
+    const option = createHTMLElement(document, "button");
+    option.type = "button";
+    option.className = "cm-axis-option cm-axis-scale-option";
+    option.textContent = label;
+    option.dataset.value = value;
+    option.addEventListener("click", () => {
+      scale = value;
+      updateDisplay();
+      changeListener?.();
+    });
+    scaleButtons.set(value, option);
+    scaleList.appendChild(option);
+  }
+  scaleSection.appendChild(scaleList);
+  popover.appendChild(scaleSection);
+
+  const updateDisplay = (): void => {
+    metricText.textContent = metricLabel(metric);
+    scaleText.textContent = metric === "none" ? "" : scaleLabel(scale);
+    scaleText.hidden = metric === "none";
+    for (const [value, option] of metricButtons) {
+      option.dataset.selected = String(value === metric);
+      option.setAttribute("aria-pressed", String(value === metric));
+    }
+    for (const [value, option] of scaleButtons) {
+      option.dataset.selected = String(value === scale);
+      option.setAttribute("aria-pressed", String(value === scale));
+      option.disabled = metric === "none";
+    }
+    scaleSection.dataset.disabled = String(metric === "none");
+  };
+
+  const setOpen = (open: boolean): void => {
+    popover.hidden = !open;
+    button.setAttribute("aria-expanded", String(open));
+    root.dataset.open = String(open);
+  };
+
+  button.addEventListener("click", () => setOpen(popover.hidden));
+  updateDisplay();
+
+  return {
+    root,
+    button,
+    popover,
+    getMetric: () => metric,
+    getScale: () => scale,
+    setOpen,
+    isOpen: () => !popover.hidden,
+    onChange: (listener) => {
+      changeListener = listener;
+    },
+  };
+}
+
+function collectionDepth(path: string): number {
+  return path.split(/\s*(?:\/|›|>)\s*/).filter(Boolean).length;
+}
+
+function buildCollectionVisuals(
+  snapshot: LibrarySnapshot,
+  nodes: CitationGraphNode[],
+): CollectionVisuals {
+  const collectionsByID = new Map(
+    snapshot.collections.map((collection) => [
+      collection.collectionID,
+      collection,
+    ]),
+  );
+  const topLevelCollections = snapshot.collections
+    .filter((collection) => collectionDepth(collection.path) === 1)
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const colorByCollectionID = new Map<number, string>();
+  topLevelCollections.forEach((collection, index) => {
+    colorByCollectionID.set(
+      collection.collectionID,
+      COLLECTION_PALETTE[index % COLLECTION_PALETTE.length],
+    );
+  });
+
+  const colorByNodeKey = new Map<string, string>();
+  const labelByNodeKey = new Map<string, string>();
+
+  for (const node of nodes) {
+    const directCollections = node.collectionIDs
+      .map((collectionID) => collectionsByID.get(collectionID))
+      .filter((collection): collection is LibraryCollectionFilter =>
+        Boolean(collection),
+      )
+      .sort((left, right) => left.path.localeCompare(right.path));
+
+    const topLevelMatches = topLevelCollections.filter((topLevel) =>
+      node.collectionIDs.some((collectionID) =>
+        topLevel.includedCollectionIDs.includes(collectionID),
+      ),
+    );
+    const primary = topLevelMatches[0] ?? directCollections[0] ?? null;
+    const color = primary
+      ? (colorByCollectionID.get(primary.collectionID) ??
+        COLLECTION_PALETTE[
+          hashCollection(primary.path) % COLLECTION_PALETTE.length
+        ])
+      : UNFILED_COLOR;
+    const label =
+      directCollections.length > 0
+        ? directCollections.map((collection) => collection.path).join(" · ")
+        : "Unfiled";
+
+    colorByNodeKey.set(node.key, color);
+    labelByNodeKey.set(node.key, label);
+  }
+
+  return {
+    colorByNodeKey,
+    labelByNodeKey,
+  };
+}
+
+function hashCollection(value: string): number {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (Math.imul(hash, 31) + value.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+}
+
+function collectionMatches(
+  node: CitationGraphNode,
+  collection: LibraryCollectionFilter | null,
+): boolean {
+  if (!collection) {
+    return true;
+  }
+
+  const includedIDs = new Set(collection.includedCollectionIDs);
+  return node.collectionIDs.some((collectionID) =>
+    includedIDs.has(collectionID),
+  );
+}
+
+function createDetailRow(
+  document: Document,
+  label: string,
+  value: string,
+): HTMLDivElement {
+  const row = createHTMLElement(document, "div");
+  row.className = "cm-detail-row";
+  row.appendChild(
+    createTextElement(document, "span", label, "cm-detail-label"),
+  );
+  row.appendChild(
+    createTextElement(document, "span", value, "cm-detail-value"),
+  );
+  return row;
+}
+
+function formatDate(value: string | null): string {
+  if (!value) {
+    return "Not updated";
+  }
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+export function destroyCitationMapView(mount: Element): void {
+  cleanupByMount.get(mount)?.();
+  cleanupByMount.delete(mount);
 }
 
 export function renderCitationMapView(
@@ -164,9 +574,12 @@ export function renderCitationMapView(
   snapshot: LibrarySnapshot,
   options: GraphViewOptions,
 ): HTMLElement {
+  destroyCitationMapView(mount);
   ensureGraphStyle(document);
   clearElement(mount);
 
+  const graph = buildCitationGraph(snapshot);
+  const collectionVisuals = buildCollectionVisuals(snapshot, graph.nodes);
   const root = createHTMLElement(document, "div");
   root.className = "citation-map-root";
   root.dataset.mode = options.mode;
@@ -209,13 +622,43 @@ export function renderCitationMapView(
   const headerActions = createHTMLElement(document, "div");
   headerActions.className = "cm-header-actions";
 
+  const searchFilterRow = createHTMLElement(document, "div");
+  searchFilterRow.className = "cm-search-filter-row";
+
   const searchInput = createHTMLElement(document, "input");
   searchInput.type = "search";
   searchInput.className = "cm-search-input";
   searchInput.placeholder = "Search all fields and tags";
   searchInput.setAttribute("aria-label", "Search all fields and tags");
   searchInput.autocomplete = "off";
-  headerActions.appendChild(searchInput);
+  searchFilterRow.appendChild(searchInput);
+
+  const collectionControl = createLabelledSelect(
+    document,
+    "Collection",
+    "cm-filter-control cm-compact-control",
+  );
+  collectionControl.select.appendChild(
+    createOption(document, "all", "Whole library"),
+  );
+  for (const collection of snapshot.collections) {
+    collectionControl.select.appendChild(
+      createOption(document, String(collection.collectionID), collection.path),
+    );
+  }
+  searchFilterRow.appendChild(collectionControl.wrapper);
+
+  const tagControl = createLabelledSelect(
+    document,
+    "Tag",
+    "cm-filter-control cm-compact-control",
+  );
+  tagControl.select.appendChild(createOption(document, "all", "All tags"));
+  for (const tag of snapshot.tags) {
+    tagControl.select.appendChild(createOption(document, tag, tag));
+  }
+  searchFilterRow.appendChild(tagControl.wrapper);
+  headerActions.appendChild(searchFilterRow);
 
   const searchStatus = createTextElement(
     document,
@@ -229,6 +672,33 @@ export function renderCitationMapView(
   header.appendChild(headerActions);
   root.appendChild(header);
 
+  const toolbar = createHTMLElement(document, "div");
+  toolbar.className = "cm-toolbar";
+
+  const missingControls = createHTMLElement(document, "div");
+  missingControls.className = "cm-missing-controls";
+  missingControls.appendChild(
+    createTextElement(document, "span", "Include missing:", "cm-control-label"),
+  );
+  const missingYear = createCheckbox(document, "year", true);
+  const missingCitations = createCheckbox(document, "citations", true);
+  const missingReferences = createCheckbox(document, "references", true);
+  missingControls.append(
+    missingYear.wrapper,
+    missingCitations.wrapper,
+    missingReferences.wrapper,
+  );
+  toolbar.appendChild(missingControls);
+
+  const graphStatus = createTextElement(
+    document,
+    "span",
+    "",
+    "cm-graph-status",
+  );
+  toolbar.appendChild(graphStatus);
+  root.appendChild(toolbar);
+
   const main = createHTMLElement(document, "main");
   main.className = "cm-main";
 
@@ -236,44 +706,324 @@ export function renderCitationMapView(
   graphShell.className = "cm-graph-shell";
   graphShell.setAttribute("aria-label", "Citation graph");
 
+  const graphStage = createHTMLElement(document, "div");
+  graphStage.className = "cm-graph-stage";
+
+  const yAxisDock = createHTMLElement(document, "div");
+  yAxisDock.className = "cm-axis-dock cm-y-axis-dock";
+
+  const yAxisCanvas = createHTMLElement(document, "canvas");
+  yAxisCanvas.className = "cm-axis-canvas cm-y-axis-canvas";
+  yAxisCanvas.setAttribute("aria-hidden", "true");
+  yAxisDock.appendChild(yAxisCanvas);
+
+  const yAxisPicker = createAxisPicker(document, "y");
+  const xAxisPicker = createAxisPicker(document, "x");
+  graphStage.appendChild(yAxisDock);
+
   const graphSurface = createHTMLElement(document, "div");
   graphSurface.className = "cm-graph-surface";
-  graphSurface.tabIndex = 0;
-  graphSurface.dataset.totalNodes = String(snapshot.papers.length);
-  graphSurface.dataset.matchingNodes = String(snapshot.papers.length);
+
+  const canvas = createHTMLElement(document, "canvas");
+  canvas.className = "cm-graph-canvas";
+  canvas.setAttribute(
+    "aria-label",
+    "Interactive citation graph. Arrows point from citing papers to cited papers.",
+  );
+  graphSurface.appendChild(canvas);
+
+  const tooltip = createHTMLElement(document, "div");
+  tooltip.className = "cm-node-tooltip";
+  tooltip.hidden = true;
+  graphSurface.appendChild(tooltip);
 
   const emptyState = createHTMLElement(document, "div");
   emptyState.className = "cm-graph-empty-state";
-  emptyState.appendChild(createTextElement(document, "h2", "Citation graph"));
+  emptyState.hidden = true;
+  emptyState.appendChild(
+    createTextElement(document, "h2", "No papers to display"),
+  );
   const emptyStateText = createTextElement(
     document,
     "p",
-    "Citation relationships will appear here after citation data is loaded.",
+    "Change the filters to include papers in the graph.",
   );
   emptyState.appendChild(emptyStateText);
   graphSurface.appendChild(emptyState);
-  graphShell.appendChild(graphSurface);
+
+  graphSurface.append(yAxisPicker.root, xAxisPicker.root);
+
+  const zoomControls = createHTMLElement(document, "div");
+  zoomControls.className = "cm-zoom-controls";
+
+  const zoomInButton = createHTMLElement(document, "button");
+  zoomInButton.type = "button";
+  zoomInButton.className = "cm-graph-icon-button";
+  zoomInButton.title = "Zoom in";
+  zoomInButton.setAttribute("aria-label", "Zoom in");
+  zoomInButton.appendChild(createGraphControlIcon(document, "zoom-in"));
+
+  const zoomOutButton = createHTMLElement(document, "button");
+  zoomOutButton.type = "button";
+  zoomOutButton.className = "cm-graph-icon-button";
+  zoomOutButton.title = "Zoom out";
+  zoomOutButton.setAttribute("aria-label", "Zoom out");
+  zoomOutButton.appendChild(createGraphControlIcon(document, "zoom-out"));
+
+  const fitButton = createHTMLElement(document, "button");
+  fitButton.type = "button";
+  fitButton.className = "cm-graph-icon-button";
+  fitButton.title = "Fit graph (keyboard: F)";
+  fitButton.setAttribute("aria-label", "Fit graph");
+  fitButton.appendChild(createGraphControlIcon(document, "fit"));
+
+  zoomControls.append(zoomInButton, zoomOutButton, fitButton);
+  graphSurface.appendChild(zoomControls);
+
+  graphStage.appendChild(graphSurface);
+
+  const axisCorner = createHTMLElement(document, "div");
+  axisCorner.className = "cm-axis-corner";
+  graphStage.appendChild(axisCorner);
+
+  const xAxisDock = createHTMLElement(document, "div");
+  xAxisDock.className = "cm-axis-dock cm-x-axis-dock";
+
+  const xAxisCanvas = createHTMLElement(document, "canvas");
+  xAxisCanvas.className = "cm-axis-canvas cm-x-axis-canvas";
+  xAxisCanvas.setAttribute("aria-hidden", "true");
+  xAxisDock.appendChild(xAxisCanvas);
+
+  graphStage.appendChild(xAxisDock);
+
+  graphShell.appendChild(graphStage);
+
+  const detailPanel = createHTMLElement(document, "aside");
+  detailPanel.className = "cm-detail-panel";
+  detailPanel.setAttribute("aria-label", "Selected paper details");
+
+  const renderDetails = (node: CitationGraphNode | null): void => {
+    clearElement(detailPanel);
+
+    if (!node) {
+      detailPanel.appendChild(
+        createTextElement(document, "h2", "Paper details"),
+      );
+      detailPanel.appendChild(
+        createTextElement(
+          document,
+          "p",
+          "Select a node to inspect it. Double-click a node to show the paper in Zotero.",
+          "cm-detail-placeholder",
+        ),
+      );
+      return;
+    }
+
+    detailPanel.appendChild(createTextElement(document, "h2", node.title));
+    detailPanel.appendChild(
+      createTextElement(
+        document,
+        "p",
+        node.authors.length > 0 ? node.authors.join(", ") : "Unknown author",
+        "cm-detail-authors",
+      ),
+    );
+
+    const rows = createHTMLElement(document, "div");
+    rows.className = "cm-detail-rows";
+    rows.append(
+      createDetailRow(document, "Year", node.year ? String(node.year) : "—"),
+      createDetailRow(
+        document,
+        "Collections",
+        collectionVisuals.labelByNodeKey.get(node.key) ?? "Unfiled",
+      ),
+      createDetailRow(
+        document,
+        "Citations",
+        node.citationCount === null ? "—" : formatCount(node.citationCount),
+      ),
+      createDetailRow(
+        document,
+        "References",
+        node.referenceCount === null ? "—" : formatCount(node.referenceCount),
+      ),
+      createDetailRow(
+        document,
+        "Citations in graph",
+        formatCount(node.incomingLibraryCitations),
+      ),
+      createDetailRow(
+        document,
+        "References in graph",
+        formatCount(node.outgoingLibraryReferences),
+      ),
+      createDetailRow(
+        document,
+        "Structured references cached",
+        formatCount(node.resolvedReferenceCount),
+      ),
+      createDetailRow(document, "Updated", formatDate(node.metricsUpdatedAt)),
+    );
+    detailPanel.appendChild(rows);
+
+    if (node.doi) {
+      const doi = createTextElement(
+        document,
+        "p",
+        `DOI: ${node.doi}`,
+        "cm-detail-doi",
+      );
+      detailPanel.appendChild(doi);
+    }
+
+    if (node.tags.length > 0) {
+      const tags = createHTMLElement(document, "div");
+      tags.className = "cm-detail-tags";
+      for (const tag of node.tags.slice(0, 16)) {
+        tags.appendChild(
+          createTextElement(document, "span", tag, "cm-detail-tag"),
+        );
+      }
+      detailPanel.appendChild(tags);
+    }
+
+    const actions = createHTMLElement(document, "div");
+    actions.className = "cm-detail-actions";
+
+    const showButton = createHTMLElement(document, "button");
+    showButton.type = "button";
+    showButton.textContent = "Show in Zotero";
+    showButton.addEventListener("click", () => {
+      void options.onSelectPaper(node.itemID);
+    });
+    actions.appendChild(showButton);
+
+    if (node.doi) {
+      const doiButton = createHTMLElement(document, "button");
+      doiButton.type = "button";
+      doiButton.textContent = "Open DOI";
+      doiButton.addEventListener("click", () => {
+        Zotero.launchURL(
+          `https://doi.org/${encodeURIComponent(node.doi ?? "")}`,
+        );
+      });
+      actions.appendChild(doiButton);
+    }
+
+    detailPanel.appendChild(actions);
+  };
+
+  renderDetails(null);
+  graphShell.appendChild(detailPanel);
   main.appendChild(graphShell);
   root.appendChild(main);
   mount.appendChild(root);
 
+  const renderer = new CitationGraphRenderer({
+    root,
+    canvas,
+    xAxisCanvas,
+    yAxisCanvas,
+    tooltip,
+    model: graph,
+    nodeSizeMetric: readNodeSizeMetric(),
+    nodeLabelMode: readNodeLabelMode(),
+    collectionColorByNodeKey: collectionVisuals.colorByNodeKey,
+    collectionLabelByNodeKey: collectionVisuals.labelByNodeKey,
+    onSelectionChange: renderDetails,
+    onOpenNode: (node) => options.onSelectPaper(node.itemID),
+  });
+
+  const nodeKeyByItemID = new Map(
+    graph.nodes.map((node) => [node.itemID, node.key]),
+  );
+  let visibleNodeKeys = new Set(graph.nodes.map((node) => node.key));
   let searchTimer: number | null = null;
   let searchGeneration = 0;
+
+  const getCollectionFilter = (): LibraryCollectionFilter | null => {
+    const collectionID = Number(collectionControl.select.value);
+    return Number.isFinite(collectionID)
+      ? (snapshot.collections.find(
+          (collection) => collection.collectionID === collectionID,
+        ) ?? null)
+      : null;
+  };
+
+  const updateGraphStatus = (): void => {
+    const visibleEdges = renderer.getVisibleEdgeCount();
+    graphStatus.textContent =
+      `${formatCount(visibleNodeKeys.size)} papers · ` +
+      `${formatCount(visibleEdges)} citation links · ` +
+      `${formatCount(graph.statistics.resolvedNodes)} papers with cached data`;
+  };
+
+  const applyFilters = (): void => {
+    const collection = getCollectionFilter();
+    const selectedTag = tagControl.select.value;
+
+    visibleNodeKeys = new Set(
+      graph.nodes
+        .filter((node) => {
+          if (!collectionMatches(node, collection)) {
+            return false;
+          }
+          if (selectedTag !== "all" && !node.tags.includes(selectedTag)) {
+            return false;
+          }
+          if (!missingYear.input.checked && node.year === null) {
+            return false;
+          }
+          if (!missingCitations.input.checked && node.citationCount === null) {
+            return false;
+          }
+          if (
+            !missingReferences.input.checked &&
+            node.referenceCount === null
+          ) {
+            return false;
+          }
+          return true;
+        })
+        .map((node) => node.key),
+    );
+
+    const graphIsEmpty = visibleNodeKeys.size === 0;
+    emptyState.hidden = !graphIsEmpty;
+    canvas.hidden = graphIsEmpty;
+    xAxisCanvas.hidden = graphIsEmpty;
+    yAxisCanvas.hidden = graphIsEmpty;
+    xAxisPicker.root.hidden = graphIsEmpty;
+    yAxisPicker.root.hidden = graphIsEmpty;
+    zoomControls.hidden = graphIsEmpty;
+    renderer.setVisibleKeys(visibleNodeKeys);
+    updateGraphStatus();
+
+    if (searchInput.value.trim()) {
+      void applySearch();
+    }
+  };
+
+  const currentLayout = (): GraphLayoutOptions => ({
+    xMetric: xAxisPicker.getMetric(),
+    xScale: xAxisPicker.getScale(),
+    yMetric: yAxisPicker.getMetric(),
+    yScale: yAxisPicker.getScale(),
+  });
+
+  const applyLayout = (): void => {
+    renderer.setLayout(currentLayout());
+  };
 
   const applySearch = async (): Promise<void> => {
     const generation = ++searchGeneration;
     const query = searchInput.value.trim();
 
     if (!query) {
-      const allItemIDs = snapshot.papers.map((paper) => paper.itemID);
       searchStatus.textContent = "";
-      graphSurface.dataset.matchingNodes = String(allItemIDs.length);
-      emptyStateText.textContent =
-        "Citation relationships will appear here after citation data is loaded.";
-      dispatchSearchEvent(document, root, {
-        query: "",
-        matchingItemIDs: allItemIDs,
-      });
+      renderer.setSearchMatches(null);
       return;
     }
 
@@ -284,21 +1034,19 @@ export function renderCitationMapView(
       return;
     }
 
-    graphSurface.dataset.matchingNodes = String(matchingItemIDs.length);
-    searchStatus.textContent = `${formatCount(matchingItemIDs.length)} match${
-      matchingItemIDs.length === 1 ? "" : "es"
-    }`;
-    emptyStateText.textContent =
-      matchingItemIDs.length === 0
-        ? "No papers match the current search."
-        : `${formatCount(
-            matchingItemIDs.length,
-          )} matching papers will be highlighted in the graph.`;
+    const matchingKeys = new Set(
+      matchingItemIDs
+        .map((itemID) => nodeKeyByItemID.get(itemID))
+        .filter((key): key is string => Boolean(key)),
+    );
+    const visibleMatches = [...matchingKeys].filter((key) =>
+      visibleNodeKeys.has(key),
+    );
 
-    dispatchSearchEvent(document, root, {
-      query,
-      matchingItemIDs,
-    });
+    renderer.setSearchMatches(matchingKeys);
+    searchStatus.textContent = `${formatCount(visibleMatches.length)} match${
+      visibleMatches.length === 1 ? "" : "es"
+    } in current graph`;
   };
 
   const scheduleSearch = (): void => {
@@ -308,6 +1056,7 @@ export function renderCitationMapView(
 
     searchTimer =
       document.defaultView?.setTimeout(() => {
+        searchTimer = null;
         void applySearch();
       }, 250) ?? null;
   };
@@ -326,13 +1075,84 @@ export function renderCitationMapView(
     }
   });
 
-  graphSurface.addEventListener("dblclick", () => {
-    const matchingItemIDs = fallbackSearch(searchInput.value, snapshot.papers);
+  for (const control of [
+    collectionControl.select,
+    tagControl.select,
+    missingYear.input,
+    missingCitations.input,
+    missingReferences.input,
+  ]) {
+    control.addEventListener("change", applyFilters);
+  }
 
-    if (matchingItemIDs.length === 1) {
-      void options.onSelectPaper(matchingItemIDs[0]);
-    }
+  xAxisPicker.onChange(applyLayout);
+  yAxisPicker.onChange(applyLayout);
+
+  const closeAxisMenus = (except?: AxisPicker): void => {
+    if (except !== xAxisPicker) xAxisPicker.setOpen(false);
+    if (except !== yAxisPicker) yAxisPicker.setOpen(false);
+  };
+
+  xAxisPicker.button.addEventListener("click", () => {
+    if (xAxisPicker.isOpen()) closeAxisMenus(xAxisPicker);
   });
+  yAxisPicker.button.addEventListener("click", () => {
+    if (yAxisPicker.isOpen()) closeAxisMenus(yAxisPicker);
+  });
+
+  const documentPointerListener = (event: Event): void => {
+    const target = event.target as Node | null;
+    if (
+      target &&
+      (xAxisPicker.root.contains(target) || yAxisPicker.root.contains(target))
+    ) {
+      return;
+    }
+    closeAxisMenus();
+  };
+  const documentKeyListener = (event: KeyboardEvent): void => {
+    if (event.key === "Escape") closeAxisMenus();
+  };
+  document.addEventListener("pointerdown", documentPointerListener, true);
+  document.addEventListener("keydown", documentKeyListener, true);
+
+  zoomInButton.addEventListener("click", () => renderer.zoomBy(1.25));
+  zoomOutButton.addEventListener("click", () => renderer.zoomBy(0.8));
+  fitButton.addEventListener("click", () => renderer.fitView());
+
+  const nodeSizeObserverID = Zotero.Prefs.registerObserver(
+    NODE_SIZE_PREF,
+    () => renderer.setNodeSizeMetric(readNodeSizeMetric()),
+    true,
+  );
+  const nodeLabelObserverID = Zotero.Prefs.registerObserver(
+    NODE_LABEL_PREF,
+    () => renderer.setNodeLabelMode(readNodeLabelMode()),
+    true,
+  );
+
+  applyLayout();
+  applyFilters();
+
+  let cleanedUp = false;
+  const cleanup = (): void => {
+    if (cleanedUp) {
+      return;
+    }
+    cleanedUp = true;
+    if (searchTimer !== null) {
+      document.defaultView?.clearTimeout(searchTimer);
+      searchTimer = null;
+    }
+    document.removeEventListener("pointerdown", documentPointerListener, true);
+    document.removeEventListener("keydown", documentKeyListener, true);
+    document.defaultView?.removeEventListener("unload", cleanup);
+    Zotero.Prefs.unregisterObserver(nodeSizeObserverID);
+    Zotero.Prefs.unregisterObserver(nodeLabelObserverID);
+    renderer.destroy();
+  };
+  document.defaultView?.addEventListener("unload", cleanup, { once: true });
+  cleanupByMount.set(mount, cleanup);
 
   return root;
 }

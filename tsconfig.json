@@ -1,5 +1,10 @@
 {
   "extends": "zotero-types/entries/sandbox/",
+  "compilerOptions": {
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "useUnknownInCatchVariables": true
+  },
   "include": ["src", "typings"],
-  "exclude": ["build", "addon"]
+  "exclude": ["node_modules", ".scaffold", "build", "dist", "addon"]
 }

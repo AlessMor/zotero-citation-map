@@ -86,6 +86,7 @@ INSERT OR REPLACE INTO citation_metrics (
 `;
 
 const MAX_STORED_REFERENCES = 2000;
+const CLOSE_WRITE_DRAIN_TIMEOUT_MS = 4000;
 
 let db: _ZoteroTypes.DBConnection | null = null;
 let initialized = false;
@@ -270,7 +271,31 @@ export async function closeCitationMetricsStore(): Promise<void> {
     await initPromise.catch(() => undefined);
   }
 
-  await Promise.allSettled([...writeTails.values()]);
+  if (writeTails.size > 0) {
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    let completed = false;
+
+    try {
+      await Promise.race([
+        Promise.allSettled([...writeTails.values()]).then(() => {
+          completed = true;
+        }),
+        new Promise<void>((resolve) => {
+          timeout = setTimeout(resolve, CLOSE_WRITE_DRAIN_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timeout !== null) {
+        clearTimeout(timeout);
+      }
+    }
+
+    if (!completed) {
+      Zotero.debug(
+        `Citation Map: cache-write shutdown drain exceeded ${CLOSE_WRITE_DRAIN_TIMEOUT_MS} ms`,
+      );
+    }
+  }
 
   if (db) {
     await db.closeDatabase(true);

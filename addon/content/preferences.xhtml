@@ -71,3 +71,54 @@
     data-l10n-id="pref-reference-count-note"
   />
 </groupbox>
+
+<groupbox class="citation-map-preferences citation-map-appearance-preferences">
+  <label>
+    <html:h2 data-l10n-id="pref-graph-appearance-heading"></html:h2>
+  </label>
+
+  <description data-l10n-id="pref-graph-appearance-description" />
+
+  <hbox class="citation-map-pref-row" align="center">
+    <html:label
+      for="zotero-prefpane-__addonRef__-node-size"
+      data-l10n-id="pref-node-size"
+    ></html:label>
+    <menulist
+      id="zotero-prefpane-__addonRef__-node-size"
+      preference="nodeSizeMetric"
+      native="true"
+    >
+      <menupopup>
+        <menuitem value="citations" data-l10n-id="pref-node-size-citations" />
+        <menuitem value="references" data-l10n-id="pref-node-size-references" />
+        <menuitem value="uniform" data-l10n-id="pref-node-size-uniform" />
+      </menupopup>
+    </menulist>
+  </hbox>
+
+  <hbox class="citation-map-pref-row" align="center">
+    <html:label
+      for="zotero-prefpane-__addonRef__-node-label"
+      data-l10n-id="pref-node-label"
+    ></html:label>
+    <menulist
+      id="zotero-prefpane-__addonRef__-node-label"
+      preference="nodeLabelMode"
+      native="true"
+    >
+      <menupopup>
+        <menuitem value="title" data-l10n-id="pref-node-label-title" />
+        <menuitem
+          value="author-year"
+          data-l10n-id="pref-node-label-author-year"
+        />
+      </menupopup>
+    </menulist>
+  </hbox>
+
+  <description
+    class="citation-map-pref-help"
+    data-l10n-id="pref-collection-colors-note"
+  />
+</groupbox>

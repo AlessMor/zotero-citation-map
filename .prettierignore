@@ -1,7 +1,11 @@
-.vscode
-build
-logs
-node_modules
+node_modules/
+.scaffold/
+build/
+dist/
+coverage/
+logs/
 package-lock.json
-yarn.lock
-pnpm-lock.yaml
+*.xpi
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
