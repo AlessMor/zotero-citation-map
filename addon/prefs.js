@@ -1,5 +1,12 @@
-pref("provider", "auto");
-pref("automaticUpdates", true);
-pref("cacheDays", 30);
-pref("nodeSizeMetric", "citations");
-pref("nodeLabelMode", "title");
+pref("extensions.zotero.citationmap.provider", "auto");
+pref("extensions.zotero.citationmap.automaticUpdates", true);
+pref("extensions.zotero.citationmap.updateNewItems", true);
+pref("extensions.zotero.citationmap.cacheDays", 30);
+pref("extensions.zotero.citationmap.exactTitleFallback", true);
+pref("extensions.zotero.citationmap.localRelations", true);
+pref("extensions.zotero.citationmap.noteExtraction", false);
+pref("extensions.zotero.citationmap.pdfExtraction", false);
+pref("extensions.zotero.citationmap.debugLogging", false);
+pref("extensions.zotero.citationmap.detailPanelWidth", 360);
+pref("extensions.zotero.citationmap.detailPanelCollapsed", false);
+pref("extensions.zotero.citationmap.graphAppearance", "");

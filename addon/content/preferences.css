@@ -1,39 +1,50 @@
-@namespace html url("http://www.w3.org/1999/xhtml");
-
 .citation-map-preferences {
-  max-width: 760px;
+  margin: 0 0 18px;
+  padding: 0;
 }
 
-.citation-map-preferences description {
-  margin: 0 0 12px;
-  line-height: 1.45;
+.citation-map-preferences h2 {
+  margin: 0 0 8px;
+  font-size: 1.15rem;
 }
 
 .citation-map-pref-row {
   gap: 12px;
-  margin: 8px 0 4px;
+  margin-block: 9px;
 }
 
 .citation-map-pref-row html|label {
-  min-width: 190px;
-}
-
-.citation-map-pref-row menulist {
-  min-width: 230px;
+  min-width: 170px;
 }
 
 .citation-map-pref-row html|input[type="number"] {
-  width: 88px;
+  width: 90px;
 }
 
 .citation-map-pref-help {
-  max-width: 680px;
-  color: var(--fill-secondary, rgba(0, 0, 0, 0.58));
-  font-size: 0.95em;
+  max-width: 640px;
+  margin: 4px 0 9px 26px;
+  opacity: 0.75;
+  line-height: 1.35;
 }
 
-.citation-map-appearance-preferences {
-  margin-top: 18px;
-  padding-top: 4px;
-  border-top: 1px solid var(--color-border50, rgba(0, 0, 0, 0.08));
+.citation-map-pref-actions {
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.citation-map-pref-actions html|button {
+  min-height: 30px;
+  padding: 4px 12px;
+}
+
+.citation-map-advanced {
+  margin-top: 6px;
+  max-width: 680px;
+}
+
+.citation-map-advanced > summary {
+  cursor: pointer;
+  font-weight: 600;
+  margin-bottom: 12px;
 }

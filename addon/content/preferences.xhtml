@@ -1,63 +1,64 @@
 <linkset>
-  <html:link rel="localization" href="__addonRef__-preferences.ftl" />
+  <html:link rel="localization" href="citationmap-preferences.ftl" />
   <html:link
     rel="stylesheet"
-    href="chrome://__addonRef__/content/preferences.css"
+    href="chrome://citationmap/content/preferences.css"
   />
 </linkset>
 
 <groupbox class="citation-map-preferences">
-  <label>
-    <html:h2 data-l10n-id="pref-citation-data-heading"></html:h2>
-  </label>
-
-  <description data-l10n-id="pref-citation-data-description" />
-
-  <checkbox
-    id="zotero-prefpane-__addonRef__-automatic-updates"
-    preference="automaticUpdates"
-    data-l10n-id="pref-automatic-updates"
-  />
+  <label><html:h2 data-l10n-id="pref-data-heading"></html:h2></label>
+  <description data-l10n-id="pref-data-description" />
 
   <hbox class="citation-map-pref-row" align="center">
     <html:label
-      for="zotero-prefpane-__addonRef__-provider"
+      for="zotero-prefpane-citationmap-provider"
       data-l10n-id="pref-provider"
     ></html:label>
     <menulist
-      id="zotero-prefpane-__addonRef__-provider"
+      id="zotero-prefpane-citationmap-provider"
       preference="provider"
       native="true"
     >
       <menupopup>
         <menuitem value="auto" data-l10n-id="pref-provider-auto" />
-        <menuitem value="openalex" data-l10n-id="pref-provider-openalex" />
+        <menuitem value="crossref" data-l10n-id="pref-provider-crossref" />
         <menuitem
           value="semantic-scholar"
           data-l10n-id="pref-provider-semantic-scholar"
         />
-        <menuitem value="crossref" data-l10n-id="pref-provider-crossref" />
         <menuitem
           value="opencitations"
           data-l10n-id="pref-provider-opencitations"
         />
         <menuitem value="inspire" data-l10n-id="pref-provider-inspire" />
+        <menuitem value="openalex" data-l10n-id="pref-provider-openalex" />
       </menupopup>
     </menulist>
   </hbox>
-
   <description
     class="citation-map-pref-help"
     data-l10n-id="pref-provider-help"
   />
 
+  <checkbox
+    id="zotero-prefpane-citationmap-automatic-updates"
+    preference="automaticUpdates"
+    data-l10n-id="pref-automatic-updates"
+  />
+  <checkbox
+    id="zotero-prefpane-citationmap-update-new-items"
+    preference="updateNewItems"
+    data-l10n-id="pref-update-new-items"
+  />
+
   <hbox class="citation-map-pref-row" align="center">
     <html:label
-      for="zotero-prefpane-__addonRef__-cache-days"
+      for="zotero-prefpane-citationmap-cache-days"
       data-l10n-id="pref-cache-days"
     ></html:label>
     <html:input
-      id="zotero-prefpane-__addonRef__-cache-days"
+      id="zotero-prefpane-citationmap-cache-days"
       type="number"
       min="1"
       max="3650"
@@ -66,59 +67,53 @@
     />
   </hbox>
 
-  <description
-    class="citation-map-pref-help"
-    data-l10n-id="pref-reference-count-note"
-  />
+  <hbox class="citation-map-pref-actions">
+    <html:button
+      type="button"
+      data-l10n-id="pref-refresh-all"
+      onclick="Zotero.CitationMap.api.refreshAll()"
+    ></html:button>
+  </hbox>
 </groupbox>
 
-<groupbox class="citation-map-preferences citation-map-appearance-preferences">
-  <label>
-    <html:h2 data-l10n-id="pref-graph-appearance-heading"></html:h2>
-  </label>
-
-  <description data-l10n-id="pref-graph-appearance-description" />
-
-  <hbox class="citation-map-pref-row" align="center">
-    <html:label
-      for="zotero-prefpane-__addonRef__-node-size"
-      data-l10n-id="pref-node-size"
-    ></html:label>
-    <menulist
-      id="zotero-prefpane-__addonRef__-node-size"
-      preference="nodeSizeMetric"
-      native="true"
-    >
-      <menupopup>
-        <menuitem value="citations" data-l10n-id="pref-node-size-citations" />
-        <menuitem value="references" data-l10n-id="pref-node-size-references" />
-        <menuitem value="uniform" data-l10n-id="pref-node-size-uniform" />
-      </menupopup>
-    </menulist>
-  </hbox>
-
-  <hbox class="citation-map-pref-row" align="center">
-    <html:label
-      for="zotero-prefpane-__addonRef__-node-label"
-      data-l10n-id="pref-node-label"
-    ></html:label>
-    <menulist
-      id="zotero-prefpane-__addonRef__-node-label"
-      preference="nodeLabelMode"
-      native="true"
-    >
-      <menupopup>
-        <menuitem value="title" data-l10n-id="pref-node-label-title" />
-        <menuitem
-          value="author-year"
-          data-l10n-id="pref-node-label-author-year"
-        />
-      </menupopup>
-    </menulist>
-  </hbox>
-
-  <description
-    class="citation-map-pref-help"
-    data-l10n-id="pref-collection-colors-note"
-  />
-</groupbox>
+<html:details class="citation-map-advanced">
+  <html:summary data-l10n-id="pref-advanced-heading"></html:summary>
+  <groupbox class="citation-map-preferences">
+    <checkbox
+      id="zotero-prefpane-citationmap-title-fallback"
+      preference="exactTitleFallback"
+      data-l10n-id="pref-title-fallback"
+    />
+    <checkbox
+      id="zotero-prefpane-citationmap-local-relations"
+      preference="localRelations"
+      data-l10n-id="pref-local-relations"
+    />
+    <checkbox
+      id="zotero-prefpane-citationmap-note-extraction"
+      preference="noteExtraction"
+      data-l10n-id="pref-note-extraction"
+    />
+    <checkbox
+      id="zotero-prefpane-citationmap-pdf-extraction"
+      preference="pdfExtraction"
+      data-l10n-id="pref-pdf-extraction"
+    />
+    <checkbox
+      id="zotero-prefpane-citationmap-debug"
+      preference="debugLogging"
+      data-l10n-id="pref-debug"
+    />
+    <description
+      class="citation-map-pref-help"
+      data-l10n-id="pref-advanced-help"
+    />
+    <hbox class="citation-map-pref-actions">
+      <html:button
+        type="button"
+        data-l10n-id="pref-clear-cache"
+        onclick="Zotero.CitationMap.api.clearCache()"
+      ></html:button>
+    </hbox>
+  </groupbox>
+</html:details>

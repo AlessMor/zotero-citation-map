@@ -8,161 +8,133 @@ import { requestJSON } from "./http";
 import type { CitationProvider } from "./types";
 import { failureStatusFromHTTP, numberOrNull, stringOrNull } from "./types";
 
+interface InspireReference {
+  reference?: {
+    dois?: string[];
+    arxiv_eprint?: string;
+    label?: string;
+    publication_info?: { year?: number };
+  };
+  raw_refs?: Array<{ source?: string }>;
+}
 interface InspireRecord {
   id?: string | number;
-  metadata?: any;
+  metadata?: {
+    titles?: Array<{ title?: string }>;
+    abstracts?: Array<{ value?: string }>;
+    document_type?: string[];
+    citation_count?: number;
+    citation_count_without_self_citations?: number;
+    reference_count?: number;
+    references?: InspireReference[];
+    dois?: Array<{ value?: string }>;
+    arxiv_eprints?: Array<{ value?: string }>;
+    authors?: Array<{ full_name?: string }>;
+    publication_info?: Array<{ year?: number; journal_title?: string }>;
+    earliest_date?: string;
+  };
+}
+interface InspireResponse {
+  hits?: { hits?: InspireRecord[] };
 }
 
-function firstValue(value: any): any {
-  return Array.isArray(value) ? value[0] : value;
+function queryFor(identifiers: WorkIdentifiers): string | null {
+  if (identifiers.doi) return `doi:${identifiers.doi}`;
+  if (identifiers.arxiv) return `arxiv:${identifiers.arxiv}`;
+  return null;
 }
 
-function getDOI(metadata: any): string | null {
-  const doiEntry = firstValue(metadata?.dois);
-  return normalizeDOI(doiEntry?.value ?? doiEntry);
-}
-
-function getTitle(metadata: any): string | null {
-  const entry = firstValue(metadata?.titles);
-  return stringOrNull(entry?.title ?? entry);
-}
-
-function getYear(metadata: any): number | null {
-  return (
-    numberOrNull(metadata?.earliest_date?.slice?.(0, 4)) ??
-    numberOrNull(firstValue(metadata?.publication_info)?.year) ??
-    numberOrNull(metadata?.preprint_date?.slice?.(0, 4))
-  );
-}
-
-function getAuthors(metadata: any): string[] {
-  return (metadata?.authors ?? [])
-    .map((author: any) => stringOrNull(author?.full_name ?? author?.raw_name))
-    .filter((name: string | null): name is string => Boolean(name));
-}
-
-function getReferenceDOI(reference: any): string | null {
-  const structured = reference?.reference ?? reference;
-  const doiEntry = firstValue(structured?.dois);
-  const direct = normalizeDOI(doiEntry?.value ?? doiEntry);
-
-  if (direct) {
-    return direct;
-  }
-
-  const rawText = (reference?.raw_refs ?? [])
-    .map((entry: any) => entry?.value)
-    .filter(Boolean)
-    .join(" ");
-
-  return normalizeDOI(rawText);
-}
-
-function getReferenceTitle(reference: any): string | null {
-  const structured = reference?.reference ?? reference;
-  const titleEntry = firstValue(structured?.titles);
-
-  if (titleEntry) {
-    return stringOrNull(titleEntry?.title ?? titleEntry);
-  }
-
-  return stringOrNull(reference?.raw_refs?.[0]?.value);
-}
-
-function getReferenceYear(reference: any): number | null {
-  const structured = reference?.reference ?? reference;
-
-  return (
-    numberOrNull(firstValue(structured?.publication_info)?.year) ??
-    numberOrNull(structured?.year)
-  );
-}
-
-function getReferenceAuthors(reference: any): string[] {
-  const structured = reference?.reference ?? reference;
-
-  return (structured?.authors ?? [])
-    .map((author: any) => stringOrNull(author?.full_name ?? author?.raw_name))
-    .filter((name: string | null): name is string => Boolean(name));
-}
-
-function getReferenceRecordID(reference: any): string | null {
-  const ref = stringOrNull(reference?.record?.$ref);
-  if (!ref) {
-    return null;
-  }
-
-  const parts = ref.split("/").filter(Boolean);
-  return parts.length > 0 ? parts[parts.length - 1] : null;
-}
-
-function mapReferences(metadata: any): RelatedWorkMetadata[] {
-  return (metadata?.references ?? []).map((reference: any) => ({
-    providerWorkID: getReferenceRecordID(reference),
-    doi: getReferenceDOI(reference),
-    title: getReferenceTitle(reference),
-    year: getReferenceYear(reference),
-    authors: getReferenceAuthors(reference),
-  }));
+function relationFromReference(
+  reference: InspireReference,
+): RelatedWorkMetadata | null {
+  const doi = normalizeDOI(reference.reference?.dois?.[0]);
+  const raw =
+    reference.raw_refs?.[0]?.source ?? reference.reference?.label ?? null;
+  if (!doi && !raw) return null;
+  return {
+    provider: "inspire",
+    providerWorkID: doi ?? reference.reference?.arxiv_eprint ?? null,
+    doi,
+    arxiv: reference.reference?.arxiv_eprint ?? null,
+    title: raw,
+    year: reference.reference?.publication_info?.year ?? null,
+    authors: [],
+  };
 }
 
 export const inspireProvider: CitationProvider = {
   id: "inspire",
   label: "INSPIRE-HEP",
-
-  supports(identifiers) {
-    return Boolean(identifiers.doi || identifiers.arxiv);
+  capabilities: {
+    identifiers: {
+      doi: true,
+      pmid: false,
+      arxiv: true,
+      isbn: false,
+      titleSearch: false,
+    },
+    citationCount: true,
+    referenceCount: true,
+    citingWorks: false,
+    referencedWorks: true,
+    abstract: true,
+    openAccess: false,
+    retraction: false,
+    sourceMetrics: false,
   },
-
-  async lookup(identifiers: WorkIdentifiers): Promise<ProviderLookupResult> {
-    const matchedBy = identifiers.doi ? "doi" : "arxiv";
-    const value = identifiers.doi ?? identifiers.arxiv;
-
-    if (!value) {
+  supports: (identifiers) => Boolean(queryFor(identifiers)),
+  lookup: async (identifiers): Promise<ProviderLookupResult> => {
+    const query = queryFor(identifiers);
+    if (!query) {
       return {
         status: "no-identifier",
         provider: "inspire",
-        message: "INSPIRE-HEP requires a DOI or arXiv ID.",
+        message: "INSPIRE-HEP needs a DOI or arXiv ID.",
       };
     }
-
-    const endpoint = matchedBy === "doi" ? "doi" : "arxiv";
-    const url =
-      `https://inspirehep.net/api/${endpoint}/` + encodeURIComponent(value);
-
-    const response = await requestJSON<InspireRecord>("inspire", url);
-
-    if (!response.ok || !response.data?.metadata) {
+    const response = await requestJSON<InspireResponse>(
+      "inspire",
+      `https://inspirehep.net/api/literature?q=${encodeURIComponent(query)}&size=2`,
+    );
+    const hit = response.data?.hits?.hits?.[0];
+    if (!response.ok || !hit?.metadata) {
       return {
         status: failureStatusFromHTTP(response.status),
         provider: "inspire",
-        message: response.message,
+        message: response.message || "INSPIRE-HEP did not return a work.",
       };
     }
-
-    const record = response.data;
-    const metadata = record.metadata;
-    const references = mapReferences(metadata);
-    const declaredReferenceCount = numberOrNull(metadata.reference_count);
-
+    const metadata = hit.metadata;
+    const references = (metadata.references ?? [])
+      .map(relationFromReference)
+      .filter((work): work is RelatedWorkMetadata => Boolean(work));
+    const dateYear = Number(String(metadata.earliest_date ?? "").slice(0, 4));
     return {
       status: "success",
       provider: "inspire",
-      matchedBy,
-      providerWorkID: stringOrNull(record.id),
-      doi: getDOI(metadata) ?? normalizeDOI(identifiers.doi),
-      title: getTitle(metadata),
-      year: getYear(metadata),
-      authors: getAuthors(metadata),
+      matchedBy: identifiers.doi ? "doi" : "arxiv",
+      matchConfidence: 1,
+      providerWorkID: String(hit.id ?? "") || null,
+      doi: normalizeDOI(metadata.dois?.[0]?.value ?? identifiers.doi),
+      title: stringOrNull(metadata.titles?.[0]?.title),
+      year:
+        metadata.publication_info?.[0]?.year ??
+        (Number.isFinite(dateYear) ? dateYear : null),
+      authors: (metadata.authors ?? [])
+        .map((author) => String(author.full_name ?? "").trim())
+        .filter(Boolean),
+      sourceTitle: stringOrNull(metadata.publication_info?.[0]?.journal_title),
+      abstract: stringOrNull(metadata.abstracts?.[0]?.value),
       citationCount: numberOrNull(metadata.citation_count),
       citationCountProvider: "inspire",
       referenceCount:
-        declaredReferenceCount === null
-          ? references.length
-          : Math.max(declaredReferenceCount, references.length),
+        numberOrNull(metadata.reference_count) ?? references.length,
       referenceCountProvider: "inspire",
       resolvedReferenceCount: references.length,
       references,
+      influentialCitationCount: null,
+      publicationType: stringOrNull(metadata.document_type?.join(", ")),
+      sourceMetrics: null,
     };
   },
 };

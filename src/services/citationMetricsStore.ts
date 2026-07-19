@@ -6,7 +6,11 @@ import type {
   CitationProviderPreference,
   CitationYearCount,
   IdentifierKind,
+  IgnoredProviderRelation,
+  ManualCitationRelation,
+  ManualRelationDirection,
   RelatedWorkMetadata,
+  SourceMetrics,
 } from "../domain/citationTypes";
 
 interface CitationMetricRow {
@@ -15,29 +19,36 @@ interface CitationMetricRow {
   provider: string;
   provider_work_id: string | null;
   matched_by: string | null;
+  match_confidence: number | null;
+  match_confirmed: number | null;
   doi: string | null;
   title: string | null;
+  normalized_title: string | null;
   publication_year: number | null;
   authors_json: string;
+  source_title: string | null;
+  abstract_text: string | null;
   citation_count: number | null;
-  citation_count_provider?: string | null;
+  citation_count_provider: string | null;
   reference_count: number | null;
-  reference_count_provider?: string | null;
-  resolved_reference_count?: number | null;
+  reference_count_provider: string | null;
+  resolved_reference_count: number | null;
   references_json: string;
-  fwci?: number | null;
-  citation_percentile?: number | null;
-  top_1_percent?: number | null;
-  top_10_percent?: number | null;
-  citation_counts_by_year_json?: string | null;
-  citations_last_year?: number | null;
-  citation_velocity?: number | null;
-  citation_acceleration?: number | null;
-  influential_citation_count?: number | null;
-  is_retracted?: number | null;
-  open_access_status?: string | null;
-  is_open_access?: number | null;
-  publication_type?: string | null;
+  match_candidates_json: string | null;
+  fwci: number | null;
+  citation_percentile: number | null;
+  top_1_percent: number | null;
+  top_10_percent: number | null;
+  citation_counts_by_year_json: string | null;
+  citations_last_year: number | null;
+  citation_velocity: number | null;
+  citation_acceleration: number | null;
+  influential_citation_count: number | null;
+  is_retracted: number | null;
+  open_access_status: string | null;
+  is_open_access: number | null;
+  publication_type: string | null;
+  source_metrics_json: string | null;
   status: string;
   fetched_at: string | null;
   last_attempt_at: string;
@@ -48,118 +59,146 @@ interface CitationMetricRow {
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS citation_metrics (
-  library_id                  INTEGER NOT NULL,
-  item_key                   TEXT NOT NULL,
-  provider                   TEXT NOT NULL,
-  provider_work_id           TEXT,
-  matched_by                 TEXT,
-  doi                        TEXT,
-  title                      TEXT,
-  publication_year           INTEGER,
-  authors_json               TEXT NOT NULL DEFAULT '[]',
-  citation_count             INTEGER,
-  citation_count_provider    TEXT,
-  reference_count            INTEGER,
-  reference_count_provider   TEXT,
-  resolved_reference_count   INTEGER NOT NULL DEFAULT 0,
-  references_json            TEXT NOT NULL DEFAULT '[]',
-  fwci                       REAL,
-  citation_percentile        REAL,
-  top_1_percent              INTEGER,
-  top_10_percent             INTEGER,
+  library_id                    INTEGER NOT NULL,
+  item_key                     TEXT NOT NULL,
+  provider                     TEXT NOT NULL,
+  provider_work_id             TEXT,
+  matched_by                   TEXT,
+  match_confidence             REAL,
+  match_confirmed              INTEGER NOT NULL DEFAULT 1,
+  doi                          TEXT,
+  title                        TEXT,
+  normalized_title             TEXT,
+  publication_year             INTEGER,
+  authors_json                 TEXT NOT NULL DEFAULT '[]',
+  source_title                 TEXT,
+  abstract_text                TEXT,
+  citation_count               INTEGER,
+  citation_count_provider      TEXT,
+  reference_count              INTEGER,
+  reference_count_provider     TEXT,
+  resolved_reference_count     INTEGER NOT NULL DEFAULT 0,
+  references_json              TEXT NOT NULL DEFAULT '[]',
+  match_candidates_json        TEXT NOT NULL DEFAULT '[]',
+  fwci                         REAL,
+  citation_percentile          REAL,
+  top_1_percent                INTEGER,
+  top_10_percent               INTEGER,
   citation_counts_by_year_json TEXT NOT NULL DEFAULT '[]',
-  citations_last_year        INTEGER,
-  citation_velocity          REAL,
-  citation_acceleration      REAL,
-  influential_citation_count INTEGER,
-  is_retracted               INTEGER,
-  open_access_status         TEXT,
-  is_open_access             INTEGER,
-  publication_type           TEXT,
-  status                     TEXT NOT NULL,
-  fetched_at                 TEXT,
-  last_attempt_at            TEXT NOT NULL,
-  error_message              TEXT,
-  failure_count              INTEGER NOT NULL DEFAULT 0,
-  next_retry_at              TEXT,
+  citations_last_year          INTEGER,
+  citation_velocity            REAL,
+  citation_acceleration        REAL,
+  influential_citation_count   INTEGER,
+  is_retracted                 INTEGER,
+  open_access_status           TEXT,
+  is_open_access               INTEGER,
+  publication_type             TEXT,
+  source_metrics_json          TEXT,
+  status                       TEXT NOT NULL,
+  fetched_at                   TEXT,
+  last_attempt_at              TEXT NOT NULL,
+  error_message                TEXT,
+  failure_count                INTEGER NOT NULL DEFAULT 0,
+  next_retry_at                TEXT,
   PRIMARY KEY (library_id, item_key)
-)
+);
+
+CREATE TABLE IF NOT EXISTS manual_relations (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  library_id       INTEGER NOT NULL,
+  subject_item_key TEXT NOT NULL,
+  related_item_key TEXT NOT NULL,
+  direction        TEXT NOT NULL,
+  created_at       TEXT NOT NULL,
+  UNIQUE(library_id, subject_item_key, related_item_key, direction)
+);
+
+CREATE TABLE IF NOT EXISTS ignored_provider_relations (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  library_id        INTEGER NOT NULL,
+  subject_item_key  TEXT NOT NULL,
+  direction         TEXT NOT NULL,
+  provider          TEXT NOT NULL,
+  provider_work_id  TEXT,
+  doi               TEXT,
+  normalized_title  TEXT,
+  created_at        TEXT NOT NULL,
+  UNIQUE(library_id, subject_item_key, direction, provider, provider_work_id, doi, normalized_title)
+);
 `;
 
 const UPSERT_SQL = `
 INSERT OR REPLACE INTO citation_metrics (
-  library_id,
-  item_key,
-  provider,
-  provider_work_id,
-  matched_by,
-  doi,
-  title,
-  publication_year,
-  authors_json,
-  citation_count,
-  citation_count_provider,
-  reference_count,
-  reference_count_provider,
-  resolved_reference_count,
-  references_json,
-  fwci,
-  citation_percentile,
-  top_1_percent,
-  top_10_percent,
-  citation_counts_by_year_json,
-  citations_last_year,
-  citation_velocity,
-  citation_acceleration,
-  influential_citation_count,
-  is_retracted,
-  open_access_status,
-  is_open_access,
-  publication_type,
-  status,
-  fetched_at,
-  last_attempt_at,
-  error_message,
-  failure_count,
+  library_id, item_key, provider, provider_work_id, matched_by,
+  match_confidence, match_confirmed, doi, title, normalized_title,
+  publication_year, authors_json, source_title, abstract_text,
+  citation_count, citation_count_provider, reference_count,
+  reference_count_provider, resolved_reference_count, references_json,
+  match_candidates_json, fwci, citation_percentile, top_1_percent, top_10_percent,
+  citation_counts_by_year_json, citations_last_year, citation_velocity,
+  citation_acceleration, influential_citation_count, is_retracted,
+  open_access_status, is_open_access, publication_type, source_metrics_json,
+  status, fetched_at, last_attempt_at, error_message, failure_count,
   next_retry_at
-) VALUES (${Array.from({ length: 34 }, () => "?").join(", ")})
+) VALUES (${Array.from({ length: 41 }, () => "?").join(", ")})
 `;
 
-const MAX_STORED_REFERENCES = 2000;
-const CLOSE_WRITE_DRAIN_TIMEOUT_MS = 4000;
-
+const MAX_STORED_REFERENCES = 2500;
 let db: _ZoteroTypes.DBConnection | null = null;
 let initialized = false;
 let initPromise: Promise<void> | null = null;
 let mirror = new Map<string, CitationMetricRecord>();
 let mirrorRevision = 0;
+let manualMirror: ManualCitationRelation[] = [];
+let ignoredMirror: IgnoredProviderRelation[] = [];
 const writeTails = new Map<string, Promise<void>>();
 
 function mirrorKey(libraryID: number, itemKey: string): string {
   return `${libraryID}:${itemKey}`;
 }
 
-function safeParseArray<T>(value: string | null | undefined): T[] {
-  if (!value) {
-    return [];
-  }
-
+function safeParse<T>(value: string | null | undefined, fallback: T): T {
+  if (!value) return fallback;
   try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? (parsed as T[]) : [];
+    return JSON.parse(value) as T;
   } catch {
-    return [];
+    return fallback;
   }
 }
 
-function safeCitationYearCounts(
-  value: string | null | undefined,
-): CitationYearCount[] {
-  return safeParseArray<CitationYearCount>(value)
-    .map((entry) => ({
-      year: Number(entry.year),
-      count: Number(entry.count),
-    }))
+function safeArray<T>(value: string | null | undefined): T[] {
+  const parsed = safeParse<unknown>(value, []);
+  return Array.isArray(parsed) ? (parsed as T[]) : [];
+}
+
+function numberOrNull(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function booleanOrNull(value: unknown): boolean | null {
+  if (value === null || value === undefined || value === "") return null;
+  return Number(value) !== 0;
+}
+
+function providerOrNull(value: unknown): CitationProviderID | null {
+  return typeof value === "string" && value
+    ? (value as CitationProviderID)
+    : null;
+}
+
+function dataAgeDays(fetchedAt: string | null): number | null {
+  if (!fetchedAt) return null;
+  const timestamp = Date.parse(fetchedAt);
+  return Number.isFinite(timestamp)
+    ? Math.max(0, (Date.now() - timestamp) / 86400000)
+    : null;
+}
+
+function normalizeYearCounts(value: string | null): CitationYearCount[] {
+  return safeArray<CitationYearCount>(value)
+    .map((entry) => ({ year: Number(entry.year), count: Number(entry.count) }))
     .filter(
       (entry) =>
         Number.isInteger(entry.year) &&
@@ -169,56 +208,25 @@ function safeCitationYearCounts(
     );
 }
 
-function providerOrNull(value: unknown): CitationProviderID | null {
-  return typeof value === "string" && value.length > 0
-    ? (value as CitationProviderID)
-    : null;
-}
-
-function numberOrNull(value: unknown): number | null {
-  if (value === null || value === undefined || value === "") {
-    return null;
-  }
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-function booleanOrNull(value: unknown): boolean | null {
-  if (value === null || value === undefined || value === "") {
-    return null;
-  }
-  return Number(value) !== 0;
-}
-
-function matchConfidence(matchedBy: IdentifierKind | null): number | null {
-  return matchedBy ? 1 : null;
-}
-
-function dataAgeDays(fetchedAt: string | null): number | null {
-  if (!fetchedAt) {
-    return null;
-  }
-  const timestamp = Date.parse(fetchedAt);
-  if (!Number.isFinite(timestamp)) {
-    return null;
-  }
-  return Math.max(0, (Date.now() - timestamp) / (24 * 60 * 60 * 1000));
-}
-
 function rowToRecord(row: CitationMetricRow): CitationMetricRecord {
-  const references = safeParseArray<RelatedWorkMetadata>(row.references_json);
   const provider = row.provider as CitationProviderID;
-
+  const references = safeArray<RelatedWorkMetadata>(row.references_json);
   return {
     libraryID: Number(row.library_id),
     itemKey: String(row.item_key),
     provider,
     providerWorkID: row.provider_work_id,
     matchedBy: row.matched_by as IdentifierKind | null,
+    matchConfidence: numberOrNull(row.match_confidence),
+    matchConfirmed:
+      row.match_confirmed === null ? true : Number(row.match_confirmed) !== 0,
     doi: row.doi,
     title: row.title,
-    year: row.publication_year === null ? null : Number(row.publication_year),
-    authors: safeParseArray<string>(row.authors_json),
+    normalizedTitle: row.normalized_title,
+    year: numberOrNull(row.publication_year),
+    authors: safeArray<string>(row.authors_json),
+    sourceTitle: row.source_title,
+    abstract: row.abstract_text,
     citationCount: numberOrNull(row.citation_count),
     citationCountProvider:
       providerOrNull(row.citation_count_provider) ?? provider,
@@ -226,26 +234,26 @@ function rowToRecord(row: CitationMetricRow): CitationMetricRecord {
     referenceCountProvider:
       providerOrNull(row.reference_count_provider) ?? provider,
     resolvedReferenceCount:
-      row.resolved_reference_count === undefined ||
-      row.resolved_reference_count === null
-        ? references.length
-        : Number(row.resolved_reference_count),
+      numberOrNull(row.resolved_reference_count) ?? references.length,
     references,
+    matchCandidates: safeArray<RelatedWorkMetadata>(row.match_candidates_json),
     fwci: numberOrNull(row.fwci),
     citationPercentile: numberOrNull(row.citation_percentile),
     isTop1Percent: booleanOrNull(row.top_1_percent),
     isTop10Percent: booleanOrNull(row.top_10_percent),
-    citationCountsByYear: safeCitationYearCounts(
-      row.citation_counts_by_year_json,
-    ),
+    citationCountsByYear: normalizeYearCounts(row.citation_counts_by_year_json),
     citationsLastYear: numberOrNull(row.citations_last_year),
     citationVelocity: numberOrNull(row.citation_velocity),
     citationAcceleration: numberOrNull(row.citation_acceleration),
     influentialCitationCount: numberOrNull(row.influential_citation_count),
     isRetracted: booleanOrNull(row.is_retracted),
-    openAccessStatus: row.open_access_status ?? null,
+    openAccessStatus: row.open_access_status,
     isOpenAccess: booleanOrNull(row.is_open_access),
-    publicationType: row.publication_type ?? null,
+    publicationType: row.publication_type,
+    sourceMetrics: safeParse<SourceMetrics | null>(
+      row.source_metrics_json,
+      null,
+    ),
     status: row.status as CitationMetricStatus,
     fetchedAt: row.fetched_at,
     lastAttemptAt: row.last_attempt_at,
@@ -262,16 +270,22 @@ function recordToParams(record: CitationMetricRecord): unknown[] {
     record.provider,
     record.providerWorkID,
     record.matchedBy,
+    record.matchConfidence,
+    Number(record.matchConfirmed),
     record.doi,
     record.title,
+    record.normalizedTitle,
     record.year,
     JSON.stringify(record.authors),
+    record.sourceTitle,
+    record.abstract,
     record.citationCount,
     record.citationCountProvider,
     record.referenceCount,
     record.referenceCountProvider,
     record.resolvedReferenceCount,
     JSON.stringify(record.references.slice(0, MAX_STORED_REFERENCES)),
+    JSON.stringify(record.matchCandidates),
     record.fwci,
     record.citationPercentile,
     record.isTop1Percent === null ? null : Number(record.isTop1Percent),
@@ -285,6 +299,7 @@ function recordToParams(record: CitationMetricRecord): unknown[] {
     record.openAccessStatus,
     record.isOpenAccess === null ? null : Number(record.isOpenAccess),
     record.publicationType,
+    JSON.stringify(record.sourceMetrics),
     record.status,
     record.fetchedAt,
     record.lastAttemptAt,
@@ -298,22 +313,26 @@ function requireDB(): _ZoteroTypes.DBConnection {
   if (!db || !initialized) {
     throw new Error("Citation Map metrics store is not initialized.");
   }
-
   return db;
 }
 
-async function ensureSchemaColumns(
+async function ensureColumns(
   connection: _ZoteroTypes.DBConnection,
 ): Promise<void> {
   const rows = (await connection.queryAsync(
     "PRAGMA table_info(citation_metrics)",
   )) as Array<{ name?: string }>;
   const existing = new Set(rows.map((row) => String(row.name ?? "")));
-
   const additions: Array<[string, string]> = [
+    ["match_confidence", "REAL"],
+    ["match_confirmed", "INTEGER NOT NULL DEFAULT 1"],
+    ["normalized_title", "TEXT"],
+    ["source_title", "TEXT"],
+    ["abstract_text", "TEXT"],
     ["citation_count_provider", "TEXT"],
     ["reference_count_provider", "TEXT"],
     ["resolved_reference_count", "INTEGER NOT NULL DEFAULT 0"],
+    ["match_candidates_json", "TEXT NOT NULL DEFAULT '[]'"],
     ["fwci", "REAL"],
     ["citation_percentile", "REAL"],
     ["top_1_percent", "INTEGER"],
@@ -327,8 +346,8 @@ async function ensureSchemaColumns(
     ["open_access_status", "TEXT"],
     ["is_open_access", "INTEGER"],
     ["publication_type", "TEXT"],
+    ["source_metrics_json", "TEXT"],
   ];
-
   for (const [name, definition] of additions) {
     if (!existing.has(name)) {
       await connection.queryAsync(
@@ -336,102 +355,94 @@ async function ensureSchemaColumns(
       );
     }
   }
+}
 
-  await connection
-    .queryAsync(
-      `
-      UPDATE citation_metrics
-      SET resolved_reference_count =
-        CASE
-          WHEN resolved_reference_count IS NULL OR resolved_reference_count = 0
-          THEN json_array_length(references_json)
-          ELSE resolved_reference_count
-        END
-    `,
-    )
-    .catch(() => undefined);
+function relationRow(row: any): ManualCitationRelation {
+  return {
+    id: Number(row.id),
+    libraryID: Number(row.library_id),
+    subjectItemKey: String(row.subject_item_key),
+    relatedItemKey: String(row.related_item_key),
+    direction: row.direction as ManualRelationDirection,
+    createdAt: String(row.created_at),
+  };
+}
+
+function ignoredRow(row: any): IgnoredProviderRelation {
+  return {
+    id: Number(row.id),
+    libraryID: Number(row.library_id),
+    subjectItemKey: String(row.subject_item_key),
+    direction: row.direction as ManualRelationDirection,
+    provider: row.provider as CitationProviderID,
+    providerWorkID: row.provider_work_id ?? null,
+    doi: row.doi ?? null,
+    normalizedTitle: row.normalized_title ?? null,
+    createdAt: String(row.created_at),
+  };
 }
 
 export function initCitationMetricsStore(): Promise<void> {
-  if (initialized) {
-    return Promise.resolve();
-  }
-
-  if (initPromise) {
-    return initPromise;
-  }
-
+  if (initialized) return Promise.resolve();
+  if (initPromise) return initPromise;
   initPromise = (async () => {
     const connection = new Zotero.DBConnection("citationmap");
-    await connection.queryAsync(SCHEMA);
-    await ensureSchemaColumns(connection);
-
+    for (const statement of SCHEMA.split(";")
+      .map((part) => part.trim())
+      .filter(Boolean)) {
+      await connection.queryAsync(statement);
+    }
+    await ensureColumns(connection);
     const rows = (await connection.queryAsync(
       "SELECT * FROM citation_metrics",
     )) as CitationMetricRow[];
-
-    const nextMirror = new Map<string, CitationMetricRecord>();
-
+    mirror = new Map();
     for (const row of rows) {
       const record = rowToRecord(row);
-      nextMirror.set(mirrorKey(record.libraryID, record.itemKey), record);
+      mirror.set(mirrorKey(record.libraryID, record.itemKey), record);
     }
-
+    manualMirror = (
+      (await connection.queryAsync("SELECT * FROM manual_relations")) as any[]
+    ).map(relationRow);
+    ignoredMirror = (
+      (await connection.queryAsync(
+        "SELECT * FROM ignored_provider_relations",
+      )) as any[]
+    ).map(ignoredRow);
     db = connection;
-    mirror = nextMirror;
-    mirrorRevision += 1;
     initialized = true;
-
+    mirrorRevision += 1;
     Zotero.debug(
-      `Citation Map: metrics cache initialized with ${mirror.size} rows`,
+      `Citation Map: cache initialized with ${mirror.size} metric records and ${manualMirror.length} manual relations`,
     );
   })().finally(() => {
     initPromise = null;
   });
-
   return initPromise;
 }
 
 export async function closeCitationMetricsStore(): Promise<void> {
-  if (initPromise) {
-    await initPromise.catch(() => undefined);
-  }
-
-  if (writeTails.size > 0) {
-    let timeout: ReturnType<typeof setTimeout> | null = null;
-    let completed = false;
-
-    try {
-      await Promise.race([
-        Promise.allSettled([...writeTails.values()]).then(() => {
-          completed = true;
-        }),
-        new Promise<void>((resolve) => {
-          timeout = setTimeout(resolve, CLOSE_WRITE_DRAIN_TIMEOUT_MS);
-        }),
-      ]);
-    } finally {
-      if (timeout !== null) {
-        clearTimeout(timeout);
-      }
-    }
-
-    if (!completed) {
-      Zotero.debug(
-        `Citation Map: cache-write shutdown drain exceeded ${CLOSE_WRITE_DRAIN_TIMEOUT_MS} ms`,
-      );
-    }
-  }
-
-  if (db) {
-    await db.closeDatabase(true);
-  }
-
+  if (initPromise) await initPromise.catch(() => undefined);
+  await Promise.all(
+    [...writeTails.values()].map((tail) => tail.catch(() => undefined)),
+  );
+  const connection = db;
   db = null;
-  mirror = new Map();
-  mirrorRevision += 1;
-  writeTails.clear();
   initialized = false;
+  mirror.clear();
+  manualMirror = [];
+  ignoredMirror = [];
+  if (connection) await connection.closeDatabase().catch(() => undefined);
+}
+
+function queueWrite(key: string, task: () => Promise<void>): Promise<void> {
+  const previous =
+    writeTails.get(key)?.catch(() => undefined) ?? Promise.resolve();
+  const next = previous.then(task).finally(() => {
+    if (writeTails.get(key) === next) writeTails.delete(key);
+  });
+  writeTails.set(key, next);
+  return next;
 }
 
 export function getCitationMetricRecord(
@@ -442,12 +453,11 @@ export function getCitationMetricRecord(
 }
 
 export function getCitationMetricRecords(
-  libraryID?: number,
+  libraryID: number,
 ): CitationMetricRecord[] {
-  const records = [...mirror.values()];
-  return libraryID === undefined
-    ? records
-    : records.filter((record) => record.libraryID === libraryID);
+  return [...mirror.values()].filter(
+    (record) => record.libraryID === libraryID,
+  );
 }
 
 export function getCitationMetricsRevision(): number {
@@ -459,82 +469,72 @@ export function getItemCitationMetrics(
   itemKey: string,
 ): CitationMetricSummary {
   const record = getCitationMetricRecord(libraryID, itemKey);
-
-  return {
-    citationCount: record?.citationCount ?? null,
-    citationCountProvider: record?.citationCountProvider ?? null,
-    referenceCount: record?.referenceCount ?? null,
-    referenceCountProvider: record?.referenceCountProvider ?? null,
-    resolvedReferenceCount: record?.resolvedReferenceCount ?? 0,
-    provider: record?.provider ?? null,
-    matchedBy: record?.matchedBy ?? null,
-    matchConfidence: matchConfidence(record?.matchedBy ?? null),
-    fwci: record?.fwci ?? null,
-    citationPercentile: record?.citationPercentile ?? null,
-    isTop1Percent: record?.isTop1Percent ?? null,
-    isTop10Percent: record?.isTop10Percent ?? null,
-    citationsLastYear: record?.citationsLastYear ?? null,
-    citationVelocity: record?.citationVelocity ?? null,
-    citationAcceleration: record?.citationAcceleration ?? null,
-    influentialCitationCount: record?.influentialCitationCount ?? null,
-    isRetracted: record?.isRetracted ?? null,
-    openAccessStatus: record?.openAccessStatus ?? null,
-    isOpenAccess: record?.isOpenAccess ?? null,
-    publicationType: record?.publicationType ?? null,
-    updatedAt: record?.fetchedAt ?? null,
-    dataAgeDays: dataAgeDays(record?.fetchedAt ?? null),
-    status: record?.status ?? null,
-  };
-}
-
-async function withKeyLock<T>(
-  libraryID: number,
-  itemKey: string,
-  task: () => Promise<T>,
-): Promise<T> {
-  const key = mirrorKey(libraryID, itemKey);
-  const previous = writeTails.get(key) ?? Promise.resolve();
-
-  let release = (): void => undefined;
-  const ticket = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-
-  const nextTail = previous.then(() => ticket);
-  writeTails.set(key, nextTail);
-
-  await previous;
-
-  try {
-    return await task();
-  } finally {
-    release();
-
-    if (writeTails.get(key) === nextTail) {
-      writeTails.delete(key);
-    }
+  if (!record) {
+    return {
+      citationCount: null,
+      citationCountProvider: null,
+      referenceCount: null,
+      referenceCountProvider: null,
+      resolvedReferenceCount: 0,
+      provider: null,
+      matchedBy: null,
+      matchConfidence: null,
+      matchConfirmed: true,
+      fwci: null,
+      citationPercentile: null,
+      isTop1Percent: null,
+      isTop10Percent: null,
+      citationsLastYear: null,
+      citationVelocity: null,
+      citationAcceleration: null,
+      influentialCitationCount: null,
+      isRetracted: null,
+      openAccessStatus: null,
+      isOpenAccess: null,
+      publicationType: null,
+      sourceMetrics: null,
+      updatedAt: null,
+      dataAgeDays: null,
+      status: null,
+    };
   }
+  return {
+    citationCount: record.citationCount,
+    citationCountProvider: record.citationCountProvider,
+    referenceCount: record.referenceCount,
+    referenceCountProvider: record.referenceCountProvider,
+    resolvedReferenceCount: record.resolvedReferenceCount,
+    provider: record.provider,
+    matchedBy: record.matchedBy,
+    matchConfidence: record.matchConfidence,
+    matchConfirmed: record.matchConfirmed,
+    fwci: record.fwci,
+    citationPercentile: record.citationPercentile,
+    isTop1Percent: record.isTop1Percent,
+    isTop10Percent: record.isTop10Percent,
+    citationsLastYear: record.citationsLastYear,
+    citationVelocity: record.citationVelocity,
+    citationAcceleration: record.citationAcceleration,
+    influentialCitationCount: record.influentialCitationCount,
+    isRetracted: record.isRetracted,
+    openAccessStatus: record.openAccessStatus,
+    isOpenAccess: record.isOpenAccess,
+    publicationType: record.publicationType,
+    sourceMetrics: record.sourceMetrics,
+    updatedAt: record.fetchedAt,
+    dataAgeDays: dataAgeDays(record.fetchedAt),
+    status: record.status,
+  };
 }
 
 export async function saveCitationMetricRecord(
   record: CitationMetricRecord,
 ): Promise<void> {
-  await withKeyLock(record.libraryID, record.itemKey, async () => {
+  const key = mirrorKey(record.libraryID, record.itemKey);
+  mirror.set(key, record);
+  mirrorRevision += 1;
+  await queueWrite(key, async () => {
     await requireDB().queryAsync(UPSERT_SQL, recordToParams(record));
-    mirror.set(mirrorKey(record.libraryID, record.itemKey), {
-      ...record,
-      authors: [...record.authors],
-      citationCountsByYear: record.citationCountsByYear.map((entry) => ({
-        ...entry,
-      })),
-      references: record.references
-        .slice(0, MAX_STORED_REFERENCES)
-        .map((reference) => ({
-          ...reference,
-          authors: [...reference.authors],
-        })),
-    });
-    mirrorRevision += 1;
   });
 }
 
@@ -545,110 +545,265 @@ export async function saveCitationMetricFailure(
   status: Exclude<CitationMetricStatus, "success">,
   message: string,
   nextRetryAt: string | null,
-): Promise<CitationMetricRecord> {
-  const existing = getCitationMetricRecord(libraryID, itemKey);
+  matchCandidates: RelatedWorkMetadata[] = [],
+): Promise<void> {
+  const previous = getCitationMetricRecord(libraryID, itemKey);
   const now = new Date().toISOString();
-
-  const next: CitationMetricRecord = {
+  await saveCitationMetricRecord({
     libraryID,
     itemKey,
-    provider: existing?.provider ?? provider,
-    providerWorkID: existing?.providerWorkID ?? null,
-    matchedBy: existing?.matchedBy ?? null,
-    doi: existing?.doi ?? null,
-    title: existing?.title ?? null,
-    year: existing?.year ?? null,
-    authors: existing?.authors ?? [],
-    citationCount: existing?.citationCount ?? null,
-    citationCountProvider:
-      existing?.citationCountProvider ?? existing?.provider ?? null,
-    referenceCount: existing?.referenceCount ?? null,
-    referenceCountProvider:
-      existing?.referenceCountProvider ?? existing?.provider ?? null,
-    resolvedReferenceCount: existing?.resolvedReferenceCount ?? 0,
-    references: existing?.references ?? [],
-    fwci: existing?.fwci ?? null,
-    citationPercentile: existing?.citationPercentile ?? null,
-    isTop1Percent: existing?.isTop1Percent ?? null,
-    isTop10Percent: existing?.isTop10Percent ?? null,
-    citationCountsByYear: existing?.citationCountsByYear ?? [],
-    citationsLastYear: existing?.citationsLastYear ?? null,
-    citationVelocity: existing?.citationVelocity ?? null,
-    citationAcceleration: existing?.citationAcceleration ?? null,
-    influentialCitationCount: existing?.influentialCitationCount ?? null,
-    isRetracted: existing?.isRetracted ?? null,
-    openAccessStatus: existing?.openAccessStatus ?? null,
-    isOpenAccess: existing?.isOpenAccess ?? null,
-    publicationType: existing?.publicationType ?? null,
+    provider,
+    providerWorkID: previous?.providerWorkID ?? null,
+    matchedBy: previous?.matchedBy ?? null,
+    matchConfidence: previous?.matchConfidence ?? null,
+    matchConfirmed:
+      status === "ambiguous-match" ? false : (previous?.matchConfirmed ?? true),
+    doi: previous?.doi ?? null,
+    title: previous?.title ?? null,
+    normalizedTitle: previous?.normalizedTitle ?? null,
+    year: previous?.year ?? null,
+    authors: previous?.authors ?? [],
+    sourceTitle: previous?.sourceTitle ?? null,
+    abstract: previous?.abstract ?? null,
+    citationCount: previous?.citationCount ?? null,
+    citationCountProvider: previous?.citationCountProvider ?? null,
+    referenceCount: previous?.referenceCount ?? null,
+    referenceCountProvider: previous?.referenceCountProvider ?? null,
+    resolvedReferenceCount: previous?.resolvedReferenceCount ?? 0,
+    references: previous?.references ?? [],
+    matchCandidates:
+      matchCandidates.length > 0
+        ? matchCandidates
+        : (previous?.matchCandidates ?? []),
+    fwci: previous?.fwci ?? null,
+    citationPercentile: previous?.citationPercentile ?? null,
+    isTop1Percent: previous?.isTop1Percent ?? null,
+    isTop10Percent: previous?.isTop10Percent ?? null,
+    citationCountsByYear: previous?.citationCountsByYear ?? [],
+    citationsLastYear: previous?.citationsLastYear ?? null,
+    citationVelocity: previous?.citationVelocity ?? null,
+    citationAcceleration: previous?.citationAcceleration ?? null,
+    influentialCitationCount: previous?.influentialCitationCount ?? null,
+    isRetracted: previous?.isRetracted ?? null,
+    openAccessStatus: previous?.openAccessStatus ?? null,
+    isOpenAccess: previous?.isOpenAccess ?? null,
+    publicationType: previous?.publicationType ?? null,
+    sourceMetrics: previous?.sourceMetrics ?? null,
     status,
-    fetchedAt: existing?.fetchedAt ?? null,
+    fetchedAt: previous?.fetchedAt ?? null,
     lastAttemptAt: now,
     errorMessage: message,
-    failureCount: (existing?.failureCount ?? 0) + 1,
+    failureCount: (previous?.failureCount ?? 0) + 1,
     nextRetryAt,
-  };
-
-  await saveCitationMetricRecord(next);
-  return next;
+  });
 }
 
 export function shouldRefreshCitationMetrics(
   libraryID: number,
   itemKey: string,
-  preference: CitationProviderPreference,
+  providerPreference: CitationProviderPreference,
   cacheDays: number,
 ): boolean {
   const record = getCitationMetricRecord(libraryID, itemKey);
-
-  if (!record) {
-    return true;
-  }
-
-  if (preference !== "auto" && record.provider !== preference) {
-    return true;
-  }
-
-  if (record.status !== "success") {
-    if (!record.nextRetryAt) {
-      return true;
-    }
-
-    return Date.parse(record.nextRetryAt) <= Date.now();
-  }
-
-  if (!record.fetchedAt) {
-    return true;
-  }
-
-  // Refresh successful rows created before enriched provider fields were
-  // introduced. OpenAlex always reports work type/retraction status and
-  // Semantic Scholar reports open-access state when the newer field set is
-  // requested, so both are reliable migration sentinels.
+  if (!record) return true;
+  if (record.nextRetryAt && Date.parse(record.nextRetryAt) > Date.now())
+    return false;
   if (
-    (record.provider === "openalex" &&
-      record.publicationType === null &&
-      record.isRetracted === null) ||
-    (record.provider === "semantic-scholar" &&
-      record.publicationType === null &&
-      record.isOpenAccess === null)
+    record.status === "ambiguous-match" &&
+    record.matchCandidates.length > 0
   ) {
-    return true;
+    return false;
   }
-
-  const maxAge = cacheDays * 24 * 60 * 60 * 1000;
-  return Date.now() - Date.parse(record.fetchedAt) >= maxAge;
+  if (providerPreference !== "auto" && record.provider !== providerPreference)
+    return true;
+  if (!record.fetchedAt) return true;
+  return dataAgeDays(record.fetchedAt)! >= cacheDays;
 }
 
-export async function deleteCitationMetricRecord(
+export async function confirmCitationMatch(
   libraryID: number,
   itemKey: string,
 ): Promise<void> {
-  await withKeyLock(libraryID, itemKey, async () => {
-    await requireDB().queryAsync(
-      "DELETE FROM citation_metrics WHERE library_id = ? AND item_key = ?",
-      [libraryID, itemKey],
-    );
-    mirror.delete(mirrorKey(libraryID, itemKey));
+  const record = getCitationMetricRecord(libraryID, itemKey);
+  if (!record) return;
+  await saveCitationMetricRecord({ ...record, matchConfirmed: true });
+}
+
+export function getManualRelations(
+  libraryID: number,
+  subjectItemKey?: string,
+): ManualCitationRelation[] {
+  return manualMirror.filter(
+    (relation) =>
+      relation.libraryID === libraryID &&
+      (!subjectItemKey || relation.subjectItemKey === subjectItemKey),
+  );
+}
+
+export async function addManualRelation(
+  libraryID: number,
+  subjectItemKey: string,
+  relatedItemKey: string,
+  direction: ManualRelationDirection,
+): Promise<void> {
+  if (subjectItemKey === relatedItemKey) {
+    throw new Error("A paper cannot cite itself through a manual relation.");
+  }
+  const createdAt = new Date().toISOString();
+  await requireDB().queryAsync(
+    `INSERT OR IGNORE INTO manual_relations
+     (library_id, subject_item_key, related_item_key, direction, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    [libraryID, subjectItemKey, relatedItemKey, direction, createdAt],
+  );
+  const rows = (await requireDB().queryAsync(
+    `SELECT * FROM manual_relations
+     WHERE library_id = ? AND subject_item_key = ? AND related_item_key = ? AND direction = ?`,
+    [libraryID, subjectItemKey, relatedItemKey, direction],
+  )) as any[];
+  const relation = rows[0] ? relationRow(rows[0]) : null;
+  if (relation && !manualMirror.some((entry) => entry.id === relation.id)) {
+    manualMirror.push(relation);
     mirrorRevision += 1;
+  }
+}
+
+export async function removeManualRelation(id: number): Promise<void> {
+  await requireDB().queryAsync("DELETE FROM manual_relations WHERE id = ?", [
+    id,
+  ]);
+  manualMirror = manualMirror.filter((relation) => relation.id !== id);
+  mirrorRevision += 1;
+}
+
+export function getIgnoredRelations(
+  libraryID: number,
+  subjectItemKey?: string,
+): IgnoredProviderRelation[] {
+  return ignoredMirror.filter(
+    (relation) =>
+      relation.libraryID === libraryID &&
+      (!subjectItemKey || relation.subjectItemKey === subjectItemKey),
+  );
+}
+
+export async function ignoreProviderRelation(
+  relation: Omit<IgnoredProviderRelation, "id" | "createdAt">,
+): Promise<void> {
+  const createdAt = new Date().toISOString();
+  await requireDB().queryAsync(
+    `INSERT OR IGNORE INTO ignored_provider_relations
+     (library_id, subject_item_key, direction, provider, provider_work_id, doi, normalized_title, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      relation.libraryID,
+      relation.subjectItemKey,
+      relation.direction,
+      relation.provider,
+      relation.providerWorkID,
+      relation.doi,
+      relation.normalizedTitle,
+      createdAt,
+    ],
+  );
+  const rows = (await requireDB().queryAsync(
+    `SELECT * FROM ignored_provider_relations
+     WHERE library_id = ? AND subject_item_key = ? AND direction = ? AND provider = ?
+       AND COALESCE(provider_work_id, '') = COALESCE(?, '')
+       AND COALESCE(doi, '') = COALESCE(?, '')
+       AND COALESCE(normalized_title, '') = COALESCE(?, '')`,
+    [
+      relation.libraryID,
+      relation.subjectItemKey,
+      relation.direction,
+      relation.provider,
+      relation.providerWorkID,
+      relation.doi,
+      relation.normalizedTitle,
+    ],
+  )) as any[];
+  const stored = rows[0] ? ignoredRow(rows[0]) : null;
+  if (stored && !ignoredMirror.some((entry) => entry.id === stored.id)) {
+    ignoredMirror.push(stored);
+    mirrorRevision += 1;
+  }
+}
+
+export async function removeIgnoredRelation(id: number): Promise<void> {
+  await requireDB().queryAsync(
+    "DELETE FROM ignored_provider_relations WHERE id = ?",
+    [id],
+  );
+  ignoredMirror = ignoredMirror.filter((relation) => relation.id !== id);
+  mirrorRevision += 1;
+}
+
+export async function clearCitationMetrics(): Promise<void> {
+  await requireDB().queryAsync("DELETE FROM citation_metrics");
+  mirror.clear();
+  mirrorRevision += 1;
+}
+
+export function getCitationCacheStatus(): {
+  metricRecords: number;
+  manualRelations: number;
+  ignoredRelations: number;
+  lastUpdated: string | null;
+} {
+  const dates = [...mirror.values()]
+    .map((record) => record.fetchedAt)
+    .filter((value): value is string => Boolean(value))
+    .sort();
+  return {
+    metricRecords: mirror.size,
+    manualRelations: manualMirror.length,
+    ignoredRelations: ignoredMirror.length,
+    lastUpdated: dates.at(-1) ?? null,
+  };
+}
+
+export async function confirmCitationMatchCandidate(
+  libraryID: number,
+  itemKey: string,
+  candidate: RelatedWorkMetadata,
+): Promise<void> {
+  const previous = getCitationMetricRecord(libraryID, itemKey);
+  if (!previous) {
+    throw new Error("Citation data must be fetched before confirming a match.");
+  }
+  await saveCitationMetricRecord({
+    ...previous,
+    provider:
+      candidate.provider === "manual" || candidate.provider === "zotero"
+        ? previous.provider
+        : candidate.provider,
+    providerWorkID: candidate.providerWorkID,
+    doi: candidate.doi ?? previous.doi,
+    title: candidate.title ?? previous.title,
+    normalizedTitle: candidate.title
+      ? candidate.title
+          .normalize("NFKD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .toLocaleLowerCase()
+          .replace(/[^\p{L}\p{N}]+/gu, " ")
+          .trim()
+          .replace(/\s+/g, " ")
+      : previous.normalizedTitle,
+    year: candidate.year ?? previous.year,
+    authors: candidate.authors.length ? candidate.authors : previous.authors,
+    sourceTitle: candidate.sourceTitle ?? previous.sourceTitle,
+    abstract: candidate.abstract ?? previous.abstract,
+    citationCount: candidate.citationCount ?? previous.citationCount,
+    referenceCount: candidate.referenceCount ?? previous.referenceCount,
+    isOpenAccess: candidate.isOpenAccess ?? previous.isOpenAccess,
+    openAccessStatus: candidate.openAccessStatus ?? previous.openAccessStatus,
+    isRetracted: candidate.isRetracted ?? previous.isRetracted,
+    matchedBy: previous.matchedBy ?? "title",
+    matchConfidence: Math.max(previous.matchConfidence ?? 0, 0.9),
+    matchConfirmed: true,
+    matchCandidates: [],
+    status: "success",
+    errorMessage: null,
+    nextRetryAt: null,
   });
 }

@@ -7,21 +7,13 @@ class Addon {
     config: typeof config;
     env: "development" | "production";
     initialized: boolean;
-
-    /** Zotero tab containing Citation Map. */
     graphTabID: string | null;
-
-    /** Optional detached Citation Map window. */
     graphWindow: Window | null;
-
-    locale?: {
-      current: any;
-    };
+    locale?: { current: any };
   };
 
   public hooks: typeof hooks;
-
-  public api: Record<string, unknown>;
+  public api: Record<string, any>;
 
   constructor() {
     this.data = {
@@ -32,7 +24,6 @@ class Addon {
       graphTabID: null,
       graphWindow: null,
     };
-
     this.hooks = hooks;
     this.api = {};
   }

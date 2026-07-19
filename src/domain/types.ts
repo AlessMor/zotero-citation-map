@@ -1,36 +1,37 @@
+import type { CitationMetricSummary } from "./citationTypes";
+
 export interface ZoteroPaper {
-  libraryID: number;
   itemID: number;
   itemKey: string;
+  libraryID: number;
   title: string;
   authors: string[];
   year: number | null;
   doi: string | null;
+  abstract: string | null;
+  sourceTitle: string | null;
   tags: string[];
   collectionIDs: number[];
-  dateModified: string;
-  citationCount: number | null;
-  referenceCount: number | null;
-  metricsUpdatedAt: string | null;
   metadataCompleteness: number;
+  metrics: CitationMetricSummary;
 }
 
 export interface LibraryCollectionFilter {
   collectionID: number;
+  parentCollectionID: number | null;
+  key: string;
   name: string;
   path: string;
+  depth: number;
+  orderIndex: number;
   includedCollectionIDs: number[];
 }
 
 export interface LibraryStatistics {
   totalPapers: number;
-  withYear: number;
   withoutYear: number;
-  withDOI: number;
   withoutDOI: number;
-  withCitationData: number;
   withoutCitationData: number;
-  withReferenceData: number;
   withoutReferenceData: number;
 }
 

@@ -21,10 +21,13 @@ import {
 import {
   getAutomaticUpdatesEnabled,
   getCacheDays,
+  getExactTitleFallbackEnabled,
   getProviderLabel,
   getProviderPreference,
+  getUpdateNewItemsEnabled,
 } from "./citationPreferences";
 import { refreshCitationColumns } from "./itemTreeColumnService";
+import { refreshCitationItemPanes } from "./itemPaneService";
 import { refreshOpenCitationMapViews } from "./windowService";
 
 interface UpdateOptions {
@@ -39,255 +42,131 @@ let startupTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingTimer: ReturnType<typeof setTimeout> | null = null;
 let shuttingDown = false;
 const pendingItemIDs = new Set<number>();
-interface UpdateProgressCard {
-  hostWindow: Window;
+
+interface ProgressCard {
   root: HTMLElement;
   label: HTMLElement;
-  progressBar: HTMLElement;
-  cleanupTimer: ReturnType<typeof setTimeout> | null;
+  bar: HTMLElement;
+  timer: ReturnType<typeof setTimeout> | null;
 }
+const progressCards = new Set<ProgressCard>();
 
-const activeProgressCards = new Set<UpdateProgressCard>();
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function runSerialized<T>(task: () => Promise<T>): Promise<T> {
+function runSerialized<T>(task: () => Promise<T>): Promise<T> {
   const previous = operationTail.catch(() => undefined);
-
   let release = (): void => undefined;
   const ticket = new Promise<void>((resolve) => {
     release = resolve;
   });
-
   operationTail = previous.then(() => ticket);
-  await previous;
-
-  try {
-    return await task();
-  } finally {
-    release();
-  }
+  return previous.then(task).finally(release);
 }
 
-function getRegularItems(items: Zotero.Item[]): Zotero.Item[] {
+function regularItems(items: Zotero.Item[]): Zotero.Item[] {
   return items.filter(
     (item) => Boolean(item) && item.isRegularItem?.() && !item.deleted,
   );
 }
 
-async function getWholeLibraryItems(): Promise<Zotero.Item[]> {
-  const items = await Zotero.Items.getAll(Zotero.Libraries.userLibraryID);
-  return getRegularItems(items as Zotero.Item[]);
+async function wholeLibraryItems(): Promise<Zotero.Item[]> {
+  return regularItems(
+    (await Zotero.Items.getAll(
+      Zotero.Libraries.userLibraryID,
+    )) as Zotero.Item[],
+  );
 }
 
-function removeProgressCard(card: UpdateProgressCard): void {
-  if (card.cleanupTimer !== null) {
-    clearTimeout(card.cleanupTimer);
-    card.cleanupTimer = null;
-  }
-
-  try {
-    card.root.remove();
-  } catch {
-    // The host window may already be unloading.
-  }
-  activeProgressCards.delete(card);
-}
-
-function createHtmlElement<K extends keyof HTMLElementTagNameMap>(
+function createElement<K extends keyof HTMLElementTagNameMap>(
   document: Document,
-  tagName: K,
+  tag: K,
 ): HTMLElementTagNameMap[K] {
   return document.createElementNS(
     "http://www.w3.org/1999/xhtml",
-    tagName,
+    tag,
   ) as HTMLElementTagNameMap[K];
 }
 
-function createProgressWindow(
+function createProgress(
   total: number,
   provider: CitationProviderPreference,
-): UpdateProgressCard | null {
-  const hostWindow = Zotero.getMainWindow() as Window | null;
-  if (!hostWindow || hostWindow.closed) {
-    return null;
-  }
-
+): ProgressCard | null {
+  const win = Zotero.getMainWindow() as Window | null;
+  if (!win || win.closed) return null;
   try {
-    const document = hostWindow.document;
+    const document = win.document;
     const mount =
       document.getElementById("zotero-pane") ??
       document.getElementById("main-window") ??
       document.documentElement;
-    const root = createHtmlElement(document, "div");
-    root.dataset.citationMapProgress = "true";
+    const root = createElement(document, "div");
+    root.className = "citation-map-progress";
     root.setAttribute("role", "status");
     root.setAttribute("aria-live", "polite");
-    Object.assign(root.style, {
-      position: "absolute",
-      right: "18px",
-      bottom: "18px",
-      zIndex: "2147483647",
-      width: "min(380px, calc(100vw - 36px))",
-      boxSizing: "border-box",
-      padding: "12px 14px",
-      border: "1px solid var(--fill-quinary, rgba(127, 127, 127, 0.35))",
-      borderRadius: "9px",
-      background: "var(--material-background, Canvas)",
-      color: "var(--fill-primary, CanvasText)",
-      boxShadow: "0 8px 28px rgba(0, 0, 0, 0.28)",
-      font: "menu",
-      pointerEvents: "none",
-      display: "block",
-      visibility: "visible",
-      opacity: "1",
-    });
-
-    const heading = createHtmlElement(document, "div");
+    const heading = createElement(document, "strong");
     heading.textContent = config.addonName;
-    Object.assign(heading.style, {
-      marginBottom: "5px",
-      fontWeight: "600",
-      fontSize: "13px",
-    });
-
-    const label = createHtmlElement(document, "div");
-    label.textContent = `Updating citation data with ${getProviderLabel(provider)} (0/${total})`;
-    Object.assign(label.style, {
-      overflow: "hidden",
-      textOverflow: "ellipsis",
-      whiteSpace: "nowrap",
-      fontSize: "12px",
-      opacity: "0.9",
-    });
-
-    const track = createHtmlElement(document, "div");
-    Object.assign(track.style, {
-      height: "4px",
-      marginTop: "9px",
-      overflow: "hidden",
-      borderRadius: "999px",
-      background: "var(--fill-quinary, rgba(127, 127, 127, 0.25))",
-    });
-
-    const progressBar = createHtmlElement(document, "div");
-    Object.assign(progressBar.style, {
-      width: "0%",
-      height: "100%",
-      borderRadius: "inherit",
-      background: "var(--accent-blue, #4a90e2)",
-      transition: "width 120ms ease-out",
-    });
-
-    track.appendChild(progressBar);
+    const label = createElement(document, "div");
+    label.textContent = `Updating with ${getProviderLabel(provider)} (0/${total})`;
+    const track = createElement(document, "div");
+    track.className = "citation-map-progress-track";
+    const bar = createElement(document, "div");
+    bar.className = "citation-map-progress-bar";
+    track.appendChild(bar);
     root.append(heading, label, track);
     mount.appendChild(root);
-    hostWindow.requestAnimationFrame(() => {
-      if (root.isConnected) {
-        root.style.setProperty("display", "block", "important");
-        root.style.setProperty("visibility", "visible", "important");
-        root.style.setProperty("opacity", "1", "important");
-      }
-    });
-
-    const card: UpdateProgressCard = {
-      hostWindow,
-      root,
-      label,
-      progressBar,
-      cleanupTimer: null,
-    };
-    activeProgressCards.add(card);
-
-    hostWindow.addEventListener("unload", () => removeProgressCard(card), {
-      once: true,
-    });
+    const card = { root, label, bar, timer: null };
+    progressCards.add(card);
     return card;
-  } catch (error) {
-    Zotero.debug(
-      `Citation Map: could not create in-window progress card: ${error}`,
-    );
+  } catch {
     return null;
   }
 }
 
 function updateProgress(
-  progressCard: UpdateProgressCard | null,
+  card: ProgressCard | null,
   current: number,
   total: number,
   title: string,
 ): void {
-  if (!progressCard || progressCard.hostWindow.closed) {
-    return;
-  }
-
-  progressCard.label.textContent = `Updating ${current}/${total}: ${title}`;
-  progressCard.progressBar.style.width = `${Math.round((current / Math.max(total, 1)) * 100)}%`;
+  if (!card) return;
+  card.label.textContent = `Updating ${current}/${total}: ${title}`;
+  card.bar.style.width = `${Math.round((current / Math.max(1, total)) * 100)}%`;
 }
 
 function finishProgress(
-  progressCard: UpdateProgressCard | null,
+  card: ProgressCard | null,
   result: CitationUpdateBatchResult,
 ): void {
-  if (!progressCard || progressCard.hostWindow.closed) {
-    return;
-  }
-
-  progressCard.label.textContent = [
-    `${result.updated} updated`,
-    `${result.cached} already current`,
-    `${result.failed} failed`,
-    `${result.skipped} skipped`,
-  ].join(" · ");
-  progressCard.progressBar.style.width = "100%";
-
-  if (progressCard.cleanupTimer !== null) {
-    clearTimeout(progressCard.cleanupTimer);
-  }
-  progressCard.cleanupTimer = setTimeout(
-    () => removeProgressCard(progressCard),
-    3000,
-  );
+  if (!card) return;
+  card.label.textContent = `${result.updated} updated · ${result.cached} current · ${result.failed} failed · ${result.skipped} skipped`;
+  card.bar.style.width = "100%";
+  card.timer = setTimeout(() => {
+    card.root.remove();
+    progressCards.delete(card);
+  }, 3500);
 }
 
-function closeActiveProgressWindows(): void {
-  for (const card of [...activeProgressCards]) {
-    removeProgressCard(card);
-  }
-}
-
-function addDays(date: Date, days: number): string {
-  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
-}
-
-function getNextRetryAt(
+function nextRetryAt(
   failure: ProviderLookupFailure,
   previousFailureCount: number,
 ): string | null {
-  const now = new Date();
-
+  const now = Date.now();
+  const day = 86400000;
   switch (failure.status) {
     case "no-identifier":
-      return addDays(now, 30);
-
+      return new Date(now + 30 * day).toISOString();
+    case "ambiguous-match":
+      return null;
     case "not-found": {
       const delays = [7, 30, 90, 180];
-      return addDays(
-        now,
-        delays[Math.min(previousFailureCount, delays.length - 1)],
-      );
+      return new Date(
+        now + delays[Math.min(previousFailureCount, delays.length - 1)] * day,
+      ).toISOString();
     }
-
     case "rate-limited":
-      return new Date(now.getTime() + 60 * 60 * 1000).toISOString();
-
+      return new Date(now + 60 * 60 * 1000).toISOString();
     case "network-error":
-      return new Date(now.getTime() + 6 * 60 * 60 * 1000).toISOString();
-
+      return new Date(now + 6 * 60 * 60 * 1000).toISOString();
     case "provider-error":
-      return addDays(now, 1);
+      return new Date(now + day).toISOString();
   }
 }
 
@@ -296,13 +175,10 @@ async function updateOneItem(
   preference: CitationProviderPreference,
   force: boolean,
 ): Promise<"updated" | "cached" | "failed" | "skipped"> {
-  if (shuttingDown || isCitationRequestCancellationRequested()) {
+  if (shuttingDown || isCitationRequestCancellationRequested())
     return "skipped";
-  }
-
   const libraryID = Number(item.libraryID);
   const itemKey = String(item.key);
-
   if (
     !force &&
     !shouldRefreshCitationMetrics(
@@ -314,49 +190,69 @@ async function updateOneItem(
   ) {
     return "cached";
   }
-
-  const identifiers = extractWorkIdentifiers(item);
-  const result = await lookupCitationMetrics(preference, identifiers);
-
-  if (shuttingDown || isCitationRequestCancellationRequested()) {
-    return "skipped";
-  }
-
+  const previous = getCitationMetricRecord(libraryID, itemKey);
+  const extracted = extractWorkIdentifiers(item);
+  // A user-confirmed fallback match may supply a DOI that is intentionally
+  // kept in Citation Map's private cache rather than written into the Zotero
+  // item. Reuse it for future refreshes.
+  const identifiers = {
+    ...extracted,
+    doi: extracted.doi ?? (previous?.matchConfirmed ? previous.doi : null),
+  };
+  const result = await lookupCitationMetrics(
+    preference,
+    identifiers,
+    getExactTitleFallbackEnabled(),
+    force,
+  );
   if (result.status !== "success") {
-    const existing = getCitationMetricRecord(libraryID, itemKey);
-
     await saveCitationMetricFailure(
       libraryID,
       itemKey,
       result.provider,
       result.status,
       result.message,
-      getNextRetryAt(result, existing?.failureCount ?? 0),
-    );
-
-    Zotero.debug(
-      `Citation Map: ${itemKey} failed via ${result.provider}: ${result.status} (${result.message})`,
+      nextRetryAt(result, previous?.failureCount ?? 0),
+      result.candidates ?? [],
     );
     return "failed";
   }
-
   const now = new Date().toISOString();
+  // DOI and unique non-contradictory exact-title matches are accepted
+  // automatically. Exact fallback identifiers remain visible as provisional
+  // until the user confirms them in the item pane.
+  const sameConfirmedIdentity = Boolean(
+    previous?.matchConfirmed &&
+    ((previous.providerWorkID &&
+      previous.providerWorkID === result.providerWorkID) ||
+      (previous.doi && previous.doi === result.doi)),
+  );
+  const matchConfirmed =
+    result.matchedBy === "doi" ||
+    result.matchedBy === "title" ||
+    sameConfirmedIdentity;
   const record: CitationMetricRecord = {
     libraryID,
     itemKey,
     provider: result.provider,
     providerWorkID: result.providerWorkID,
     matchedBy: result.matchedBy,
+    matchConfidence: result.matchConfidence,
+    matchConfirmed,
     doi: result.doi ?? identifiers.doi,
     title: result.title ?? identifiers.title,
+    normalizedTitle: identifiers.normalizedTitle,
     year: result.year ?? identifiers.year,
-    authors: result.authors.length > 0 ? result.authors : identifiers.authors,
+    authors: result.authors.length ? result.authors : identifiers.authors,
+    sourceTitle: result.sourceTitle ?? identifiers.sourceTitle,
+    abstract: result.abstract,
     citationCount: result.citationCount,
     citationCountProvider: result.citationCountProvider,
     referenceCount: result.referenceCount,
     referenceCountProvider: result.referenceCountProvider,
     resolvedReferenceCount: result.resolvedReferenceCount,
     references: result.references,
+    matchCandidates: [],
     fwci: result.fwci ?? null,
     citationPercentile: result.citationPercentile ?? null,
     isTop1Percent: result.isTop1Percent ?? null,
@@ -370,6 +266,7 @@ async function updateOneItem(
     openAccessStatus: result.openAccessStatus ?? null,
     isOpenAccess: result.isOpenAccess ?? null,
     publicationType: result.publicationType ?? null,
+    sourceMetrics: result.sourceMetrics ?? null,
     status: "success",
     fetchedAt: now,
     lastAttemptAt: now,
@@ -377,227 +274,125 @@ async function updateOneItem(
     failureCount: 0,
     nextRetryAt: null,
   };
-
   await saveCitationMetricRecord(record);
   return "updated";
 }
 
-export function updateCitationMetricsForItems(
+async function runUpdate(
   items: Zotero.Item[],
   options: UpdateOptions = {},
 ): Promise<CitationUpdateBatchResult> {
-  return runSerialized(async () => {
-    const regularItems = getRegularItems(items);
-    const preference = options.provider ?? getProviderPreference();
-    const result: CitationUpdateBatchResult = {
-      total: regularItems.length,
-      updated: 0,
-      cached: 0,
-      failed: 0,
-      skipped: items.length - regularItems.length,
-    };
-
-    if (regularItems.length === 0) {
-      return result;
-    }
-
-    const progressWindow = options.silent
-      ? null
-      : createProgressWindow(regularItems.length, preference);
-
-    for (let index = 0; index < regularItems.length; index += 1) {
-      if (shuttingDown || isCitationRequestCancellationRequested()) {
-        result.skipped += regularItems.length - index;
-        break;
-      }
-
-      const item = regularItems[index];
-      const title = String(
-        item.getDisplayTitle?.() ?? item.getField("title") ?? item.key,
-      );
-
-      updateProgress(progressWindow, index + 1, regularItems.length, title);
-
-      try {
-        const status = await updateOneItem(
-          item,
-          preference,
-          Boolean(options.force),
-        );
-        result[status] += 1;
-      } catch (error) {
-        result.failed += 1;
-        Zotero.logError(
-          error instanceof Error ? error : new Error(String(error)),
-        );
-      }
-
-      if ((index + 1) % 20 === 0 && !shuttingDown) {
-        refreshCitationColumns();
-        await delay(0);
-      }
-    }
-
-    if (!shuttingDown) {
-      refreshCitationColumns();
-      await refreshOpenCitationMapViews().catch((error: unknown) => {
-        Zotero.debug(`Citation Map: could not refresh an open graph: ${error}`);
-      });
-      finishProgress(progressWindow, result);
-    } else if (progressWindow) {
-      // unregisterAutomaticCitationUpdates() closes all tracked windows.
-    }
-    return result;
-  });
+  const selected = regularItems(items);
+  const provider = options.provider ?? getProviderPreference();
+  const result: CitationUpdateBatchResult = {
+    total: selected.length,
+    updated: 0,
+    cached: 0,
+    failed: 0,
+    skipped: 0,
+  };
+  const progress = options.silent
+    ? null
+    : createProgress(selected.length, provider);
+  for (let index = 0; index < selected.length; index += 1) {
+    const item = selected[index];
+    updateProgress(
+      progress,
+      index + 1,
+      selected.length,
+      String(item.getField("title") ?? "Untitled"),
+    );
+    const outcome = await updateOneItem(item, provider, Boolean(options.force));
+    result[outcome] += 1;
+    if (shuttingDown) break;
+  }
+  refreshCitationColumns();
+  refreshCitationItemPanes();
+  refreshOpenCitationMapViews();
+  finishProgress(progress, result);
+  return result;
 }
 
-export async function updateCitationMetricsForLibrary(
+export function updateCitationDataForItems(
+  items: Zotero.Item[],
   options: UpdateOptions = {},
 ): Promise<CitationUpdateBatchResult> {
-  const items = await getWholeLibraryItems();
-  return updateCitationMetricsForItems(items, options);
+  return runSerialized(() => runUpdate(items, options));
 }
 
-async function flushPendingItemUpdates(): Promise<void> {
-  pendingTimer = null;
-
-  if (
-    shuttingDown ||
-    !getAutomaticUpdatesEnabled() ||
-    pendingItemIDs.size === 0
-  ) {
-    pendingItemIDs.clear();
-    return;
-  }
-
-  const ids = [...pendingItemIDs];
-  pendingItemIDs.clear();
-
-  const items = ids
-    .map((id) => Zotero.Items.get(id))
-    .filter((item): item is Zotero.Item => Boolean(item));
-
-  await updateCitationMetricsForItems(items, {
-    force: true,
-    silent: true,
-  });
+export async function updateWholeLibraryCitationData(
+  options: UpdateOptions = {},
+): Promise<CitationUpdateBatchResult> {
+  return updateCitationDataForItems(await wholeLibraryItems(), options);
 }
 
-function queueChangedItems(ids: Array<number | string>): void {
-  for (const id of ids) {
-    const itemID = Number(id);
-    if (Number.isFinite(itemID)) {
-      pendingItemIDs.add(itemID);
-    }
-  }
-
-  if (pendingTimer) {
-    clearTimeout(pendingTimer);
-  }
-
+function schedulePendingItems(): void {
+  if (pendingTimer) clearTimeout(pendingTimer);
   pendingTimer = setTimeout(() => {
-    void flushPendingItemUpdates();
-  }, 2500);
-}
-
-export function scheduleAutomaticLibraryUpdate(delayMilliseconds = 500): void {
-  if (startupTimer) {
-    clearTimeout(startupTimer);
-  }
-
-  startupTimer = setTimeout(() => {
-    startupTimer = null;
-
-    if (shuttingDown || !getAutomaticUpdatesEnabled()) {
-      return;
-    }
-
-    void updateCitationMetricsForLibrary({
-      force: false,
-      silent: true,
-    }).catch((error: unknown) => {
-      Zotero.logError(
-        error instanceof Error ? error : new Error(String(error)),
-      );
-    });
-  }, delayMilliseconds);
+    pendingTimer = null;
+    const ids = [...pendingItemIDs];
+    pendingItemIDs.clear();
+    const items = ids
+      .map((id) => Zotero.Items.get(id))
+      .filter((item): item is Zotero.Item => Boolean(item));
+    if (items.length) void updateCitationDataForItems(items, { silent: true });
+  }, 1200);
 }
 
 export function registerAutomaticCitationUpdates(): void {
-  if (notifierID) {
-    return;
-  }
-
   shuttingDown = false;
   resetCitationRequestCancellation();
-
-  notifierID = Zotero.Notifier.registerObserver(
-    {
-      notify: (event: string, type: string, ids: Array<number | string>) => {
-        if (
-          type === "item" &&
-          (event === "add" || event === "modify") &&
-          getAutomaticUpdatesEnabled()
-        ) {
-          queueChangedItems(ids);
-        }
-      },
+  if (notifierID) return;
+  const observer = {
+    notify: async (
+      event: string,
+      type: string,
+      ids: Array<number | string>,
+    ): Promise<void> => {
+      if (
+        type !== "item" ||
+        !getAutomaticUpdatesEnabled() ||
+        (event === "add" && !getUpdateNewItemsEnabled())
+      ) {
+        return;
+      }
+      if (event !== "add" && event !== "modify") return;
+      for (const id of ids) pendingItemIDs.add(Number(id));
+      schedulePendingItems();
     },
+  };
+  notifierID = Zotero.Notifier.registerObserver(
+    observer,
     ["item"],
-    "citation-map-metrics",
+    "citation-map-updates",
   );
-
-  scheduleAutomaticLibraryUpdate(8000);
-}
-
-export async function waitForCitationUpdates(
-  timeoutMilliseconds = 4000,
-): Promise<void> {
-  let timeout: ReturnType<typeof setTimeout> | null = null;
-  let completed = false;
-
-  try {
-    await Promise.race([
-      operationTail
-        .catch(() => undefined)
-        .then(() => {
-          completed = true;
-        }),
-      new Promise<void>((resolve) => {
-        timeout = setTimeout(resolve, timeoutMilliseconds);
-      }),
-    ]);
-  } finally {
-    if (timeout !== null) {
-      clearTimeout(timeout);
-    }
-  }
-
-  if (!completed) {
-    Zotero.debug(
-      `Citation Map: citation-update shutdown drain exceeded ${timeoutMilliseconds} ms`,
-    );
+  if (getAutomaticUpdatesEnabled()) {
+    startupTimer = setTimeout(() => {
+      startupTimer = null;
+      void updateWholeLibraryCitationData({ silent: true });
+    }, 4500);
   }
 }
 
 export function unregisterAutomaticCitationUpdates(): void {
   shuttingDown = true;
   cancelPendingCitationRequests();
-  closeActiveProgressWindows();
   if (notifierID) {
     Zotero.Notifier.unregisterObserver(notifierID);
     notifierID = null;
   }
-
-  if (startupTimer) {
-    clearTimeout(startupTimer);
-    startupTimer = null;
-  }
-
-  if (pendingTimer) {
-    clearTimeout(pendingTimer);
-    pendingTimer = null;
-  }
-
+  if (startupTimer) clearTimeout(startupTimer);
+  if (pendingTimer) clearTimeout(pendingTimer);
+  startupTimer = null;
+  pendingTimer = null;
   pendingItemIDs.clear();
+  for (const card of progressCards) {
+    if (card.timer) clearTimeout(card.timer);
+    card.root.remove();
+  }
+  progressCards.clear();
+}
+
+export async function waitForCitationUpdates(): Promise<void> {
+  await operationTail.catch(() => undefined);
 }

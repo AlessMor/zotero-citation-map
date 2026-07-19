@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "packageManager": "npm@11.18.0",
-  "version": "0.1.2",
+  "version": "0.2.8",
   "description": "Citation and reference metrics with an interactive citation-network graph for Zotero 9.",
   "keywords": [
     "zotero",
@@ -38,19 +38,11 @@
     "start": "zotero-plugin serve",
     "typecheck": "tsc --noEmit",
     "lint:check": "prettier --check . && eslint .",
-    "lint:fix": "prettier --write . && eslint . --fix",
+    "lint:fix": "prettier --write . && eslint . --fix && prettier --write .",
     "check": "npm run lint:check && npm run typecheck",
     "build": "npm run check && zotero-plugin build",
     "release": "npm run check && zotero-plugin release",
-    "test": "zotero-plugin test",
-    "audit:signatures": "npm audit signatures",
-    "audit:runtime": "npm audit --omit=dev --audit-level=high",
-    "update-deps": "npm update --save"
-  },
-  "allowScripts": {
-    "@swc/core@1.15.43": true,
-    "es5-ext@0.10.64": true,
-    "esbuild@0.28.1": true
+    "test": "zotero-plugin test"
   },
   "devDependencies": {
     "@types/chai": "^5.2.3",

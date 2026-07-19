@@ -1,18 +1,12 @@
-declare const _globalThis: {
-  [key: string]: any;
-  Zotero: _ZoteroTypes.Zotero;
-  ztoolkit: ZToolkit;
-  addon: typeof addon;
-};
-
-declare type ZToolkit = ReturnType<
-  typeof import("../src/utils/ztoolkit").createZToolkit
->;
-
-declare const ztoolkit: ZToolkit;
-
-declare const rootURI: string;
-
+declare const Zotero: any;
+declare namespace Zotero {
+  type Item = any;
+}
+declare namespace _ZoteroTypes {
+  type DBConnection = any;
+  type MainWindow = any;
+}
 declare const addon: import("../src/addon").default;
-
-declare const __env__: "production" | "development";
+declare const rootURI: string;
+declare const _globalThis: any;
+declare const __env__: "development" | "production";

@@ -5,7 +5,7 @@ import type {
   CitationGraphNode,
   GraphAxisMetric,
   GraphLayoutOptions,
-  GraphNodeLabelMode,
+  GraphNodeColorMetric,
   GraphNodeSizeMetric,
   GraphScaleType,
 } from "../domain/graphTypes";
@@ -15,7 +15,10 @@ import type {
   ZoteroPaper,
 } from "../domain/types";
 import { buildCitationGraph } from "./citationGraphService";
-import { CitationGraphRenderer } from "./citationGraphRenderer";
+import {
+  CitationGraphRenderer,
+  type GhostPreview,
+} from "./citationGraphRenderer";
 import {
   getExternalCitedBy,
   getExternalReferences,
@@ -24,587 +27,672 @@ import {
   type ExternalWork,
 } from "./externalDiscoveryService";
 import {
-  formatGraphMetricValue,
-  GRAPH_AXIS_OPTIONS,
-  graphMetricDescription,
-  graphMetricLabel,
-  graphMetricSupportsLog,
-} from "./graphMetricDefinitions";
+  exportGraphCSV,
+  exportGraphJSON,
+  exportGraphPNG,
+} from "./exportService";
+import {
+  axisMetricDefinitions,
+  formatMetricValue,
+  getMetricDefinition,
+  nodeColorMetricDefinitions,
+  nodeSizeMetricDefinitions,
+} from "./metricRegistry";
+import {
+  getDetailPanelCollapsed,
+  getDetailPanelWidth,
+  getGraphAppearance,
+  resetGraphAppearance,
+  setDetailPanelCollapsed,
+  setDetailPanelWidth,
+  setGraphAppearance,
+} from "./citationPreferences";
 
-const HTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
-const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
-const styledDocuments = new WeakSet<Document>();
+const HTML_NS = "http://www.w3.org/1999/xhtml";
 const cleanupByMount = new WeakMap<Element, () => void>();
-const NODE_SIZE_PREF = `${config.prefsPrefix}.nodeSizeMetric`;
-const NODE_LABEL_PREF = `${config.prefsPrefix}.nodeLabelMode`;
 
-export type GraphViewMode = "tab" | "window";
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.max(minimum, Math.min(maximum, value));
+}
 
 export interface GraphViewOptions {
-  mode: GraphViewMode;
+  mode: "tab" | "window";
   onSelectPaper: (itemID: number) => void | Promise<void>;
+  initialItemID?: number | null;
 }
 
-function createHTMLElement<K extends keyof HTMLElementTagNameMap>(
+interface CollectionVisuals {
+  colorsByNodeKey: Map<string, string[]>;
+  labelsByNodeKey: Map<string, string[]>;
+}
+
+function element<K extends keyof HTMLElementTagNameMap>(
   document: Document,
-  tagName: K,
-): HTMLElementTagNameMap[K] {
-  return document.createElementNS(
-    HTML_NAMESPACE,
-    tagName,
-  ) as HTMLElementTagNameMap[K];
-}
-
-function createGraphControlIcon(
-  document: Document,
-  kind: "zoom-in" | "zoom-out" | "fit",
-): SVGSVGElement {
-  const svg = document.createElementNS(SVG_NAMESPACE, "svg");
-  svg.setAttribute("viewBox", "0 0 24 24");
-  svg.setAttribute("aria-hidden", "true");
-  svg.setAttribute("focusable", "false");
-
-  const appendShape = (
-    tagName: "circle" | "path",
-    attributes: Record<string, string>,
-  ): void => {
-    const shape = document.createElementNS(SVG_NAMESPACE, tagName);
-    for (const [name, value] of Object.entries(attributes)) {
-      shape.setAttribute(name, value);
-    }
-    shape.setAttribute("fill", "none");
-    shape.setAttribute("stroke", "currentColor");
-    svg.appendChild(shape);
-  };
-
-  if (kind === "fit") {
-    appendShape("circle", { cx: "12", cy: "12", r: "6.5" });
-    appendShape("circle", { cx: "12", cy: "12", r: "2" });
-    appendShape("path", { d: "M12 2v3M12 19v3M2 12h3M19 12h3" });
-    return svg;
-  }
-
-  appendShape("circle", { cx: "10.5", cy: "10.5", r: "5.5" });
-  appendShape("path", { d: "M14.5 14.5 20 20" });
-  appendShape("path", { d: "M7.5 10.5h6" });
-  if (kind === "zoom-in") {
-    appendShape("path", { d: "M10.5 7.5v6" });
-  }
-  return svg;
-}
-
-function clearElement(element: Element): void {
-  while (element.firstChild) {
-    element.firstChild.remove();
-  }
-}
-
-function ensureGraphStyle(document: Document): void {
-  if (styledDocuments.has(document)) {
-    return;
-  }
-
-  const stylesheetID = `${config.addonRef}-graph-stylesheet`;
-  if (!document.getElementById(stylesheetID)) {
-    const link = createHTMLElement(document, "link");
-    link.id = stylesheetID;
-    link.rel = "stylesheet";
-    link.href = `chrome://${config.addonRef}/content/graph.css`;
-    (document.head ?? document.documentElement).appendChild(link);
-  }
-
-  styledDocuments.add(document);
-}
-
-function createTextElement<K extends keyof HTMLElementTagNameMap>(
-  document: Document,
-  tagName: K,
-  text: string,
+  tag: K,
   className?: string,
 ): HTMLElementTagNameMap[K] {
-  const element = createHTMLElement(document, tagName);
-  element.textContent = text;
-
-  if (className) {
-    element.className = className;
-  }
-
-  return element;
+  const node = document.createElementNS(
+    HTML_NS,
+    tag,
+  ) as HTMLElementTagNameMap[K];
+  if (className) node.className = className;
+  return node;
 }
 
-function createMetricInfoIndicator(
+function text<K extends keyof HTMLElementTagNameMap>(
   document: Document,
-  metric: GraphAxisMetric,
-): HTMLSpanElement | null {
-  const description = graphMetricDescription(metric);
-  if (!description) return null;
-
-  const indicator = createHTMLElement(document, "span");
-  indicator.className = "cm-metric-info";
-  indicator.textContent = "ⓘ";
-  indicator.title = description;
-  indicator.setAttribute("aria-label", description);
-  return indicator;
+  tag: K,
+  content: string,
+  className?: string,
+): HTMLElementTagNameMap[K] {
+  const node = element(document, tag, className);
+  node.textContent = content;
+  return node;
 }
 
-function formatCount(value: number): string {
-  return new Intl.NumberFormat().format(value);
+function clear(node: Element): void {
+  node.replaceChildren();
 }
 
-function createStatisticsSummary(snapshot: LibrarySnapshot): string {
-  const statistics = snapshot.statistics;
-
-  return [
-    `${formatCount(statistics.totalPapers)} papers`,
-    `${formatCount(statistics.withoutYear)} without year`,
-    `${formatCount(statistics.withoutDOI)} without DOI`,
-    `${formatCount(statistics.withoutCitationData)} missing citation data`,
-    `${formatCount(statistics.withoutReferenceData)} missing reference data`,
-  ].join(" · ");
+function ensureStyles(document: Document): void {
+  const id = `${config.addonRef}-graph-stylesheet`;
+  const href = `chrome://${config.addonRef}/content/graph.css`;
+  let link = document.getElementById(id) as HTMLLinkElement | null;
+  if (!link) {
+    link = element(document, "link");
+    link.id = id;
+    link.rel = "stylesheet";
+    (document.head ?? document.documentElement).appendChild(link);
+  }
+  if (link.getAttribute("href") !== href) link.setAttribute("href", href);
 }
 
-function normalizeSearchText(value: string): string {
+function formatCount(value: number | null): string {
+  return value === null ? "—" : new Intl.NumberFormat().format(value);
+}
+
+function normalizeSearch(value: string): string {
   return value
-    .normalize("NFD")
+    .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLocaleLowerCase();
 }
 
-function getFallbackSearchText(paper: ZoteroPaper): string {
-  return normalizeSearchText(
+function paperSearchText(paper: ZoteroPaper): string {
+  return normalizeSearch(
     [
       paper.title,
       paper.authors.join(" "),
       paper.doi ?? "",
+      paper.sourceTitle ?? "",
       paper.tags.join(" "),
-      String(paper.year ?? ""),
+      paper.year ?? "",
     ].join(" "),
   );
 }
 
-function fallbackSearch(query: string, papers: ZoteroPaper[]): number[] {
-  const tokens = normalizeSearchText(query).split(/\s+/).filter(Boolean);
-
-  if (tokens.length === 0) {
-    return papers.map((paper) => paper.itemID);
+function collectionChildren(
+  collections: LibraryCollectionFilter[],
+): Map<number | null, LibraryCollectionFilter[]> {
+  const children = new Map<number | null, LibraryCollectionFilter[]>();
+  for (const collection of collections) {
+    const siblings = children.get(collection.parentCollectionID) ?? [];
+    siblings.push(collection);
+    children.set(collection.parentCollectionID, siblings);
   }
-
-  return papers
-    .filter((paper) => {
-      const text = getFallbackSearchText(paper);
-      return tokens.every((token) => text.includes(token));
-    })
-    .map((paper) => paper.itemID);
-}
-
-async function runZoteroSearch(
-  query: string,
-  snapshot: LibrarySnapshot,
-): Promise<number[]> {
-  const allowedItemIDs = new Set(snapshot.papers.map((paper) => paper.itemID));
-
-  try {
-    const search = new Zotero.Search();
-    Reflect.set(search, "libraryID", snapshot.libraryID);
-    search.addCondition("quicksearch-fields", "contains", query);
-
-    const itemIDs = await search.search();
-
-    return itemIDs
-      .map((itemID: string | number) => Number(itemID))
-      .filter((itemID: number) => allowedItemIDs.has(itemID));
-  } catch (error) {
-    Zotero.debug(
-      `Citation Map: Zotero search failed, using local fallback: ${error}`,
+  for (const siblings of children.values()) {
+    siblings.sort(
+      (left, right) =>
+        left.orderIndex - right.orderIndex ||
+        left.name.localeCompare(right.name),
     );
-    return fallbackSearch(query, snapshot.papers);
   }
+  return children;
 }
 
-function createOption(
-  document: Document,
-  value: string,
-  label: string,
-): HTMLOptionElement {
-  const option = createHTMLElement(document, "option");
-  option.value = value;
-  option.textContent = label;
-  return option;
-}
+const TOP_LEVEL_HUES = [215, 28, 145, 350, 180, 282, 325, 48, 15, 250, 165, 95];
 
-function createLabelledSelect(
-  document: Document,
-  labelText: string,
-  className: string,
-): { wrapper: HTMLLabelElement; select: HTMLSelectElement } {
-  const wrapper = createHTMLElement(document, "label");
-  wrapper.className = `cm-control ${className}`;
-  wrapper.appendChild(
-    createTextElement(document, "span", labelText, "cm-control-label"),
-  );
-  const select = createHTMLElement(document, "select");
-  select.className = "cm-select";
-  wrapper.appendChild(select);
-  return { wrapper, select };
-}
-
-function createCheckbox(
-  document: Document,
-  labelText: string,
-  checked: boolean,
-): { wrapper: HTMLLabelElement; input: HTMLInputElement } {
-  const wrapper = createHTMLElement(document, "label");
-  wrapper.className = "cm-checkbox-control";
-  const input = createHTMLElement(document, "input");
-  input.type = "checkbox";
-  input.checked = checked;
-  wrapper.appendChild(input);
-  wrapper.appendChild(createTextElement(document, "span", labelText));
-  return { wrapper, input };
-}
-
-const COLLECTION_PALETTE = [
-  "#4c78a8",
-  "#f58518",
-  "#54a24b",
-  "#e45756",
-  "#72b7b2",
-  "#b279a2",
-  "#ff9da6",
-  "#9d755d",
-  "#bab0ac",
-  "#7f6db0",
-  "#2f9c95",
-  "#d68c45",
-];
-
-const UNFILED_COLOR = "#8b8f98";
-
-interface AxisPicker {
-  root: HTMLDivElement;
-  button: HTMLButtonElement;
-  popover: HTMLDivElement;
-  getMetric: () => GraphAxisMetric;
-  getScale: () => GraphScaleType;
-  setOpen: (open: boolean) => void;
-  isOpen: () => boolean;
-  onChange: (listener: () => void) => void;
-}
-
-interface CollectionVisuals {
-  colorByNodeKey: Map<string, string>;
-  labelByNodeKey: Map<string, string>;
-}
-
-function readNodeSizeMetric(): GraphNodeSizeMetric {
-  const value = Zotero.Prefs.get(NODE_SIZE_PREF, true);
-  return value === "uniform" || value === "references" ? value : "citations";
-}
-
-function readNodeLabelMode(): GraphNodeLabelMode {
-  const value = Zotero.Prefs.get(NODE_LABEL_PREF, true);
-  return value === "author-year" ? "author-year" : "title";
-}
-
-function scaleLabel(scale: GraphScaleType): string {
-  return scale === "log" ? "Log" : "Linear";
-}
-
-function createAxisPicker(
-  document: Document,
-  orientation: "x" | "y",
-): AxisPicker {
-  const root = createHTMLElement(document, "div");
-  root.className = `cm-axis-picker cm-${orientation}-axis-picker`;
-
-  const button = createHTMLElement(document, "button");
-  button.type = "button";
-  button.className = "cm-axis-label-button";
-  button.setAttribute("aria-haspopup", "dialog");
-  button.setAttribute("aria-expanded", "false");
-  root.appendChild(button);
-
-  const metricText = createHTMLElement(document, "span");
-  metricText.className = "cm-axis-label-metric";
-  const metricInfo = createHTMLElement(document, "span");
-  metricInfo.className = "cm-metric-info cm-axis-label-info";
-  metricInfo.textContent = "ⓘ";
-  metricInfo.hidden = true;
-  const scaleText = createHTMLElement(document, "span");
-  scaleText.className = "cm-axis-label-scale";
-  const chevron = createHTMLElement(document, "span");
-  chevron.className = "cm-axis-label-chevron";
-  chevron.textContent = "⌄";
-  chevron.setAttribute("aria-hidden", "true");
-  button.append(metricText, metricInfo, scaleText, chevron);
-
-  const popover = createHTMLElement(document, "div");
-  popover.className = "cm-axis-popover";
-  popover.hidden = true;
-  popover.setAttribute("role", "dialog");
-  popover.setAttribute(
-    "aria-label",
-    `${orientation.toUpperCase()} axis options`,
-  );
-  root.appendChild(popover);
-
-  popover.appendChild(
-    createTextElement(
-      document,
-      "div",
-      `${orientation.toUpperCase()} axis`,
-      "cm-axis-popover-title",
-    ),
-  );
-  popover.appendChild(
-    createTextElement(
-      document,
-      "div",
-      "Position",
-      "cm-axis-popover-section-title",
-    ),
-  );
-
-  let metric: GraphAxisMetric = "none";
-  let scale: GraphScaleType = "linear";
-  let changeListener: (() => void) | null = null;
-  const metricButtons = new Map<GraphAxisMetric, HTMLButtonElement>();
-  const scaleButtons = new Map<GraphScaleType, HTMLButtonElement>();
-
-  const metricList = createHTMLElement(document, "div");
-  metricList.className = "cm-axis-option-list";
-  let currentGroup = "";
-  for (const definition of GRAPH_AXIS_OPTIONS) {
-    if (definition.group !== currentGroup) {
-      currentGroup = definition.group;
-      metricList.appendChild(
-        createTextElement(
-          document,
-          "div",
-          currentGroup,
-          "cm-axis-option-group",
-        ),
-      );
-    }
-
-    const option = createHTMLElement(document, "button");
-    option.type = "button";
-    option.className = "cm-axis-option";
-    option.appendChild(
-      createTextElement(
-        document,
-        "span",
-        definition.label,
-        "cm-axis-option-label",
-      ),
-    );
-    const info = createMetricInfoIndicator(document, definition.metric);
-    if (info) option.appendChild(info);
-    option.dataset.value = definition.metric;
-    option.addEventListener("click", () => {
-      metric = definition.metric;
-      if (!graphMetricSupportsLog(metric)) {
-        scale = "linear";
-      }
-      updateDisplay();
-      changeListener?.();
-    });
-    metricButtons.set(definition.metric, option);
-    metricList.appendChild(option);
-  }
-  popover.appendChild(metricList);
-
-  const scaleSection = createHTMLElement(document, "div");
-  scaleSection.className = "cm-axis-scale-section";
-  scaleSection.appendChild(
-    createTextElement(
-      document,
-      "div",
-      "Scale",
-      "cm-axis-popover-section-title",
-    ),
-  );
-  const scaleList = createHTMLElement(document, "div");
-  scaleList.className = "cm-axis-scale-options";
-  for (const [value, label] of [
-    ["linear", "Linear"],
-    ["log", "Logarithmic"],
-  ] as Array<[GraphScaleType, string]>) {
-    const option = createHTMLElement(document, "button");
-    option.type = "button";
-    option.className = "cm-axis-option cm-axis-scale-option";
-    option.textContent = label;
-    option.dataset.value = value;
-    option.addEventListener("click", () => {
-      if (value === "log" && !graphMetricSupportsLog(metric)) {
-        return;
-      }
-      scale = value;
-      updateDisplay();
-      changeListener?.();
-    });
-    scaleButtons.set(value, option);
-    scaleList.appendChild(option);
-  }
-  scaleSection.appendChild(scaleList);
-  popover.appendChild(scaleSection);
-
-  const updateDisplay = (): void => {
-    metricText.textContent = graphMetricLabel(metric);
-    const metricDescription = graphMetricDescription(metric);
-    metricInfo.hidden = metricDescription === null;
-    metricInfo.title = metricDescription ?? "";
-    metricInfo.setAttribute("aria-label", metricDescription ?? "");
-    scaleText.textContent = metric === "none" ? "" : scaleLabel(scale);
-    scaleText.hidden = metric === "none";
-    for (const [value, option] of metricButtons) {
-      option.dataset.selected = String(value === metric);
-      option.setAttribute("aria-pressed", String(value === metric));
-    }
-    const supportsLog = graphMetricSupportsLog(metric);
-    for (const [value, option] of scaleButtons) {
-      option.dataset.selected = String(value === scale);
-      option.setAttribute("aria-pressed", String(value === scale));
-      option.disabled = metric === "none" || (value === "log" && !supportsLog);
-    }
-    scaleSection.dataset.disabled = String(metric === "none");
-  };
-
-  const setOpen = (open: boolean): void => {
-    popover.hidden = !open;
-    button.setAttribute("aria-expanded", String(open));
-    root.dataset.open = String(open);
-  };
-
-  button.addEventListener("click", () => setOpen(popover.hidden));
-  updateDisplay();
-
-  return {
-    root,
-    button,
-    popover,
-    getMetric: () => metric,
-    getScale: () => scale,
-    setOpen,
-    isOpen: () => !popover.hidden,
-    onChange: (listener) => {
-      changeListener = listener;
-    },
-  };
-}
-
-function collectionDepth(path: string): number {
-  return path.split(/\s*(?:\/|›|>)\s*/).filter(Boolean).length;
+function hslForCollection(
+  collection: LibraryCollectionFilter,
+  rootIndex: number,
+): string {
+  const hue = TOP_LEVEL_HUES[rootIndex % TOP_LEVEL_HUES.length];
+  const depthOffset = Math.max(0, collection.depth - 1);
+  const lightness = 45 + ((depthOffset * 13 + collection.orderIndex * 5) % 30);
+  const saturation = 58 - Math.min(18, depthOffset * 4);
+  return `hsl(${hue} ${saturation}% ${lightness}%)`;
 }
 
 function buildCollectionVisuals(
   snapshot: LibrarySnapshot,
   nodes: CitationGraphNode[],
 ): CollectionVisuals {
-  const collectionsByID = new Map(
+  const byID = new Map(
     snapshot.collections.map((collection) => [
       collection.collectionID,
       collection,
     ]),
   );
-  const topLevelCollections = snapshot.collections
-    .filter((collection) => collectionDepth(collection.path) === 1)
-    .sort((left, right) => left.path.localeCompare(right.path));
-  const colorByCollectionID = new Map<number, string>();
-  topLevelCollections.forEach((collection, index) => {
-    colorByCollectionID.set(
+  const topLevel = snapshot.collections.filter(
+    (collection) => collection.parentCollectionID === null,
+  );
+  const rootByID = new Map<number, number>();
+  const findRoot = (collection: LibraryCollectionFilter): number => {
+    let current = collection;
+    const seen = new Set<number>();
+    while (current.parentCollectionID && !seen.has(current.collectionID)) {
+      seen.add(current.collectionID);
+      const parent = byID.get(current.parentCollectionID);
+      if (!parent) break;
+      current = parent;
+    }
+    return current.collectionID;
+  };
+  for (const collection of snapshot.collections) {
+    rootByID.set(collection.collectionID, findRoot(collection));
+  }
+  const rootIndex = new Map(
+    topLevel.map((collection, index) => [collection.collectionID, index]),
+  );
+  const colorByID = new Map<number, string>();
+  for (const collection of snapshot.collections) {
+    colorByID.set(
       collection.collectionID,
-      COLLECTION_PALETTE[index % COLLECTION_PALETTE.length],
-    );
-  });
-
-  const colorByNodeKey = new Map<string, string>();
-  const labelByNodeKey = new Map<string, string>();
-
-  for (const node of nodes) {
-    const directCollections = node.collectionIDs
-      .map((collectionID) => collectionsByID.get(collectionID))
-      .filter((collection): collection is LibraryCollectionFilter =>
-        Boolean(collection),
-      )
-      .sort((left, right) => left.path.localeCompare(right.path));
-
-    const topLevelMatches = topLevelCollections.filter((topLevel) =>
-      node.collectionIDs.some((collectionID) =>
-        topLevel.includedCollectionIDs.includes(collectionID),
+      hslForCollection(
+        collection,
+        rootIndex.get(rootByID.get(collection.collectionID) ?? -1) ?? 0,
       ),
     );
-    const primary = topLevelMatches[0] ?? directCollections[0] ?? null;
-    const color = primary
-      ? (colorByCollectionID.get(primary.collectionID) ??
-        COLLECTION_PALETTE[
-          hashCollection(primary.path) % COLLECTION_PALETTE.length
-        ])
-      : UNFILED_COLOR;
-    const label =
-      directCollections.length > 0
-        ? directCollections.map((collection) => collection.path).join(" · ")
-        : "Unfiled";
-
-    colorByNodeKey.set(node.key, color);
-    labelByNodeKey.set(node.key, label);
   }
 
-  return {
-    colorByNodeKey,
-    labelByNodeKey,
-  };
-}
-
-function hashCollection(value: string): number {
-  let hash = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = (Math.imul(hash, 31) + value.charCodeAt(index)) >>> 0;
-  }
-  return hash;
-}
-
-function collectionMatches(
-  node: CitationGraphNode,
-  collection: LibraryCollectionFilter | null,
-): boolean {
-  if (!collection) {
-    return true;
+  const descendantsByID = new Map<number, Set<number>>();
+  for (const collection of snapshot.collections) {
+    descendantsByID.set(
+      collection.collectionID,
+      new Set(collection.includedCollectionIDs),
+    );
   }
 
-  const includedIDs = new Set(collection.includedCollectionIDs);
-  return node.collectionIDs.some((collectionID) =>
-    includedIDs.has(collectionID),
-  );
+  const colorsByNodeKey = new Map<string, string[]>();
+  const labelsByNodeKey = new Map<string, string[]>();
+  for (const node of nodes) {
+    const memberships = node.collectionIDs
+      .map((id) => byID.get(id))
+      .filter((entry): entry is LibraryCollectionFilter => Boolean(entry));
+    // Retain deepest memberships only. If one selected collection is an
+    // ancestor of another, only the descendant contributes a slice.
+    const deepest = memberships.filter(
+      (candidate) =>
+        !memberships.some(
+          (other) =>
+            other.collectionID !== candidate.collectionID &&
+            descendantsByID
+              .get(candidate.collectionID)
+              ?.has(other.collectionID),
+        ),
+    );
+    deepest.sort(
+      (left, right) =>
+        right.depth - left.depth ||
+        left.orderIndex - right.orderIndex ||
+        left.name.localeCompare(right.name),
+    );
+    const shown = deepest.length > 4 ? deepest.slice(0, 3) : deepest;
+    const colors = shown.map(
+      (collection) =>
+        colorByID.get(collection.collectionID) ?? "hsl(220 7% 58%)",
+    );
+    const labels = shown.map((collection) => collection.path);
+    if (deepest.length > 4) {
+      colors.push("hsl(220 7% 58%)");
+      labels.push(`+${deepest.length - 3} more collections`);
+    }
+    colorsByNodeKey.set(node.key, colors);
+    labelsByNodeKey.set(
+      node.key,
+      deepest.length
+        ? deepest.map((collection) => collection.path)
+        : ["Unfiled"],
+    );
+  }
+  return { colorsByNodeKey, labelsByNodeKey };
 }
 
-function createDetailRow(
+function createGroupedMetricSelect(
+  document: Document,
+  definitions: ReturnType<typeof axisMetricDefinitions>,
+  selected: string,
+  includeFree = false,
+): HTMLSelectElement {
+  const select = element(document, "select", "cm-select");
+  if (includeFree) {
+    const option = element(document, "option");
+    option.value = "free";
+    option.textContent = "Free";
+    select.appendChild(option);
+  }
+  const groups = new Map<string, HTMLOptGroupElement>();
+  for (const definition of definitions) {
+    let group = groups.get(definition.group);
+    if (!group) {
+      group = element(document, "optgroup");
+      group.label = definition.group;
+      groups.set(definition.group, group);
+      select.appendChild(group);
+    }
+    const option = element(document, "option");
+    option.value = definition.id;
+    option.textContent = definition.label;
+    option.title = definition.description;
+    group.appendChild(option);
+  }
+  select.value = selected;
+  return select;
+}
+
+function createScaleSelect(
+  document: Document,
+  selected: GraphScaleType,
+): HTMLSelectElement {
+  const select = element(document, "select", "cm-select");
+  for (const [value, label] of [
+    ["linear", "Linear"],
+    ["log", "Logarithmic"],
+  ] as const) {
+    const option = element(document, "option");
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  }
+  select.value = selected;
+  return select;
+}
+
+function controlRow(
   document: Document,
   label: string,
-  value: string,
-  metric?: GraphAxisMetric,
-): HTMLDivElement {
-  const row = createHTMLElement(document, "div");
-  row.className = "cm-detail-row";
-  const labelElement = createHTMLElement(document, "span");
-  labelElement.className = "cm-detail-label";
-  labelElement.appendChild(document.createTextNode(label));
-  if (metric) {
-    const info = createMetricInfoIndicator(document, metric);
-    if (info) labelElement.append(" ", info);
-  }
-  row.appendChild(labelElement);
-  row.appendChild(
-    createTextElement(document, "span", value, "cm-detail-value"),
-  );
+  control: HTMLElement,
+): HTMLLabelElement {
+  const row = element(document, "label", "cm-appearance-row");
+  row.append(text(document, "span", label), control);
   return row;
 }
 
-function formatNullableMetric(
-  metric: GraphAxisMetric,
-  value: number | null,
-): string {
-  return value === null ? "—" : formatGraphMetricValue(metric, value);
+function createAxesAppearance(
+  document: Document,
+  initial: GraphLayoutOptions,
+  onChange: (layout: GraphLayoutOptions) => void,
+): {
+  root: HTMLDivElement;
+  button: HTMLButtonElement;
+  panel: HTMLDivElement;
+  setLayout: (layout: GraphLayoutOptions) => void;
+} {
+  const root = element(document, "div", "cm-appearance-control");
+  const button = element(document, "button", "cm-overlay-button");
+  button.type = "button";
+  button.classList.add("cm-appearance-button");
+  button.textContent = "⚙";
+  button.title = "Axes and appearance";
+  button.setAttribute("aria-label", "Axes and appearance");
+  button.setAttribute("aria-expanded", "false");
+  const panel = element(document, "div", "cm-appearance-panel");
+  panel.hidden = true;
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-label", "Axes and appearance");
+  panel.append(text(document, "h2", "Axes & appearance"));
+
+  const xMetric = createGroupedMetricSelect(
+    document,
+    axisMetricDefinitions(),
+    initial.xMetric,
+    true,
+  );
+  const xScale = createScaleSelect(document, initial.xScale);
+  const yMetric = createGroupedMetricSelect(
+    document,
+    axisMetricDefinitions(),
+    initial.yMetric,
+    true,
+  );
+  const yScale = createScaleSelect(document, initial.yScale);
+  const sizeMetric = createGroupedMetricSelect(
+    document,
+    nodeSizeMetricDefinitions(),
+    initial.nodeSizeMetric,
+  );
+  const uniform = element(document, "option");
+  uniform.value = "uniform";
+  uniform.textContent = "Uniform";
+  sizeMetric.prepend(uniform);
+  sizeMetric.value = initial.nodeSizeMetric;
+
+  const colorMetric = element(document, "select", "cm-select");
+  const categorical = element(document, "optgroup");
+  categorical.label = "Categories";
+  for (const [value, label] of [
+    ["collection", "Collection"],
+    ["publication-type", "Publication type"],
+    ["provider", "Provider"],
+    ["open-access", "Open Access"],
+    ["retraction", "Retraction"],
+  ]) {
+    const option = element(document, "option");
+    option.value = value;
+    option.textContent = label;
+    categorical.appendChild(option);
+  }
+  colorMetric.appendChild(categorical);
+  const numericGroups = new Map<string, HTMLOptGroupElement>();
+  for (const definition of nodeColorMetricDefinitions()) {
+    let group = numericGroups.get(definition.group);
+    if (!group) {
+      group = element(document, "optgroup");
+      group.label = definition.group;
+      numericGroups.set(definition.group, group);
+      colorMetric.appendChild(group);
+    }
+    const option = element(document, "option");
+    option.value = definition.id;
+    option.textContent = definition.label;
+    group.appendChild(option);
+  }
+  colorMetric.value = initial.nodeColorMetric;
+
+  const labels = element(document, "select", "cm-select");
+  for (const [value, label] of [
+    ["title", "Title"],
+    ["author-year", "Author and year"],
+    ["none", "No labels"],
+  ]) {
+    const option = element(document, "option");
+    option.value = value;
+    option.textContent = label;
+    labels.appendChild(option);
+  }
+  labels.value = initial.nodeLabelMode;
+
+  const section = (titleText: string): HTMLFieldSetElement => {
+    const fieldset = element(document, "fieldset", "cm-appearance-section");
+    fieldset.append(text(document, "legend", titleText));
+    panel.appendChild(fieldset);
+    return fieldset;
+  };
+  const xSection = section("X axis");
+  xSection.append(
+    controlRow(document, "Metric", xMetric),
+    controlRow(document, "Scale", xScale),
+  );
+  const ySection = section("Y axis");
+  ySection.append(
+    controlRow(document, "Metric", yMetric),
+    controlRow(document, "Scale", yScale),
+  );
+  const nodeSection = section("Nodes");
+  nodeSection.append(
+    controlRow(document, "Size", sizeMetric),
+    controlRow(document, "Colour", colorMetric),
+    controlRow(document, "Labels", labels),
+  );
+  const appearanceActions = element(document, "div", "cm-appearance-actions");
+  const reset = element(document, "button", "cm-secondary-button");
+  reset.type = "button";
+  reset.textContent = "Reset defaults";
+  const apply = element(document, "button", "cm-primary-button");
+  apply.type = "button";
+  apply.textContent = "Apply";
+  appearanceActions.append(reset, apply);
+  panel.appendChild(appearanceActions);
+  root.append(button, panel);
+
+  const read = (): GraphLayoutOptions => ({
+    xMetric: xMetric.value as GraphAxisMetric,
+    xScale: xScale.value as GraphScaleType,
+    yMetric: yMetric.value as GraphAxisMetric,
+    yScale: yScale.value as GraphScaleType,
+    nodeSizeMetric: sizeMetric.value as GraphNodeSizeMetric,
+    nodeColorMetric: colorMetric.value as GraphNodeColorMetric,
+    nodeLabelMode: labels.value as GraphLayoutOptions["nodeLabelMode"],
+  });
+  const updateScaleAvailability = (): void => {
+    const update = (
+      metricSelect: HTMLSelectElement,
+      scaleSelect: HTMLSelectElement,
+    ): void => {
+      const metric = metricSelect.value as GraphAxisMetric;
+      const log = scaleSelect.querySelector(
+        'option[value="log"]',
+      ) as HTMLOptionElement | null;
+      const enabled =
+        metric !== "free" && getMetricDefinition(metric).graph.logarithmic;
+      if (log) log.disabled = !enabled;
+      if (!enabled && scaleSelect.value === "log") scaleSelect.value = "linear";
+      scaleSelect.disabled = metric === "free";
+    };
+    update(xMetric, xScale);
+    update(yMetric, yScale);
+  };
+  let lastCommitted = JSON.stringify(initial);
+  let applyTimer: number | null = null;
+  const commit = (layout: GraphLayoutOptions, force = false): boolean => {
+    const signature = JSON.stringify(layout);
+    if (!force && signature === lastCommitted) return true;
+
+    try {
+      onChange(layout);
+    } catch (error) {
+      Zotero.logError(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      return false;
+    }
+
+    lastCommitted = signature;
+    try {
+      setGraphAppearance(layout);
+    } catch (error) {
+      // Rendering has already succeeded. Preference persistence should not
+      // prevent the current view from updating.
+      Zotero.logError(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+    return true;
+  };
+  const applyControls = (force = false): void => {
+    updateScaleAvailability();
+    commit(read(), force);
+  };
+  const scheduleApply = (): void => {
+    updateScaleAvailability();
+    const view = document.defaultView;
+    if (applyTimer !== null) view?.clearTimeout(applyTimer);
+    applyTimer =
+      view?.setTimeout(() => {
+        applyTimer = null;
+        applyControls();
+      }, 0) ?? null;
+  };
+  const appearanceControls = [
+    xMetric,
+    xScale,
+    yMetric,
+    yScale,
+    sizeMetric,
+    colorMetric,
+    labels,
+  ];
+  for (const control of appearanceControls) {
+    for (const eventName of ["input", "change", "command"]) {
+      control.addEventListener(eventName, scheduleApply);
+    }
+  }
+  // Native select popups in Zotero can retarget command events outside the
+  // select element. Capture them at the panel as a second, deferred route.
+  for (const eventName of ["input", "change", "command"]) {
+    panel.addEventListener(eventName, scheduleApply, true);
+  }
+  const applyNow = (): void => {
+    if (applyTimer !== null) {
+      document.defaultView?.clearTimeout(applyTimer);
+      applyTimer = null;
+    }
+    applyControls(true);
+  };
+  apply.addEventListener("click", applyNow);
+  apply.addEventListener("command", applyNow);
+  root.addEventListener("pointerdown", (event) => event.stopPropagation());
+  panel.addEventListener("click", (event) => event.stopPropagation());
+  button.addEventListener("click", () => {
+    panel.hidden = !panel.hidden;
+    button.setAttribute("aria-expanded", String(!panel.hidden));
+    if (!panel.hidden) xMetric.focus();
+  });
+
+  const setControls = (layout: GraphLayoutOptions): void => {
+    xMetric.value = layout.xMetric;
+    xScale.value = layout.xScale;
+    yMetric.value = layout.yMetric;
+    yScale.value = layout.yScale;
+    sizeMetric.value = layout.nodeSizeMetric;
+    colorMetric.value = layout.nodeColorMetric;
+    labels.value = layout.nodeLabelMode;
+    updateScaleAvailability();
+  };
+  const setLayout = (layout: GraphLayoutOptions): void => {
+    setControls(layout);
+    commit(layout, true);
+  };
+  reset.addEventListener("click", () => {
+    const defaults = resetGraphAppearance();
+    setControls(defaults);
+    lastCommitted = "";
+    commit(defaults, true);
+  });
+  updateScaleAvailability();
+  return { root, button, panel, setLayout };
+}
+
+function localPaperByKey(snapshot: LibrarySnapshot): Map<string, ZoteroPaper> {
+  return new Map(snapshot.papers.map((paper) => [paper.itemKey, paper]));
+}
+
+function createCollectionChooser(
+  document: Document,
+  snapshot: LibrarySnapshot,
+  initialSelection: number[] = [],
+): {
+  root: HTMLDivElement;
+  selected: Set<number>;
+} {
+  const root = element(document, "div", "cm-collection-chooser");
+  const search = element(document, "input", "cm-collection-search");
+  search.type = "search";
+  search.placeholder = "Search collections";
+  search.setAttribute("aria-label", "Search collections");
+  const tree = element(document, "div", "cm-collection-tree");
+  tree.setAttribute("role", "tree");
+  const selected = new Set(initialSelection);
+  const expanded = new Set(
+    snapshot.collections
+      .filter((collection) => collection.depth <= 1)
+      .map((collection) => collection.collectionID),
+  );
+  const children = collectionChildren(snapshot.collections);
+
+  const render = (): void => {
+    clear(tree);
+    const query = normalizeSearch(search.value.trim());
+    const matches = new Set<number>();
+    if (query) {
+      for (const collection of snapshot.collections) {
+        if (normalizeSearch(collection.path).includes(query)) {
+          let current: LibraryCollectionFilter | undefined = collection;
+          while (current) {
+            matches.add(current.collectionID);
+            current = current.parentCollectionID
+              ? snapshot.collections.find(
+                  (candidate) =>
+                    candidate.collectionID === current?.parentCollectionID,
+                )
+              : undefined;
+          }
+        }
+      }
+    }
+    const appendBranch = (
+      parentID: number | null,
+      depth: number,
+      container: HTMLElement,
+    ): void => {
+      for (const collection of children.get(parentID) ?? []) {
+        if (query && !matches.has(collection.collectionID)) continue;
+        const row = element(document, "div", "cm-collection-row");
+        row.setAttribute("role", "treeitem");
+        row.style.paddingInlineStart = `${depth * 17}px`;
+        const branchChildren = children.get(collection.collectionID) ?? [];
+        const expander = element(document, "button", "cm-collection-expander");
+        expander.type = "button";
+        expander.textContent = branchChildren.length
+          ? expanded.has(collection.collectionID)
+            ? "▾"
+            : "▸"
+          : "";
+        expander.disabled = branchChildren.length === 0;
+        expander.setAttribute(
+          "aria-label",
+          expanded.has(collection.collectionID)
+            ? `Collapse ${collection.name}`
+            : `Expand ${collection.name}`,
+        );
+        const chooser = element(document, "button", "cm-collection-choice");
+        chooser.type = "button";
+        chooser.setAttribute(
+          "aria-pressed",
+          String(selected.has(collection.collectionID)),
+        );
+        const check = text(
+          document,
+          "span",
+          selected.has(collection.collectionID) ? "✓" : "",
+          "cm-collection-check",
+        );
+        chooser.append(check, text(document, "span", collection.name));
+        expander.addEventListener("click", () => {
+          if (expanded.has(collection.collectionID)) {
+            expanded.delete(collection.collectionID);
+          } else {
+            expanded.add(collection.collectionID);
+          }
+          render();
+        });
+        chooser.addEventListener("click", () => {
+          if (selected.has(collection.collectionID)) {
+            selected.delete(collection.collectionID);
+          } else {
+            selected.add(collection.collectionID);
+          }
+          render();
+        });
+        row.append(expander, chooser);
+        container.appendChild(row);
+        if (
+          branchChildren.length &&
+          (expanded.has(collection.collectionID) || query)
+        ) {
+          appendBranch(collection.collectionID, depth + 1, container);
+        }
+      }
+    };
+    appendBranch(null, 0, tree);
+    if (!tree.childElementCount) {
+      tree.append(text(document, "p", "No matching collections."));
+    }
+  };
+  search.addEventListener("input", render);
+  root.append(search, tree);
+  render();
+  return { root, selected };
 }
 
 export function destroyCitationMapView(mount: Element): void {
@@ -619,530 +707,701 @@ export function renderCitationMapView(
   options: GraphViewOptions,
 ): HTMLElement {
   destroyCitationMapView(mount);
-  ensureGraphStyle(document);
-  clearElement(mount);
+  ensureStyles(document);
+  clear(mount);
 
-  const graph = buildCitationGraph(snapshot);
-  const collectionVisuals = buildCollectionVisuals(snapshot, graph.nodes);
-  const root = createHTMLElement(document, "div");
-  root.className = "citation-map-root";
+  const model = buildCitationGraph(snapshot);
+  const paperByKey = localPaperByKey(snapshot);
+  const visuals = buildCollectionVisuals(snapshot, model.nodes);
+  let visibleKeys = new Set(model.nodes.map((node) => node.key));
+  let selectedNode: CitationGraphNode | null = null;
+  let renderer: CitationGraphRenderer | null = null;
+  const initialGraphLayout = getGraphAppearance();
+  const selectPaper = async (itemID: number): Promise<void> => {
+    try {
+      await options.onSelectPaper(itemID);
+    } catch (error) {
+      Zotero.logError(
+        error instanceof Error
+          ? error
+          : new Error(
+              `Citation Map could not select item ${itemID}: ${String(error)}`,
+            ),
+      );
+    }
+  };
+  let searchTimer: number | null = null;
+  let cleaned = false;
+
+  const root = element(document, "div", "citation-map-root");
   root.dataset.mode = options.mode;
-
-  const header = createHTMLElement(document, "header");
-  header.className = "cm-page-header";
-
-  const headingGroup = createHTMLElement(document, "div");
-  headingGroup.className = "cm-heading-group";
-
-  const titleRow = createHTMLElement(document, "div");
-  titleRow.className = "cm-title-row";
-  const titleIcon = createHTMLElement(document, "img");
-  titleIcon.className = "cm-title-icon";
-  titleIcon.src = `chrome://${config.addonRef}/content/icons/network.svg`;
-  titleIcon.alt = "";
-  titleRow.appendChild(titleIcon);
-  titleRow.appendChild(createTextElement(document, "h1", "Citation Map"));
-  headingGroup.appendChild(titleRow);
-  headingGroup.appendChild(
-    createTextElement(
-      document,
-      "p",
-      `${snapshot.libraryName} · loaded ${new Date(
-        snapshot.generatedAt,
-      ).toLocaleString()}`,
-      "cm-subtitle",
-    ),
+  const header = element(document, "header", "cm-header");
+  const identity = element(document, "div", "cm-header-identity");
+  identity.append(
+    text(document, "h1", "Citation Map"),
+    text(document, "p", snapshot.libraryName, "cm-subtitle"),
   );
-  headingGroup.appendChild(
-    createTextElement(
-      document,
-      "p",
-      createStatisticsSummary(snapshot),
-      "cm-statistics-summary",
-    ),
-  );
-  header.appendChild(headingGroup);
-
-  const headerActions = createHTMLElement(document, "div");
-  headerActions.className = "cm-header-actions";
-
-  const searchFilterRow = createHTMLElement(document, "div");
-  searchFilterRow.className = "cm-search-filter-row";
-
-  const searchInput = createHTMLElement(document, "input");
-  searchInput.type = "search";
-  searchInput.className = "cm-search-input";
-  searchInput.placeholder = "Search all fields and tags";
-  searchInput.setAttribute("aria-label", "Search all fields and tags");
-  searchInput.autocomplete = "off";
-  searchFilterRow.appendChild(searchInput);
-
-  const collectionControl = createLabelledSelect(
+  const summary = text(
     document,
-    "Collection",
-    "cm-filter-control cm-compact-control",
+    "p",
+    `${formatCount(snapshot.statistics.totalPapers)} papers · ${formatCount(model.statistics.edges)} citation links · ${formatCount(model.statistics.resolvedNodes)} papers with cached data`,
+    "cm-library-summary",
   );
-  collectionControl.select.appendChild(
-    createOption(document, "all", "Whole library"),
-  );
-  for (const collection of snapshot.collections) {
-    collectionControl.select.appendChild(
-      createOption(document, String(collection.collectionID), collection.path),
-    );
+  identity.appendChild(summary);
+  header.appendChild(identity);
+
+  const controls = element(document, "div", "cm-header-controls");
+  const search = element(document, "input", "cm-search");
+  search.type = "search";
+  search.placeholder = "Search all fields and tags";
+  search.setAttribute("aria-label", "Search all fields and tags");
+  const collection = element(document, "select", "cm-select");
+  collection.setAttribute("aria-label", "Collection filter");
+  const allCollections = element(document, "option");
+  allCollections.value = "all";
+  allCollections.textContent = "Whole library";
+  collection.appendChild(allCollections);
+  for (const entry of snapshot.collections) {
+    const option = element(document, "option");
+    option.value = String(entry.collectionID);
+    option.textContent = `${"  ".repeat(Math.max(0, entry.depth))}${entry.name}`;
+    collection.appendChild(option);
   }
-  searchFilterRow.appendChild(collectionControl.wrapper);
-
-  const tagControl = createLabelledSelect(
-    document,
-    "Tag",
-    "cm-filter-control cm-compact-control",
-  );
-  tagControl.select.appendChild(createOption(document, "all", "All tags"));
-  for (const tag of snapshot.tags) {
-    tagControl.select.appendChild(createOption(document, tag, tag));
+  const tag = element(document, "select", "cm-select");
+  tag.setAttribute("aria-label", "Tag filter");
+  const allTags = element(document, "option");
+  allTags.value = "all";
+  allTags.textContent = "All tags";
+  tag.appendChild(allTags);
+  for (const value of snapshot.tags) {
+    const option = element(document, "option");
+    option.value = value;
+    option.textContent = value;
+    tag.appendChild(option);
   }
-  searchFilterRow.appendChild(tagControl.wrapper);
-  headerActions.appendChild(searchFilterRow);
+  const filterButton = element(document, "button", "cm-toolbar-button");
+  filterButton.type = "button";
+  filterButton.textContent = "Filters";
+  filterButton.setAttribute("aria-expanded", "false");
+  controls.append(search, collection, tag, filterButton);
+  header.appendChild(controls);
 
-  const searchStatus = createTextElement(
-    document,
-    "span",
-    "",
-    "cm-search-status",
-  );
-  searchStatus.setAttribute("aria-live", "polite");
-  headerActions.appendChild(searchStatus);
-
-  header.appendChild(headerActions);
+  const actions = element(document, "div", "cm-header-actions");
+  const missingButton = element(document, "button", "cm-primary-button");
+  missingButton.type = "button";
+  missingButton.textContent = "Missing papers";
+  const exportWrapper = element(document, "div", "cm-menu-wrapper");
+  const exportButton = element(document, "button", "cm-toolbar-button");
+  exportButton.type = "button";
+  exportButton.textContent = "Export ▾";
+  exportButton.setAttribute("aria-expanded", "false");
+  const exportMenu = element(document, "div", "cm-export-menu");
+  exportMenu.hidden = true;
+  for (const [format, label] of [
+    ["png", "PNG image"],
+    ["json", "JSON graph data"],
+    ["csv", "CSV citation links"],
+  ]) {
+    const button = element(document, "button");
+    button.type = "button";
+    button.dataset.format = format;
+    button.textContent = label;
+    exportMenu.appendChild(button);
+  }
+  exportWrapper.append(exportButton, exportMenu);
+  const refreshButton = element(document, "button", "cm-toolbar-button");
+  refreshButton.type = "button";
+  refreshButton.textContent = "Refresh view";
+  actions.append(missingButton, exportWrapper, refreshButton);
+  header.appendChild(actions);
   root.appendChild(header);
 
-  const toolbar = createHTMLElement(document, "div");
-  toolbar.className = "cm-toolbar";
-
-  const missingControls = createHTMLElement(document, "div");
-  missingControls.className = "cm-missing-controls";
-  missingControls.appendChild(
-    createTextElement(document, "span", "Include missing:", "cm-control-label"),
+  const filterPanel = element(document, "div", "cm-filter-panel");
+  filterPanel.hidden = true;
+  const makeFilter = (label: string, checked: boolean): HTMLLabelElement => {
+    const wrapper = element(document, "label", "cm-check-control");
+    const input = element(document, "input");
+    input.type = "checkbox";
+    input.checked = checked;
+    wrapper.append(input, text(document, "span", label));
+    return wrapper;
+  };
+  const includeMissingYear = makeFilter("Include missing year", true);
+  const includeMissingCitations = makeFilter("Include missing citations", true);
+  const includeMissingReferences = makeFilter(
+    "Include missing references",
+    true,
   );
-  const missingYear = createCheckbox(document, "year", true);
-  const missingCitations = createCheckbox(document, "citations", true);
-  const missingReferences = createCheckbox(document, "references", true);
-  missingControls.append(
-    missingYear.wrapper,
-    missingCitations.wrapper,
-    missingReferences.wrapper,
+  const openAccessOnly = makeFilter("Open Access only", false);
+  const excludeRetracted = makeFilter("Exclude retracted", false);
+  filterPanel.append(
+    includeMissingYear,
+    includeMissingCitations,
+    includeMissingReferences,
+    openAccessOnly,
+    excludeRetracted,
   );
-  toolbar.appendChild(missingControls);
+  root.appendChild(filterPanel);
 
-  const discoveryActions = createHTMLElement(document, "div");
-  discoveryActions.className = "cm-discovery-actions";
-  const recommendationsButton = createHTMLElement(document, "button");
-  recommendationsButton.type = "button";
-  recommendationsButton.textContent = "Missing papers";
-  recommendationsButton.title =
-    "Rank papers absent from the whole Zotero library by how many papers in the current graph view cite them.";
-  discoveryActions.appendChild(recommendationsButton);
-  toolbar.appendChild(discoveryActions);
-
-  const graphStatus = createTextElement(
-    document,
-    "span",
-    "",
-    "cm-graph-status",
-  );
-  toolbar.appendChild(graphStatus);
-  root.appendChild(toolbar);
-
-  const main = createHTMLElement(document, "main");
-  main.className = "cm-main";
-
-  const graphShell = createHTMLElement(document, "section");
-  graphShell.className = "cm-graph-shell";
-  graphShell.setAttribute("aria-label", "Citation graph");
-
-  const graphStage = createHTMLElement(document, "div");
-  graphStage.className = "cm-graph-stage";
-
-  const yAxisDock = createHTMLElement(document, "div");
-  yAxisDock.className = "cm-axis-dock cm-y-axis-dock";
-
-  const yAxisCanvas = createHTMLElement(document, "canvas");
-  yAxisCanvas.className = "cm-axis-canvas cm-y-axis-canvas";
-  yAxisCanvas.setAttribute("aria-hidden", "true");
-  yAxisDock.appendChild(yAxisCanvas);
-
-  const yAxisPicker = createAxisPicker(document, "y");
-  const xAxisPicker = createAxisPicker(document, "x");
-  graphStage.appendChild(yAxisDock);
-
-  const graphSurface = createHTMLElement(document, "div");
-  graphSurface.className = "cm-graph-surface";
-
-  const canvas = createHTMLElement(document, "canvas");
-  canvas.className = "cm-graph-canvas";
+  const main = element(document, "main", "cm-main");
+  const graphArea = element(document, "section", "cm-graph-area");
+  graphArea.setAttribute("aria-label", "Citation graph");
+  const canvas = element(document, "canvas", "cm-graph-canvas");
   canvas.setAttribute(
     "aria-label",
     "Interactive citation graph. Arrows point from citing papers to cited papers.",
   );
-  graphSurface.appendChild(canvas);
+  graphArea.appendChild(canvas);
 
-  const tooltip = createHTMLElement(document, "div");
-  tooltip.className = "cm-node-tooltip";
-  tooltip.hidden = true;
-  graphSurface.appendChild(tooltip);
+  const zoom = element(document, "div", "cm-zoom-controls");
+  for (const [action, label, description] of [
+    ["in", "+", "Zoom in"],
+    ["out", "−", "Zoom out"],
+    ["fit", "⌖", "Fit graph to view"],
+  ]) {
+    const button = element(document, "button", "cm-overlay-button");
+    button.type = "button";
+    button.dataset.action = action;
+    button.textContent = label;
+    button.title = description;
+    button.setAttribute("aria-label", description);
+    if (action === "fit") button.classList.add("cm-fit-button");
+    zoom.appendChild(button);
+  }
+  graphArea.appendChild(zoom);
 
-  const emptyState = createHTMLElement(document, "div");
-  emptyState.className = "cm-graph-empty-state";
-  emptyState.hidden = true;
-  emptyState.appendChild(
-    createTextElement(document, "h2", "No papers to display"),
-  );
-  const emptyStateText = createTextElement(
+  const appearance = createAxesAppearance(
     document,
-    "p",
-    "Change the filters to include papers in the graph.",
+    initialGraphLayout,
+    (layout) => {
+      if (!renderer) {
+        throw new Error("Citation graph renderer is not initialized.");
+      }
+      const current = renderer.getLayout();
+      const axesChanged =
+        current.xMetric !== layout.xMetric ||
+        current.xScale !== layout.xScale ||
+        current.yMetric !== layout.yMetric ||
+        current.yScale !== layout.yScale;
+      renderer.setLayout(layout);
+      if (axesChanged) renderer.fitView();
+    },
   );
-  emptyState.appendChild(emptyStateText);
-  graphSurface.appendChild(emptyState);
+  graphArea.appendChild(appearance.root);
 
-  graphSurface.append(yAxisPicker.root, xAxisPicker.root);
+  const detailShell = element(document, "div", "cm-detail-shell");
+  const resizer = element(document, "div", "cm-detail-resizer");
+  resizer.tabIndex = 0;
+  resizer.setAttribute("role", "separator");
+  resizer.setAttribute("aria-orientation", "vertical");
+  resizer.title = "Drag to resize. Drag fully right to collapse.";
+  const detail = element(document, "aside", "cm-detail-panel");
+  detail.setAttribute("aria-label", "Selected paper details");
+  detailShell.append(resizer, detail);
+  const savedCollapsed = getDetailPanelCollapsed();
+  const savedWidth = getDetailPanelWidth();
+  const mountWidth =
+    mount.getBoundingClientRect().width ||
+    document.defaultView?.innerWidth ||
+    900;
+  const initialDetailWidth = clamp(
+    savedWidth,
+    260,
+    Math.max(260, mountWidth * 0.7),
+  );
+  detailShell.style.width = savedCollapsed ? "8px" : `${initialDetailWidth}px`;
+  detailShell.dataset.collapsed = String(savedCollapsed);
 
-  const zoomControls = createHTMLElement(document, "div");
-  zoomControls.className = "cm-zoom-controls";
+  main.append(graphArea, detailShell);
+  root.appendChild(main);
+  mount.appendChild(root);
 
-  const zoomInButton = createHTMLElement(document, "button");
-  zoomInButton.type = "button";
-  zoomInButton.className = "cm-graph-icon-button";
-  zoomInButton.title = "Zoom in";
-  zoomInButton.setAttribute("aria-label", "Zoom in");
-  zoomInButton.appendChild(createGraphControlIcon(document, "zoom-in"));
+  const updateStatus = (): void => {
+    const visibleNodes = model.nodes.filter((node) =>
+      visibleKeys.has(node.key),
+    );
+    const resolvedNodes = visibleNodes.filter(
+      (node) => node.metricStatus === "success",
+    ).length;
+    summary.textContent = `${formatCount(visibleNodes.length)} papers · ${formatCount(renderer?.getVisibleEdgeCount() ?? 0)} citation links · ${formatCount(resolvedNodes)} papers with cached data`;
+  };
 
-  const zoomOutButton = createHTMLElement(document, "button");
-  zoomOutButton.type = "button";
-  zoomOutButton.className = "cm-graph-icon-button";
-  zoomOutButton.title = "Zoom out";
-  zoomOutButton.setAttribute("aria-label", "Zoom out");
-  zoomOutButton.appendChild(createGraphControlIcon(document, "zoom-out"));
-
-  const fitButton = createHTMLElement(document, "button");
-  fitButton.type = "button";
-  fitButton.className = "cm-graph-icon-button";
-  fitButton.title = "Fit graph (keyboard: F)";
-  fitButton.setAttribute("aria-label", "Fit graph");
-  fitButton.appendChild(createGraphControlIcon(document, "fit"));
-
-  zoomControls.append(zoomInButton, zoomOutButton, fitButton);
-  graphSurface.appendChild(zoomControls);
-
-  graphStage.appendChild(graphSurface);
-
-  const axisCorner = createHTMLElement(document, "div");
-  axisCorner.className = "cm-axis-corner";
-  graphStage.appendChild(axisCorner);
-
-  const xAxisDock = createHTMLElement(document, "div");
-  xAxisDock.className = "cm-axis-dock cm-x-axis-dock";
-
-  const xAxisCanvas = createHTMLElement(document, "canvas");
-  xAxisCanvas.className = "cm-axis-canvas cm-x-axis-canvas";
-  xAxisCanvas.setAttribute("aria-hidden", "true");
-  xAxisDock.appendChild(xAxisCanvas);
-
-  graphStage.appendChild(xAxisDock);
-
-  graphShell.appendChild(graphStage);
-
-  const detailPanel = createHTMLElement(document, "aside");
-  detailPanel.className = "cm-detail-panel";
-  detailPanel.setAttribute("aria-label", "Selected paper details");
-
-  let selectedNode: CitationGraphNode | null = null;
-  let graphRenderer: CitationGraphRenderer | null = null;
-
-  const renderExternalWorks = (
-    title: string,
-    works: ExternalWork[],
-    backNode: CitationGraphNode | null,
-  ): void => {
-    graphRenderer?.setGhostPreview(null);
-    clearElement(detailPanel);
-    const heading = createHTMLElement(document, "div");
-    heading.className = "cm-external-heading";
-    const backButton = createHTMLElement(document, "button");
-    backButton.type = "button";
-    backButton.textContent = "Back";
-    backButton.addEventListener("click", () => renderDetails(backNode));
-    heading.append(backButton, createTextElement(document, "h2", title));
-    detailPanel.appendChild(heading);
-
-    if (works.length === 0) {
-      detailPanel.appendChild(
-        createTextElement(
+  const renderOverview = (node: CitationGraphNode | null): void => {
+    renderer?.setGhostPreview(null);
+    clear(detail);
+    if (!node) {
+      detail.append(
+        text(document, "h2", "Paper details"),
+        text(
           document,
           "p",
-          "No external works were found.",
-          "cm-detail-placeholder",
+          "Select a paper to inspect its metrics, references and citing works.",
+          "cm-placeholder",
         ),
       );
       return;
     }
-
-    const localDOIs = new Set(
-      snapshot.papers
-        .map((paper) => normalizeSearchText(paper.doi ?? ""))
-        .filter(Boolean),
+    selectedNode = node;
+    detail.append(text(document, "h2", node.title));
+    detail.append(
+      text(
+        document,
+        "p",
+        [node.authors.slice(0, 5).join(", "), node.sourceTitle, node.year]
+          .filter(Boolean)
+          .join(" · "),
+        "cm-detail-meta",
+      ),
     );
-    const list = createHTMLElement(document, "div");
-    list.className = "cm-external-list";
+    const badges = element(document, "div", "cm-badges");
+    if (node.isOpenAccess) badges.append(text(document, "span", "Open Access"));
+    if (node.isRetracted)
+      badges.append(text(document, "span", "Retracted", "cm-badge-danger"));
+    if (node.isTop1Percent) badges.append(text(document, "span", "Top 1%"));
+    else if (node.isTop10Percent)
+      badges.append(text(document, "span", "Top 10%"));
+    if (!node.matchConfirmed)
+      badges.append(
+        text(document, "span", "Match needs confirmation", "cm-badge-warning"),
+      );
+    if (badges.childElementCount) detail.appendChild(badges);
+
+    const tabs = element(document, "div", "cm-detail-tabs");
+    for (const [mode, label] of [
+      ["overview", "Overview"],
+      ["cited-by", "Cited by"],
+      ["references", "References"],
+    ]) {
+      const button = element(document, "button");
+      button.type = "button";
+      button.dataset.mode = mode;
+      button.textContent = label;
+      if (mode === "overview") button.dataset.selected = "true";
+      tabs.appendChild(button);
+    }
+    detail.appendChild(tabs);
+
+    const rows = element(document, "dl", "cm-metric-list");
+    const appendMetric = (
+      label: string,
+      value: string,
+      titleText?: string,
+    ): void => {
+      const dt = text(document, "dt", label);
+      if (titleText) dt.title = titleText;
+      rows.append(dt, text(document, "dd", value));
+    };
+    appendMetric("Citations", formatCount(node.citationCount));
+    appendMetric("References", formatCount(node.referenceCount));
+    appendMetric(
+      "Citation rate",
+      node.citationVelocity === null
+        ? "—"
+        : `${formatMetricValue("citation-rate", node.citationVelocity)}/year`,
+      getMetricDefinition("citation-rate").description,
+    );
+    appendMetric(
+      "Citation acceleration",
+      formatMetricValue("citation-acceleration", node.citationAcceleration),
+      getMetricDefinition("citation-acceleration").description,
+    );
+    appendMetric("FWCI", formatMetricValue("fwci", node.fwci));
+    appendMetric(
+      "Citation percentile",
+      formatMetricValue("citation-percentile", node.citationPercentile),
+    );
+    appendMetric(
+      "2-year mean citedness",
+      formatMetricValue(
+        "two-year-mean-citedness",
+        node.sourceMetrics?.twoYearMeanCitedness ?? null,
+      ),
+    );
+    appendMetric(
+      "Journal h-index",
+      formatMetricValue("journal-h-index", node.sourceMetrics?.hIndex ?? null),
+    );
+    appendMetric(
+      "Library coverage",
+      formatMetricValue("library-coverage", node.libraryCoverage),
+    );
+    appendMetric("Provider", node.provider ?? "—");
+    appendMetric(
+      "Updated",
+      node.metricsUpdatedAt
+        ? new Date(node.metricsUpdatedAt).toLocaleString()
+        : "—",
+    );
+    detail.appendChild(rows);
+
+    const buttons = element(document, "div", "cm-detail-actions");
+    const show = element(document, "button", "cm-primary-button");
+    show.type = "button";
+    show.textContent = "Show in Zotero";
+    show.addEventListener("click", () => void selectPaper(node.itemID));
+    buttons.appendChild(show);
+    if (node.doi) {
+      const doi = element(document, "button", "cm-secondary-button");
+      doi.type = "button";
+      doi.textContent = "Open DOI";
+      doi.addEventListener("click", () =>
+        Zotero.launchURL(
+          `https://doi.org/${encodeURIComponent(node.doi ?? "")}`,
+        ),
+      );
+      buttons.appendChild(doi);
+    }
+    detail.appendChild(buttons);
+
+    tabs.addEventListener("click", (event) => {
+      const target = (event.target as Element).closest(
+        "button",
+      ) as HTMLButtonElement | null;
+      if (!target) return;
+      if (target.dataset.mode === "cited-by")
+        void showRelationList(node, "cited-by");
+      if (target.dataset.mode === "references")
+        void showRelationList(node, "references");
+    });
+  };
+
+  const showLoading = (titleValue: string): void => {
+    clear(detail);
+    detail.append(
+      text(document, "h2", titleValue),
+      text(document, "p", "Loading…", "cm-placeholder"),
+    );
+  };
+
+  const renderExternalWorks = (
+    headingText: string,
+    works: ExternalWork[],
+    backNode: CitationGraphNode | null,
+  ): void => {
+    clear(detail);
+    const heading = element(document, "div", "cm-detail-heading");
+    const back = element(document, "button", "cm-secondary-button");
+    back.type = "button";
+    back.textContent = "Back";
+    back.addEventListener("click", () => renderOverview(backNode));
+    heading.append(back, text(document, "h2", headingText));
+    detail.appendChild(heading);
+    if (!works.length) {
+      detail.append(
+        text(document, "p", "No external works were found.", "cm-placeholder"),
+      );
+      return;
+    }
+    const list = element(document, "div", "cm-external-list");
     for (const work of works) {
-      const card = createHTMLElement(document, "article");
-      card.className = "cm-external-work";
-      if (work.citingNodeKeys?.length) {
-        card.classList.add("cm-missing-work");
-        card.addEventListener("mouseenter", () => {
-          graphRenderer?.setGhostPreview({
-            key: work.providerWorkID,
-            title: work.title,
-            year: work.year,
-            citationCount: work.citationCount,
-            referenceCount: work.referenceCount,
-            sourceKeys: work.citingNodeKeys ?? [],
-          });
-        });
-        card.addEventListener("mouseleave", () => {
-          graphRenderer?.setGhostPreview(null);
-        });
-      }
-      card.appendChild(createTextElement(document, "h3", work.title));
-      const metadata = [
-        work.authors.slice(0, 3).join(", "),
-        work.year ? String(work.year) : "",
-        work.citationCount === null
-          ? ""
-          : `${formatCount(work.citationCount)} citations`,
-        work.recommendationScore
-          ? `cited by ${work.recommendationScore} library papers`
-          : "",
-      ]
-        .filter(Boolean)
-        .join(" · ");
-      if (metadata) {
-        card.appendChild(
-          createTextElement(document, "p", metadata, "cm-external-meta"),
+      const card = element(document, "article", "cm-external-card");
+      if (work.isRetracted) card.classList.add("cm-external-retracted");
+      card.append(
+        text(
+          document,
+          "h3",
+          work.title?.trim() ||
+            work.doi?.trim() ||
+            work.providerWorkID?.trim() ||
+            "Untitled work",
+        ),
+      );
+      card.append(
+        text(
+          document,
+          "p",
+          [
+            work.authors.slice(0, 4).join(", "),
+            work.sourceTitle,
+            work.year,
+            work.citationCount === null || work.citationCount === undefined
+              ? ""
+              : `${formatCount(work.citationCount)} citations`,
+            work.recommendationScore
+              ? `connected to ${work.recommendationScore} visible papers`
+              : "",
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          "cm-detail-meta",
+        ),
+      );
+      const badges = element(document, "div", "cm-badges");
+      if (work.inLibraryItemKey)
+        badges.append(text(document, "span", "In Zotero"));
+      if (work.isOpenAccess)
+        badges.append(text(document, "span", "Open Access"));
+      if (work.isRetracted)
+        badges.append(text(document, "span", "Retracted", "cm-badge-danger"));
+      if (badges.childElementCount) card.appendChild(badges);
+      if (work.abstract) {
+        const disclosure = element(
+          document,
+          "details",
+          "cm-abstract-disclosure",
         );
+        disclosure.append(
+          text(document, "summary", "Abstract"),
+          text(document, "p", work.abstract),
+        );
+        card.appendChild(disclosure);
       }
-      const actions = createHTMLElement(document, "div");
-      actions.className = "cm-detail-actions";
+      const cardActions = element(document, "div", "cm-detail-actions");
       if (work.doi) {
-        const openButton = createHTMLElement(document, "button");
-        openButton.type = "button";
-        openButton.textContent = "Open DOI";
-        openButton.addEventListener("click", () => {
+        const open = element(document, "button", "cm-secondary-button");
+        open.type = "button";
+        open.textContent = "Open DOI";
+        open.addEventListener("click", () =>
           Zotero.launchURL(
             `https://doi.org/${encodeURIComponent(work.doi ?? "")}`,
-          );
+          ),
+        );
+        cardActions.appendChild(open);
+      }
+      if (work.inLibraryItemKey) {
+        const paper = paperByKey.get(work.inLibraryItemKey);
+        const show = element(document, "button", "cm-primary-button");
+        show.type = "button";
+        show.textContent = "Show in Zotero";
+        show.addEventListener("click", () => {
+          if (paper) void selectPaper(paper.itemID);
         });
-        actions.appendChild(openButton);
-
-        const normalizedDOI = normalizeSearchText(work.doi);
-        const addButton = createHTMLElement(document, "button");
-        addButton.type = "button";
-        const alreadyLocal = localDOIs.has(normalizedDOI);
-        addButton.disabled = alreadyLocal;
-        addButton.textContent = alreadyLocal
-          ? "Already in Zotero"
-          : "Add to Zotero";
-        addButton.addEventListener("click", async () => {
-          addButton.disabled = true;
-          addButton.textContent = "Adding…";
+        cardActions.appendChild(show);
+      } else {
+        const add = element(document, "button", "cm-primary-button");
+        add.type = "button";
+        add.textContent = "Add to Zotero";
+        const importArea = element(document, "div", "cm-import-area");
+        importArea.hidden = true;
+        const chooser = createCollectionChooser(document, snapshot);
+        const importButtons = element(document, "div", "cm-detail-actions");
+        const cancel = element(document, "button", "cm-secondary-button");
+        cancel.type = "button";
+        cancel.textContent = "Cancel";
+        const confirm = element(document, "button", "cm-primary-button");
+        confirm.type = "button";
+        confirm.textContent = "Add paper";
+        cancel.addEventListener("click", () => {
+          importArea.hidden = true;
+          add.hidden = false;
+        });
+        confirm.addEventListener("click", async () => {
+          confirm.disabled = true;
+          confirm.textContent = "Adding…";
           try {
-            const items = await importExternalWork(work, snapshot.libraryID);
-            if (items.length === 0) throw new Error("No item was imported.");
-            localDOIs.add(normalizedDOI);
-            addButton.textContent = "Added";
+            const items = await importExternalWork(work, snapshot.libraryID, [
+              ...chooser.selected,
+            ]);
+            const imported = items[0];
+            if (!imported) throw new Error("No item was imported.");
+            work.inLibraryItemKey = String(imported.key);
+            importArea.replaceChildren(
+              text(document, "p", "Added to Zotero.", "cm-success"),
+            );
+            add.remove();
           } catch (error) {
             Zotero.logError(
               error instanceof Error ? error : new Error(String(error)),
             );
-            addButton.disabled = false;
-            addButton.textContent = "Import failed";
+            confirm.disabled = false;
+            confirm.textContent = "Import failed — try again";
           }
         });
-        actions.appendChild(addButton);
+        importButtons.append(cancel, confirm);
+        importArea.append(
+          text(document, "h4", "Choose collections"),
+          text(
+            document,
+            "p",
+            "Select any number of collections. No selection adds the paper to the library root.",
+            "cm-help",
+          ),
+          chooser.root,
+          importButtons,
+        );
+        add.addEventListener("click", () => {
+          add.hidden = true;
+          importArea.hidden = false;
+        });
+        cardActions.appendChild(add);
+        card.appendChild(importArea);
       }
-      card.appendChild(actions);
+      card.appendChild(cardActions);
+      if (work.citingNodeKeys?.length) {
+        const preview: GhostPreview = {
+          key: work.providerWorkID ?? work.doi ?? work.title ?? "external",
+          title: work.title ?? "Untitled",
+          year: work.year,
+          citationCount: work.citationCount ?? null,
+          referenceCount: work.referenceCount ?? null,
+          sourceKeys: work.citingNodeKeys,
+        };
+        card.addEventListener("mouseenter", () =>
+          renderer?.setGhostPreview(preview),
+        );
+        card.addEventListener("mouseleave", () =>
+          renderer?.setGhostPreview(null),
+        );
+      }
       list.appendChild(card);
     }
-    detailPanel.appendChild(list);
+    detail.appendChild(list);
   };
 
-  const showLoading = (title: string): void => {
-    graphRenderer?.setGhostPreview(null);
-    clearElement(detailPanel);
-    detailPanel.appendChild(createTextElement(document, "h2", title));
-    detailPanel.appendChild(
-      createTextElement(
-        document,
-        "p",
-        "Loading from OpenAlex…",
-        "cm-detail-placeholder",
-      ),
-    );
-  };
-
-  const renderDetails = (node: CitationGraphNode | null): void => {
-    selectedNode = node;
-    graphRenderer?.setGhostPreview(null);
-    clearElement(detailPanel);
-    if (!node) {
-      detailPanel.appendChild(
-        createTextElement(document, "h2", "Paper details"),
+  const showRelationList = async (
+    node: CitationGraphNode,
+    direction: "references" | "cited-by",
+  ): Promise<void> => {
+    const titleValue = direction === "references" ? "References" : "Cited by";
+    showLoading(titleValue);
+    try {
+      const works =
+        direction === "references"
+          ? await getExternalReferences(node, model.nodes, 100)
+          : await getExternalCitedBy(node, model.nodes, 100);
+      renderExternalWorks(titleValue, works, node);
+    } catch (error) {
+      Zotero.logError(
+        error instanceof Error ? error : new Error(String(error)),
       );
-      detailPanel.appendChild(
-        createTextElement(
-          document,
-          "p",
-          "Select a node. Use References or Cited by to browse papers outside the current Zotero graph.",
-          "cm-detail-placeholder",
-        ),
-      );
-      return;
+      renderExternalWorks(titleValue, [], node);
     }
-
-    detailPanel.appendChild(createTextElement(document, "h2", node.title));
-    detailPanel.appendChild(
-      createTextElement(
-        document,
-        "p",
-        node.authors.length > 0 ? node.authors.join(", ") : "Unknown author",
-        "cm-detail-authors",
-      ),
-    );
-    const rows = createHTMLElement(document, "div");
-    rows.className = "cm-detail-rows";
-    rows.append(
-      createDetailRow(document, "Year", node.year ? String(node.year) : "—"),
-      createDetailRow(
-        document,
-        "Citations",
-        node.citationCount === null ? "—" : formatCount(node.citationCount),
-      ),
-      createDetailRow(
-        document,
-        "References",
-        node.referenceCount === null ? "—" : formatCount(node.referenceCount),
-      ),
-      createDetailRow(
-        document,
-        "Library coverage",
-        formatNullableMetric("library-coverage", node.libraryCoverage),
-        "library-coverage",
-      ),
-      createDetailRow(
-        document,
-        "Citation velocity",
-        formatNullableMetric("citation-velocity", node.citationVelocity),
-        "citation-velocity",
-      ),
-      createDetailRow(
-        document,
-        "Citation acceleration",
-        formatNullableMetric(
-          "citation-acceleration",
-          node.citationAcceleration,
-        ),
-        "citation-acceleration",
-      ),
-    );
-    detailPanel.appendChild(rows);
-
-    const actions = createHTMLElement(document, "div");
-    actions.className = "cm-detail-actions";
-    const showButton = createHTMLElement(document, "button");
-    showButton.type = "button";
-    showButton.textContent = "Show in Zotero";
-    showButton.addEventListener(
-      "click",
-      () => void options.onSelectPaper(node.itemID),
-    );
-    actions.appendChild(showButton);
-
-    const referencesButton = createHTMLElement(document, "button");
-    referencesButton.type = "button";
-    referencesButton.textContent = "References";
-    referencesButton.addEventListener("click", async () => {
-      showLoading("References");
-      const works = await getExternalReferences(node);
-      renderExternalWorks("References", works, node);
-    });
-    actions.appendChild(referencesButton);
-
-    const citedByButton = createHTMLElement(document, "button");
-    citedByButton.type = "button";
-    citedByButton.textContent = "Cited by";
-    citedByButton.disabled =
-      node.provider !== "openalex" || !node.providerWorkID;
-    citedByButton.addEventListener("click", async () => {
-      showLoading("Cited by");
-      const works = await getExternalCitedBy(node);
-      renderExternalWorks("Cited by", works, node);
-    });
-    actions.appendChild(citedByButton);
-
-    if (node.doi) {
-      const doiButton = createHTMLElement(document, "button");
-      doiButton.type = "button";
-      doiButton.textContent = "Open DOI";
-      doiButton.addEventListener("click", () => {
-        Zotero.launchURL(
-          `https://doi.org/${encodeURIComponent(node.doi ?? "")}`,
-        );
-      });
-      actions.appendChild(doiButton);
-    }
-    detailPanel.appendChild(actions);
   };
 
-  renderDetails(null);
-  graphShell.appendChild(detailPanel);
-  main.appendChild(graphShell);
-  root.appendChild(main);
-  mount.appendChild(root);
-
-  const renderer = new CitationGraphRenderer({
-    root,
+  renderer = new CitationGraphRenderer({
     canvas,
-    xAxisCanvas,
-    yAxisCanvas,
-    tooltip,
-    model: graph,
-    nodeSizeMetric: readNodeSizeMetric(),
-    nodeLabelMode: readNodeLabelMode(),
-    collectionColorByNodeKey: collectionVisuals.colorByNodeKey,
-    collectionLabelByNodeKey: collectionVisuals.labelByNodeKey,
-    onSelectionChange: renderDetails,
-    onOpenNode: (node) => options.onSelectPaper(node.itemID),
+    model,
+    layout: initialGraphLayout,
+    collectionColorsByNodeKey: visuals.colorsByNodeKey,
+    collectionLabelsByNodeKey: visuals.labelsByNodeKey,
+    onSelectionChange: renderOverview,
+    onOpenNode: (node) => void selectPaper(node.itemID),
+  });
+  renderOverview(null);
+
+  const selectedCollection = (): LibraryCollectionFilter | null => {
+    const id = Number(collection.value);
+    return Number.isFinite(id)
+      ? (snapshot.collections.find((entry) => entry.collectionID === id) ??
+          null)
+      : null;
+  };
+
+  const applyFilters = (): void => {
+    const selected = selectedCollection();
+    const selectedTag = tag.value;
+    const queryTokens = normalizeSearch(search.value)
+      .split(/\s+/)
+      .filter(Boolean);
+    const allowedCollectionIDs = selected
+      ? new Set(selected.includedCollectionIDs)
+      : null;
+    visibleKeys = new Set(
+      model.nodes
+        .filter((node) => {
+          const paper = paperByKey.get(node.itemKey);
+          if (!paper) return false;
+          if (
+            allowedCollectionIDs &&
+            !node.collectionIDs.some((id) => allowedCollectionIDs.has(id))
+          ) {
+            return false;
+          }
+          if (selectedTag !== "all" && !node.tags.includes(selectedTag))
+            return false;
+          if (
+            !(includeMissingYear.querySelector("input") as HTMLInputElement)
+              .checked &&
+            node.year === null
+          ) {
+            return false;
+          }
+          if (
+            !(
+              includeMissingCitations.querySelector("input") as HTMLInputElement
+            ).checked &&
+            node.citationCount === null
+          ) {
+            return false;
+          }
+          if (
+            !(
+              includeMissingReferences.querySelector(
+                "input",
+              ) as HTMLInputElement
+            ).checked &&
+            node.referenceCount === null
+          ) {
+            return false;
+          }
+          if (
+            (openAccessOnly.querySelector("input") as HTMLInputElement)
+              .checked &&
+            !node.isOpenAccess
+          ) {
+            return false;
+          }
+          if (
+            (excludeRetracted.querySelector("input") as HTMLInputElement)
+              .checked &&
+            node.isRetracted
+          ) {
+            return false;
+          }
+          if (
+            queryTokens.length &&
+            !queryTokens.every((token) =>
+              paperSearchText(paper).includes(token),
+            )
+          ) {
+            return false;
+          }
+          return true;
+        })
+        .map((node) => node.key),
+    );
+    renderer?.setVisibleKeys(visibleKeys);
+    renderer?.setSearchMatches(queryTokens.length ? visibleKeys : null);
+    updateStatus();
+  };
+
+  search.addEventListener("input", () => {
+    if (searchTimer !== null) document.defaultView?.clearTimeout(searchTimer);
+    searchTimer =
+      document.defaultView?.setTimeout(() => {
+        searchTimer = null;
+        applyFilters();
+      }, 180) ?? null;
+  });
+  for (const control of [collection, tag]) {
+    control.addEventListener("change", applyFilters);
+  }
+  for (const wrapper of [
+    includeMissingYear,
+    includeMissingCitations,
+    includeMissingReferences,
+    openAccessOnly,
+    excludeRetracted,
+  ]) {
+    wrapper.querySelector("input")?.addEventListener("change", applyFilters);
+  }
+  filterButton.addEventListener("click", () => {
+    filterPanel.hidden = !filterPanel.hidden;
+    filterButton.setAttribute("aria-expanded", String(!filterPanel.hidden));
   });
 
-  graphRenderer = renderer;
-
-  const nodeKeyByItemID = new Map(
-    graph.nodes.map((node) => [node.itemID, node.key]),
-  );
-  let visibleNodeKeys = new Set(graph.nodes.map((node) => node.key));
-  let searchTimer: number | null = null;
-  let searchGeneration = 0;
-
-  recommendationsButton.addEventListener("click", async () => {
+  missingButton.addEventListener("click", async () => {
     showLoading("Missing papers");
-    recommendationsButton.disabled = true;
+    missingButton.disabled = true;
     try {
-      const visibleNodes = graph.nodes.filter((node) =>
-        visibleNodeKeys.has(node.key),
+      const visibleNodes = model.nodes.filter((node) =>
+        visibleKeys.has(node.key),
       );
       const works = await getMissingPaperRecommendations(
         visibleNodes,
-        graph.nodes,
+        model.nodes,
+        50,
+        2,
       );
       renderExternalWorks("Missing papers", works, selectedNode);
     } catch (error) {
@@ -1151,221 +1410,127 @@ export function renderCitationMapView(
       );
       renderExternalWorks("Missing papers", [], selectedNode);
     } finally {
-      recommendationsButton.disabled = false;
+      missingButton.disabled = false;
     }
   });
 
-  const getCollectionFilter = (): LibraryCollectionFilter | null => {
-    const collectionID = Number(collectionControl.select.value);
-    return Number.isFinite(collectionID)
-      ? (snapshot.collections.find(
-          (collection) => collection.collectionID === collectionID,
-        ) ?? null)
-      : null;
-  };
-
-  const updateGraphStatus = (): void => {
-    const visibleEdges = renderer.getVisibleEdgeCount();
-    graphStatus.textContent =
-      `${formatCount(visibleNodeKeys.size)} papers · ` +
-      `${formatCount(visibleEdges)} citation links · ` +
-      `${formatCount(graph.statistics.resolvedNodes)} papers with cached data`;
-  };
-
-  const applyFilters = (): void => {
-    renderer.setGhostPreview(null);
-    const collection = getCollectionFilter();
-    const selectedTag = tagControl.select.value;
-
-    visibleNodeKeys = new Set(
-      graph.nodes
-        .filter((node) => {
-          if (!collectionMatches(node, collection)) {
-            return false;
-          }
-          if (selectedTag !== "all" && !node.tags.includes(selectedTag)) {
-            return false;
-          }
-          if (!missingYear.input.checked && node.year === null) {
-            return false;
-          }
-          if (!missingCitations.input.checked && node.citationCount === null) {
-            return false;
-          }
-          if (
-            !missingReferences.input.checked &&
-            node.referenceCount === null
-          ) {
-            return false;
-          }
-          return true;
-        })
-        .map((node) => node.key),
-    );
-
-    const graphIsEmpty = visibleNodeKeys.size === 0;
-    emptyState.hidden = !graphIsEmpty;
-    canvas.hidden = graphIsEmpty;
-    xAxisCanvas.hidden = graphIsEmpty;
-    yAxisCanvas.hidden = graphIsEmpty;
-    xAxisPicker.root.hidden = graphIsEmpty;
-    yAxisPicker.root.hidden = graphIsEmpty;
-    zoomControls.hidden = graphIsEmpty;
-    renderer.setVisibleKeys(visibleNodeKeys);
-    updateGraphStatus();
-
-    if (searchInput.value.trim()) {
-      void applySearch();
-    }
-  };
-
-  const currentLayout = (): GraphLayoutOptions => ({
-    xMetric: xAxisPicker.getMetric(),
-    xScale: xAxisPicker.getScale(),
-    yMetric: yAxisPicker.getMetric(),
-    yScale: yAxisPicker.getScale(),
+  exportButton.addEventListener("click", () => {
+    exportMenu.hidden = !exportMenu.hidden;
+    exportButton.setAttribute("aria-expanded", String(!exportMenu.hidden));
   });
-
-  const applyLayout = (): void => {
-    renderer.setLayout(currentLayout());
-  };
-
-  const applySearch = async (): Promise<void> => {
-    const generation = ++searchGeneration;
-    const query = searchInput.value.trim();
-
-    if (!query) {
-      searchStatus.textContent = "";
-      renderer.setSearchMatches(null);
-      return;
-    }
-
-    searchStatus.textContent = "Searching…";
-    const matchingItemIDs = await runZoteroSearch(query, snapshot);
-
-    if (generation !== searchGeneration) {
-      return;
-    }
-
-    const matchingKeys = new Set(
-      matchingItemIDs
-        .map((itemID) => nodeKeyByItemID.get(itemID))
-        .filter((key): key is string => Boolean(key)),
-    );
-    const visibleMatches = [...matchingKeys].filter((key) =>
-      visibleNodeKeys.has(key),
-    );
-
-    renderer.setSearchMatches(matchingKeys);
-    searchStatus.textContent = `${formatCount(visibleMatches.length)} match${
-      visibleMatches.length === 1 ? "" : "es"
-    } in current graph`;
-  };
-
-  const scheduleSearch = (): void => {
-    if (searchTimer !== null) {
-      document.defaultView?.clearTimeout(searchTimer);
-    }
-
-    searchTimer =
-      document.defaultView?.setTimeout(() => {
-        searchTimer = null;
-        void applySearch();
-      }, 250) ?? null;
-  };
-
-  searchInput.addEventListener("input", scheduleSearch);
-  searchInput.addEventListener("keydown", (event: KeyboardEvent) => {
-    if (event.key === "Escape") {
-      searchInput.value = "";
-      void applySearch();
-    } else if (event.key === "Enter") {
-      if (searchTimer !== null) {
-        document.defaultView?.clearTimeout(searchTimer);
-        searchTimer = null;
+  exportMenu.addEventListener("click", (event) => {
+    const target = (event.target as Element).closest(
+      "button",
+    ) as HTMLButtonElement | null;
+    if (!target) return;
+    exportMenu.hidden = true;
+    exportButton.setAttribute("aria-expanded", "false");
+    try {
+      if (target.dataset.format === "png") {
+        exportGraphPNG(document, renderer!.getCanvas(), snapshot);
+      } else if (target.dataset.format === "json") {
+        exportGraphJSON(document, snapshot, model, visibleKeys);
+      } else if (target.dataset.format === "csv") {
+        exportGraphCSV(document, snapshot, model, visibleKeys);
       }
-      void applySearch();
+    } catch (error) {
+      Zotero.logError(
+        error instanceof Error ? error : new Error(String(error)),
+      );
     }
   });
+  refreshButton.addEventListener("click", () => applyFilters());
+  zoom.addEventListener("click", (event) => {
+    const target = (event.target as Element).closest(
+      "button",
+    ) as HTMLButtonElement | null;
+    if (!target) return;
+    if (target.dataset.action === "in") renderer?.zoomBy(1.25);
+    if (target.dataset.action === "out") renderer?.zoomBy(0.8);
+    if (target.dataset.action === "fit") renderer?.fitView();
+  });
 
-  for (const control of [
-    collectionControl.select,
-    tagControl.select,
-    missingYear.input,
-    missingCitations.input,
-    missingReferences.input,
-  ]) {
-    control.addEventListener("change", applyFilters);
+  let resizing = false;
+  const resizeMove = (event: PointerEvent): void => {
+    if (!resizing) return;
+    const rect = main.getBoundingClientRect();
+    const width = clamp(
+      rect.right - event.clientX,
+      0,
+      Math.max(260, rect.width * 0.7),
+    );
+    if (width < 72) {
+      detailShell.style.width = "8px";
+      detailShell.dataset.collapsed = "true";
+    } else {
+      detailShell.style.width = `${width}px`;
+      detailShell.dataset.collapsed = "false";
+    }
+    renderer?.resizeViewport();
+  };
+  const resizeEnd = (): void => {
+    if (!resizing) return;
+    resizing = false;
+    document.removeEventListener("pointermove", resizeMove);
+    document.removeEventListener("pointerup", resizeEnd);
+    const collapsed = detailShell.dataset.collapsed === "true";
+    setDetailPanelCollapsed(collapsed);
+    if (!collapsed) {
+      setDetailPanelWidth(detailShell.getBoundingClientRect().width);
+    }
+  };
+  resizer.addEventListener("pointerdown", (event) => {
+    resizing = true;
+    event.preventDefault();
+    document.addEventListener("pointermove", resizeMove);
+    document.addEventListener("pointerup", resizeEnd);
+  });
+  resizer.addEventListener("dblclick", () => {
+    const collapsed = detailShell.dataset.collapsed === "true";
+    detailShell.dataset.collapsed = String(!collapsed);
+    if (collapsed) {
+      const mainWidth = main.getBoundingClientRect().width;
+      const restoredWidth = clamp(
+        getDetailPanelWidth(),
+        260,
+        Math.max(260, mainWidth * 0.7),
+      );
+      detailShell.style.width = `${restoredWidth}px`;
+    } else {
+      detailShell.style.width = "8px";
+    }
+    setDetailPanelCollapsed(!collapsed);
+    renderer?.resizeViewport();
+  });
+
+  const closeMenus = (event: Event): void => {
+    const target = event.target as Node | null;
+    if (target && exportWrapper.contains(target)) return;
+    exportMenu.hidden = true;
+    exportButton.setAttribute("aria-expanded", "false");
+    // Do not auto-close the appearance panel here. Firefox renders native
+    // select popups outside appearance.root; closing on capture can cancel the
+    // select's change/command event before the new value is committed.
+  };
+  document.addEventListener("pointerdown", closeMenus, true);
+  applyFilters();
+  if (options.initialItemID) {
+    const initialNode = model.nodes.find(
+      (node) => node.itemID === options.initialItemID,
+    );
+    if (initialNode) renderer.selectNode(initialNode.key, true);
   }
 
-  xAxisPicker.onChange(applyLayout);
-  yAxisPicker.onChange(applyLayout);
-
-  const closeAxisMenus = (except?: AxisPicker): void => {
-    if (except !== xAxisPicker) xAxisPicker.setOpen(false);
-    if (except !== yAxisPicker) yAxisPicker.setOpen(false);
-  };
-
-  xAxisPicker.button.addEventListener("click", () => {
-    if (xAxisPicker.isOpen()) closeAxisMenus(xAxisPicker);
-  });
-  yAxisPicker.button.addEventListener("click", () => {
-    if (yAxisPicker.isOpen()) closeAxisMenus(yAxisPicker);
-  });
-
-  const documentPointerListener = (event: Event): void => {
-    const target = event.target as Node | null;
-    if (
-      target &&
-      (xAxisPicker.root.contains(target) || yAxisPicker.root.contains(target))
-    ) {
-      return;
-    }
-    closeAxisMenus();
-  };
-  const documentKeyListener = (event: KeyboardEvent): void => {
-    if (event.key === "Escape") closeAxisMenus();
-  };
-  document.addEventListener("pointerdown", documentPointerListener, true);
-  document.addEventListener("keydown", documentKeyListener, true);
-
-  zoomInButton.addEventListener("click", () => renderer.zoomBy(1.25));
-  zoomOutButton.addEventListener("click", () => renderer.zoomBy(0.8));
-  fitButton.addEventListener("click", () => renderer.fitView());
-
-  const nodeSizeObserverID = Zotero.Prefs.registerObserver(
-    NODE_SIZE_PREF,
-    () => renderer.setNodeSizeMetric(readNodeSizeMetric()),
-    true,
-  );
-  const nodeLabelObserverID = Zotero.Prefs.registerObserver(
-    NODE_LABEL_PREF,
-    () => renderer.setNodeLabelMode(readNodeLabelMode()),
-    true,
-  );
-
-  applyLayout();
-  applyFilters();
-
-  let cleanedUp = false;
   const cleanup = (): void => {
-    if (cleanedUp) {
-      return;
-    }
-    cleanedUp = true;
-    if (searchTimer !== null) {
-      document.defaultView?.clearTimeout(searchTimer);
-      searchTimer = null;
-    }
-    document.removeEventListener("pointerdown", documentPointerListener, true);
-    document.removeEventListener("keydown", documentKeyListener, true);
-    document.defaultView?.removeEventListener("unload", cleanup);
-    Zotero.Prefs.unregisterObserver(nodeSizeObserverID);
-    Zotero.Prefs.unregisterObserver(nodeLabelObserverID);
-    renderer.destroy();
+    if (cleaned) return;
+    cleaned = true;
+    if (searchTimer !== null) document.defaultView?.clearTimeout(searchTimer);
+    document.removeEventListener("pointerdown", closeMenus, true);
+    document.removeEventListener("pointermove", resizeMove);
+    document.removeEventListener("pointerup", resizeEnd);
+    renderer?.destroy();
   };
   document.defaultView?.addEventListener("unload", cleanup, { once: true });
   cleanupByMount.set(mount, cleanup);
-
   return root;
 }

@@ -8,167 +8,141 @@ import { requestJSON } from "./http";
 import type { CitationProvider } from "./types";
 import { failureStatusFromHTTP, numberOrNull, stringOrNull } from "./types";
 
-interface CountResponseRow {
-  count?: string | number;
-}
+const BACKGROUND_REFERENCE_LIMIT = 200;
+const MAX_RELATION_RESULTS = 200;
 
-interface CitationRow {
+interface OCMetadata {
+  doi?: string;
+  title?: string;
+  author?: string;
+  year?: string;
+  source_title?: string;
+  citation_count?: string | number;
+  reference_count?: string | number;
+}
+interface OCLink {
   citing?: string;
   cited?: string;
   creation?: string;
+  author_sc?: string;
+  timespan?: string;
 }
 
-function getPID(identifiers: WorkIdentifiers): {
-  kind: "doi" | "pmid";
-  value: string;
-  pid: string;
-} | null {
-  if (identifiers.doi) {
-    return {
-      kind: "doi",
-      value: identifiers.doi,
-      pid: `doi:${identifiers.doi}`,
-    };
-  }
-
-  if (identifiers.pmid) {
-    return {
-      kind: "pmid",
-      value: identifiers.pmid,
-      pid: `pmid:${identifiers.pmid}`,
-    };
-  }
-
-  return null;
-}
-
-function extractPIDValue(
-  text: string | undefined,
-  prefix: "doi" | "pmid" | "omid",
-): string | null {
-  if (!text) {
-    return null;
-  }
-
-  const match = text.match(new RegExp(`(?:^|\\s)${prefix}:([^\\s;]+)`, "i"));
-  return match ? match[1] : null;
-}
-
-function yearFromCreation(value: unknown): number | null {
-  const match = String(value ?? "").match(/^(\d{4})/);
-  return match ? Number(match[1]) : null;
-}
-
-function mapReferences(rows: CitationRow[] | null): RelatedWorkMetadata[] {
-  const sourceRows = (rows ?? []) as Array<CitationRow | CitationRow[]>;
-  const flattened = sourceRows.flatMap((row) =>
-    Array.isArray(row) ? row : [row],
+function relatedFromLink(
+  link: OCLink,
+  direction: "citations" | "references",
+): RelatedWorkMetadata | null {
+  const doi = normalizeDOI(
+    direction === "citations" ? link.citing : link.cited,
   );
+  if (!doi) return null;
+  return {
+    provider: "opencitations",
+    providerWorkID: doi,
+    doi,
+    title: null,
+    year: link.creation
+      ? Number(String(link.creation).slice(0, 4)) || null
+      : null,
+    authors: [],
+  };
+}
 
-  return flattened.map((row) => {
-    const doi = normalizeDOI(extractPIDValue(row.cited, "doi"));
-    const pmid = extractPIDValue(row.cited, "pmid");
-    const omid = extractPIDValue(row.cited, "omid");
-
-    return {
-      providerWorkID: omid ? `omid:${omid}` : pmid ? `pmid:${pmid}` : doi,
-      doi,
-      title: null,
-      year: yearFromCreation(row.creation),
-      authors: [],
-    };
-  });
+async function fetchLinks(
+  doi: string,
+  direction: "citations" | "references",
+  maximum: number,
+  offset = 0,
+): Promise<RelatedWorkMetadata[]> {
+  const response = await requestJSON<OCLink[]>(
+    "opencitations",
+    `https://opencitations.net/index/coci/api/v1/${direction}/${encodeURIComponent(doi)}`,
+  );
+  if (!response.ok || !Array.isArray(response.data)) return [];
+  return response.data
+    .slice(offset, offset + Math.min(MAX_RELATION_RESULTS, maximum))
+    .map((link) => relatedFromLink(link, direction))
+    .filter((work): work is RelatedWorkMetadata => Boolean(work));
 }
 
 export const openCitationsProvider: CitationProvider = {
   id: "opencitations",
   label: "OpenCitations",
-
-  supports(identifiers) {
-    return Boolean(identifiers.doi || identifiers.pmid);
+  capabilities: {
+    identifiers: {
+      doi: true,
+      pmid: false,
+      arxiv: false,
+      isbn: false,
+      titleSearch: false,
+    },
+    citationCount: true,
+    referenceCount: true,
+    citingWorks: true,
+    referencedWorks: true,
+    abstract: false,
+    openAccess: false,
+    retraction: false,
+    sourceMetrics: false,
   },
-
-  async lookup(identifiers: WorkIdentifiers): Promise<ProviderLookupResult> {
-    const lookup = getPID(identifiers);
-
-    if (!lookup) {
+  supports: (identifiers) => Boolean(identifiers.doi),
+  lookup: async (
+    identifiers: WorkIdentifiers,
+  ): Promise<ProviderLookupResult> => {
+    if (!identifiers.doi) {
       return {
         status: "no-identifier",
         provider: "opencitations",
-        message: "OpenCitations requires a DOI or PMID.",
+        message: "OpenCitations needs a DOI.",
       };
     }
-
-    const encodedPID = encodeURIComponent(lookup.pid);
-    const base = "https://api.opencitations.net/index/v2";
-
-    const citationResponse = await requestJSON<CountResponseRow[]>(
+    const response = await requestJSON<OCMetadata[]>(
       "opencitations",
-      `${base}/citation-count/${encodedPID}`,
+      `https://opencitations.net/index/coci/api/v1/metadata/${encodeURIComponent(identifiers.doi)}`,
     );
-
-    if (!citationResponse.ok) {
+    const metadata = Array.isArray(response.data) ? response.data[0] : null;
+    if (!response.ok || !metadata) {
       return {
-        status: failureStatusFromHTTP(citationResponse.status),
+        status: failureStatusFromHTTP(response.status),
         provider: "opencitations",
-        message: citationResponse.message,
+        message: response.message || "OpenCitations did not return a work.",
       };
     }
-
-    const referenceResponse = await requestJSON<CountResponseRow[]>(
-      "opencitations",
-      `${base}/reference-count/${encodedPID}`,
+    const references = await fetchLinks(
+      identifiers.doi,
+      "references",
+      BACKGROUND_REFERENCE_LIMIT,
     );
-
-    if (!referenceResponse.ok) {
-      return {
-        status: failureStatusFromHTTP(referenceResponse.status),
-        provider: "opencitations",
-        message: referenceResponse.message,
-      };
-    }
-
-    const referencesResponse = await requestJSON<CitationRow[]>(
-      "opencitations",
-      `${base}/references/${encodedPID}`,
-    );
-
-    const references = referencesResponse.ok
-      ? mapReferences(referencesResponse.data)
-      : [];
-
-    const citationCount = numberOrNull(citationResponse.data?.[0]?.count);
-    const declaredReferenceCount = numberOrNull(
-      referenceResponse.data?.[0]?.count,
-    );
-    const referenceCount =
-      declaredReferenceCount === null
-        ? references.length
-        : Math.max(declaredReferenceCount, references.length);
-
-    if (citationCount === null && referenceCount === null) {
-      return {
-        status: "not-found",
-        provider: "opencitations",
-        message: "OpenCitations returned no record for this identifier.",
-      };
-    }
-
+    const year = Number(metadata.year);
     return {
       status: "success",
       provider: "opencitations",
-      matchedBy: lookup.kind,
-      providerWorkID: lookup.pid,
-      doi: lookup.kind === "doi" ? normalizeDOI(lookup.value) : null,
-      title: stringOrNull(identifiers.title),
-      year: identifiers.year,
-      authors: identifiers.authors,
-      citationCount,
+      matchedBy: "doi",
+      matchConfidence: 1,
+      providerWorkID: identifiers.doi,
+      doi: identifiers.doi,
+      title: stringOrNull(metadata.title),
+      year: Number.isFinite(year) ? year : null,
+      authors: metadata.author
+        ? metadata.author
+            .split(";")
+            .map((author) => author.trim())
+            .filter(Boolean)
+        : [],
+      sourceTitle: stringOrNull(metadata.source_title),
+      abstract: null,
+      citationCount: numberOrNull(metadata.citation_count),
       citationCountProvider: "opencitations",
-      referenceCount,
+      referenceCount:
+        numberOrNull(metadata.reference_count) ?? references.length,
       referenceCountProvider: "opencitations",
       resolvedReferenceCount: references.length,
       references,
+      sourceMetrics: null,
     };
   },
+  fetchCitingWorks: (doi, maximum, offset) =>
+    fetchLinks(doi, "citations", maximum, offset),
+  fetchReferencedWorks: (doi, maximum, offset) =>
+    fetchLinks(doi, "references", maximum, offset),
 };

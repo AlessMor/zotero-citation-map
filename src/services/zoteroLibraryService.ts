@@ -4,37 +4,15 @@ import type {
   LibraryStatistics,
   ZoteroPaper,
 } from "../domain/types";
+import { normalizeDOI } from "./citationIdentifiers";
 import { getItemCitationMetrics } from "./citationMetricsStore";
 
-/** Extract a four-digit publication year from a Zotero date field. */
 function extractYear(value: unknown): number | null {
-  const text = String(value ?? "").trim();
-
-  if (!text) {
-    return null;
-  }
-
-  const match = text.match(/\b(1[5-9]\d{2}|20\d{2}|21\d{2})\b/);
+  const match = String(value ?? "").match(/\b(1[5-9]\d{2}|20\d{2}|21\d{2})\b/);
   return match ? Number(match[0]) : null;
 }
 
-/** Normalize common DOI representations to a lowercase bare DOI. */
-function normalizeDOI(value: unknown): string | null {
-  const text = String(value ?? "")
-    .trim()
-    .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "")
-    .replace(/^doi:\s*/i, "")
-    .trim();
-
-  if (!text) {
-    return null;
-  }
-
-  const match = text.match(/10\.\d{4,9}\/[-._;()/:A-Z0-9]+/i);
-  return match ? match[0].toLowerCase() : null;
-}
-
-function getTitle(item: any): string {
+function title(item: any): string {
   return (
     item.getDisplayTitle?.() ||
     item.getField?.("title") ||
@@ -43,271 +21,232 @@ function getTitle(item: any): string {
   );
 }
 
-function getAuthors(item: any): string[] {
-  const creators = item.getCreators?.() ?? [];
-
-  return creators
-    .map((creator: any) => {
-      if (creator.name) {
-        return String(creator.name).trim();
-      }
-
-      const firstName = String(creator.firstName ?? "").trim();
-      const lastName = String(creator.lastName ?? "").trim();
-
-      return [firstName, lastName].filter(Boolean).join(" ");
-    })
+function authors(item: any): string[] {
+  return (item.getCreators?.() ?? [])
+    .map((creator: any) =>
+      String(
+        creator.name ??
+          [creator.firstName, creator.lastName].filter(Boolean).join(" "),
+      ).trim(),
+    )
     .filter(Boolean);
 }
 
-function getTags(item: any): string[] {
-  const tags = item.getTags?.() ?? [];
-
-  return tags
-    .map((entry: any) => {
-      if (typeof entry === "string") {
-        return entry.trim();
-      }
-
-      return String(entry?.tag ?? "").trim();
-    })
+function tags(item: any): string[] {
+  return (item.getTags?.() ?? [])
+    .map((entry: any) =>
+      String(typeof entry === "string" ? entry : (entry?.tag ?? "")).trim(),
+    )
     .filter(Boolean)
-    .sort((left: string, right: string) => left.localeCompare(right));
+    .sort((a: string, b: string) => a.localeCompare(b));
 }
 
-function getCollectionIDs(item: any): number[] {
-  const collectionIDs = item.getCollections?.() ?? [];
-
-  return collectionIDs
-    .map((collectionID: unknown) => Number(collectionID))
+function collectionIDs(item: any): number[] {
+  return (item.getCollections?.() ?? [])
+    .map((value: unknown) => Number(value))
     .filter(Number.isFinite);
 }
 
 export function calculateItemMetadataCompleteness(item: any): number {
-  const title = String(item.getField?.("title") ?? "").trim();
-  const creators = item.getCreators?.() ?? [];
-  const date = String(item.getField?.("date") ?? "").trim();
-  const venue = String(
-    item.getField?.("publicationTitle") ??
-      item.getField?.("conferenceName") ??
-      item.getField?.("publisher") ??
-      "",
-  ).trim();
-  const abstract = String(item.getField?.("abstractNote") ?? "").trim();
-  const identifiers = [
-    item.getField?.("DOI"),
-    item.getField?.("ISBN"),
-    item.getField?.("ISSN"),
-    item.getField?.("url"),
-  ].some((value) => String(value ?? "").trim().length > 0);
-
   const checks = [
-    title.length > 0,
-    creators.length > 0,
-    extractYear(date) !== null,
-    venue.length > 0,
-    abstract.length > 0,
-    identifiers,
+    String(item.getField?.("title") ?? "").trim().length > 0,
+    (item.getCreators?.() ?? []).length > 0,
+    extractYear(item.getField?.("date")) !== null,
+    String(
+      item.getField?.("publicationTitle") ??
+        item.getField?.("conferenceName") ??
+        item.getField?.("publisher") ??
+        "",
+    ).trim().length > 0,
+    String(item.getField?.("abstractNote") ?? "").trim().length > 0,
+    [
+      item.getField?.("DOI"),
+      item.getField?.("ISBN"),
+      item.getField?.("ISSN"),
+      item.getField?.("url"),
+      item.getField?.("extra"),
+    ].some((value) => String(value ?? "").trim().length > 0),
   ];
-
   return checks.filter(Boolean).length / checks.length;
 }
 
-function convertItemToPaper(item: any): ZoteroPaper {
-  const itemID = Number(item.id);
+function toPaper(item: any): ZoteroPaper {
   const libraryID = Number(item.libraryID);
   const itemKey = String(item.key);
-  const metrics = getItemCitationMetrics(libraryID, itemKey);
-
   return {
-    libraryID,
-    itemID,
+    itemID: Number(item.id),
     itemKey,
-
-    title: getTitle(item),
-    authors: getAuthors(item),
-
+    libraryID,
+    title: title(item),
+    authors: authors(item),
     year: extractYear(item.getField?.("date")),
     doi: normalizeDOI(item.getField?.("DOI")),
-
-    tags: getTags(item),
-    collectionIDs: getCollectionIDs(item),
-
-    dateModified: String(item.dateModified ?? ""),
-
-    citationCount: metrics.citationCount,
-    referenceCount: metrics.referenceCount,
-    metricsUpdatedAt: metrics.updatedAt,
+    abstract: String(item.getField?.("abstractNote") ?? "").trim() || null,
+    sourceTitle:
+      String(
+        item.getField?.("publicationTitle") ??
+          item.getField?.("conferenceName") ??
+          item.getField?.("publisher") ??
+          "",
+      ).trim() || null,
+    tags: tags(item),
+    collectionIDs: collectionIDs(item),
     metadataCompleteness: calculateItemMetadataCompleteness(item),
+    metrics: getItemCitationMetrics(libraryID, itemKey),
   };
 }
 
-function calculateStatistics(papers: ZoteroPaper[]): LibraryStatistics {
+function statistics(papers: ZoteroPaper[]): LibraryStatistics {
   return {
     totalPapers: papers.length,
-
-    withYear: papers.filter((paper) => paper.year !== null).length,
     withoutYear: papers.filter((paper) => paper.year === null).length,
-
-    withDOI: papers.filter((paper) => paper.doi !== null).length,
     withoutDOI: papers.filter((paper) => paper.doi === null).length,
-
-    withCitationData: papers.filter((paper) => paper.citationCount !== null)
-      .length,
-    withoutCitationData: papers.filter((paper) => paper.citationCount === null)
-      .length,
-
-    withReferenceData: papers.filter((paper) => paper.referenceCount !== null)
-      .length,
+    withoutCitationData: papers.filter(
+      (paper) => paper.metrics.citationCount === null,
+    ).length,
     withoutReferenceData: papers.filter(
-      (paper) => paper.referenceCount === null,
+      (paper) => paper.metrics.referenceCount === null,
     ).length,
   };
 }
 
 interface CollectionInfo {
   collectionID: number;
+  key: string;
   name: string;
   parentID: number | null;
+  orderIndex: number;
 }
 
-function getCollectionInfo(collectionID: number): CollectionInfo | null {
+function allCollectionInfo(
+  libraryID: number,
+  papers: ZoteroPaper[],
+): Map<number, CollectionInfo> {
+  const info = new Map<number, CollectionInfo>();
   try {
-    const collection = Zotero.Collections.get(collectionID);
-    if (!collection) {
-      return null;
-    }
-
-    const parentID = Number(
-      Reflect.get(collection as object, "parentID") ??
-        Reflect.get(collection as object, "parentCollectionID") ??
-        0,
-    );
-
-    return {
-      collectionID,
-      name: String(collection.name ?? `Collection ${collectionID}`),
-      parentID: Number.isFinite(parentID) && parentID > 0 ? parentID : null,
-    };
+    const collections =
+      (Zotero.Collections as any).getByLibrary?.(libraryID, true) ?? [];
+    collections.forEach((collection: any, index: number) => {
+      const id = Number(collection.id ?? collection.collectionID);
+      if (!Number.isFinite(id)) return;
+      const parent = Number(
+        collection.parentID ?? collection.parentCollectionID ?? 0,
+      );
+      info.set(id, {
+        collectionID: id,
+        key: String(collection.key ?? id),
+        name: String(collection.name ?? `Collection ${id}`),
+        parentID: Number.isFinite(parent) && parent > 0 ? parent : null,
+        orderIndex: index,
+      });
+    });
   } catch {
-    return null;
+    // Collection enumeration may be unavailable for some library contexts.
   }
+  const pending = new Set(papers.flatMap((paper) => paper.collectionIDs));
+  while (pending.size) {
+    const id = pending.values().next().value as number;
+    pending.delete(id);
+    if (info.has(id)) continue;
+    try {
+      const collection = Zotero.Collections.get(id) as any;
+      if (!collection) continue;
+      const parent = Number(
+        collection.parentID ?? collection.parentCollectionID ?? 0,
+      );
+      info.set(id, {
+        collectionID: id,
+        key: String(collection.key ?? id),
+        name: String(collection.name ?? `Collection ${id}`),
+        parentID: Number.isFinite(parent) && parent > 0 ? parent : null,
+        orderIndex: info.size,
+      });
+      if (parent > 0 && !info.has(parent)) pending.add(parent);
+    } catch {
+      // Ignore inaccessible or deleted collection records.
+    }
+  }
+  return info;
 }
 
-function buildCollectionFilters(
+function collectionFilters(
+  libraryID: number,
   papers: ZoteroPaper[],
 ): LibraryCollectionFilter[] {
-  const collectionInfo = new Map<number, CollectionInfo>();
-  const pending = new Set<number>(
-    papers.flatMap((paper) => paper.collectionIDs),
-  );
-
-  while (pending.size > 0) {
-    const [collectionID] = pending;
-    pending.delete(collectionID);
-
-    if (collectionInfo.has(collectionID)) {
-      continue;
-    }
-
-    const info = getCollectionInfo(collectionID);
-    if (!info) {
-      continue;
-    }
-
-    collectionInfo.set(collectionID, info);
-    if (info.parentID && !collectionInfo.has(info.parentID)) {
-      pending.add(info.parentID);
-    }
-  }
-
+  const info = allCollectionInfo(libraryID, papers);
   const children = new Map<number, number[]>();
-  for (const info of collectionInfo.values()) {
-    if (!info.parentID) {
-      continue;
-    }
-    const childIDs = children.get(info.parentID) ?? [];
-    childIDs.push(info.collectionID);
-    children.set(info.parentID, childIDs);
+  for (const collection of info.values()) {
+    if (!collection.parentID) continue;
+    const list = children.get(collection.parentID) ?? [];
+    list.push(collection.collectionID);
+    children.set(collection.parentID, list);
   }
-
-  const getDescendants = (collectionID: number): number[] => {
-    const result: number[] = [collectionID];
-    const queue = [...(children.get(collectionID) ?? [])];
-    const seen = new Set<number>(result);
-
-    while (queue.length > 0) {
-      const childID = queue.shift();
-      if (!childID || seen.has(childID)) {
-        continue;
-      }
-      seen.add(childID);
-      result.push(childID);
-      queue.push(...(children.get(childID) ?? []));
+  for (const list of children.values()) {
+    list.sort(
+      (a, b) => (info.get(a)?.orderIndex ?? 0) - (info.get(b)?.orderIndex ?? 0),
+    );
+  }
+  const descendants = (id: number): number[] => {
+    const output = [id];
+    const queue = [...(children.get(id) ?? [])];
+    const seen = new Set(output);
+    while (queue.length) {
+      const child = queue.shift()!;
+      if (seen.has(child)) continue;
+      seen.add(child);
+      output.push(child);
+      queue.push(...(children.get(child) ?? []));
     }
-
-    return result;
+    return output;
   };
-
-  const getPath = (collectionID: number): string => {
+  const pathAndDepth = (id: number): { path: string; depth: number } => {
     const parts: string[] = [];
     const seen = new Set<number>();
-    let currentID: number | null = collectionID;
-
-    while (currentID && !seen.has(currentID)) {
-      seen.add(currentID);
-      const info = collectionInfo.get(currentID);
-      if (!info) {
-        break;
-      }
-      parts.unshift(info.name);
-      currentID = info.parentID;
+    let current: number | null = id;
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const entry = info.get(current);
+      if (!entry) break;
+      parts.unshift(entry.name);
+      current = entry.parentID;
     }
-
-    return parts.join(" / ");
+    return { path: parts.join(" / "), depth: Math.max(0, parts.length - 1) };
   };
-
-  return [...collectionInfo.values()]
-    .map((info) => ({
-      collectionID: info.collectionID,
-      name: info.name,
-      path: getPath(info.collectionID),
-      includedCollectionIDs: getDescendants(info.collectionID),
-    }))
-    .sort((left, right) => left.path.localeCompare(right.path));
+  return [...info.values()]
+    .sort((a, b) => a.orderIndex - b.orderIndex)
+    .map((entry) => {
+      const located = pathAndDepth(entry.collectionID);
+      return {
+        collectionID: entry.collectionID,
+        parentCollectionID: entry.parentID,
+        key: entry.key,
+        name: entry.name,
+        path: located.path,
+        depth: located.depth,
+        orderIndex: entry.orderIndex,
+        includedCollectionIDs: descendants(entry.collectionID),
+      };
+    });
 }
 
-function buildTags(papers: ZoteroPaper[]): string[] {
-  return [...new Set(papers.flatMap((paper) => paper.tags))].sort(
-    (left, right) => left.localeCompare(right),
-  );
-}
-
-/** Load every regular bibliographic item in one Zotero library. */
 export async function loadWholeLibrary(
   libraryID: number = Zotero.Libraries.userLibraryID,
 ): Promise<LibrarySnapshot> {
   const items = await Zotero.Items.getAll(libraryID);
-
-  const papers = items
-    .filter((item: any) => {
-      return item && item.isRegularItem?.() && !item.deleted;
-    })
-    .map(convertItemToPaper)
-    .sort((left: ZoteroPaper, right: ZoteroPaper) =>
-      left.title.localeCompare(right.title),
-    );
-
-  const libraryName =
-    Zotero.Libraries.getName?.(libraryID) || `Library ${libraryID}`;
-
+  const papers = (items as Zotero.Item[])
+    .filter((item: any) => item?.isRegularItem?.() && !item.deleted)
+    .map(toPaper)
+    .sort((a, b) => a.title.localeCompare(b.title));
   return {
     libraryID,
-    libraryName,
+    libraryName:
+      Zotero.Libraries.getName?.(libraryID) || `Library ${libraryID}`,
     generatedAt: new Date().toISOString(),
     papers,
-    collections: buildCollectionFilters(papers),
-    tags: buildTags(papers),
-    statistics: calculateStatistics(papers),
+    collections: collectionFilters(libraryID, papers),
+    tags: [...new Set(papers.flatMap((paper) => paper.tags))].sort((a, b) =>
+      a.localeCompare(b),
+    ),
+    statistics: statistics(papers),
   };
 }

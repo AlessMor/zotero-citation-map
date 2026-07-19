@@ -1,93 +1,60 @@
-import type { CitationGraphNode, GraphAxisMetric } from "../domain/graphTypes";
+import type {
+  CitationGraphNode,
+  GraphAxisMetric,
+  MetricID,
+} from "../domain/graphTypes";
+import {
+  axisMetricDefinitions,
+  formatMetricValue,
+  getMetricDefinition,
+  metricTooltip,
+  metricValue,
+} from "./metricRegistry";
 
-export type GraphMetricGroup = "Core" | "Impact";
-
-export interface GraphMetricOption {
-  metric: GraphAxisMetric;
-  label: string;
-  group: GraphMetricGroup;
-}
-
-export const GRAPH_AXIS_OPTIONS: GraphMetricOption[] = [
-  { metric: "none", label: "Force layout", group: "Core" },
-  { metric: "year", label: "Publication year", group: "Core" },
-  { metric: "citations", label: "Global citations", group: "Core" },
-  { metric: "references", label: "References", group: "Core" },
-  { metric: "library-coverage", label: "Library coverage", group: "Impact" },
-  { metric: "citation-velocity", label: "Citation velocity", group: "Impact" },
-  {
-    metric: "citation-acceleration",
-    label: "Citation acceleration",
-    group: "Impact",
-  },
+export const GRAPH_AXIS_OPTIONS = [
+  { metric: "free" as const, label: "Free", group: "Layout" as const },
+  ...axisMetricDefinitions().map((definition) => ({
+    metric: definition.id,
+    label: definition.label,
+    group: definition.group,
+  })),
 ];
 
-const LABELS = new Map(
-  GRAPH_AXIS_OPTIONS.map((option) => [option.metric, option.label]),
-);
-
-const DESCRIPTIONS = new Map<GraphAxisMetric, string>([
-  [
-    "library-coverage",
-    "Library coverage = references linked to items anywhere in this Zotero library / provider-declared reference count.",
-  ],
-  [
-    "citation-velocity",
-    "Citation velocity = [C(Y - 3) + C(Y - 2) + C(Y - 1)] / 3, where Y is the current calendar year and C(y) is citations received in year y.",
-  ],
-  [
-    "citation-acceleration",
-    "Citation acceleration = C(Y - 1) - C(Y - 2), where Y is the current calendar year and C(y) is citations received in year y.",
-  ],
-]);
-
 export function graphMetricLabel(metric: GraphAxisMetric): string {
-  return LABELS.get(metric) ?? metric;
+  return metric === "free" ? "Free" : getMetricDefinition(metric).label;
 }
 
 export function graphMetricDescription(metric: GraphAxisMetric): string | null {
-  return DESCRIPTIONS.get(metric) ?? null;
+  return metric === "free"
+    ? "Leave this dimension unconstrained and position papers using the citation-network force layout."
+    : metricTooltip(metric);
 }
 
 export function graphMetricValue(
   node: CitationGraphNode,
   metric: GraphAxisMetric,
 ): number | null {
-  switch (metric) {
-    case "none":
-      return null;
-    case "year":
-      return node.year;
-    case "citations":
-      return node.citationCount;
-    case "references":
-      return node.referenceCount;
-    case "library-coverage":
-      return node.libraryCoverage;
-    case "citation-velocity":
-      return node.citationVelocity;
-    case "citation-acceleration":
-      return node.citationAcceleration;
-  }
+  if (metric === "free") return null;
+  const value = metricValue(node, metric);
+  return typeof value === "number" ? value : null;
 }
 
 export function graphMetricIsPercentage(metric: GraphAxisMetric): boolean {
-  return metric === "library-coverage";
-}
-
-export function graphMetricIsBoolean(_metric: GraphAxisMetric): boolean {
-  return false;
+  return (
+    metric !== "free" && getMetricDefinition(metric).valueType === "percentage"
+  );
 }
 
 export function graphMetricAllowsNegative(metric: GraphAxisMetric): boolean {
-  return metric === "citation-acceleration";
+  return (
+    metric !== "free" && Boolean(getMetricDefinition(metric).allowsNegative)
+  );
 }
 
 export function graphMetricSupportsLog(metric: GraphAxisMetric): boolean {
   return (
-    metric !== "none" &&
-    metric !== "year" &&
-    !graphMetricIsPercentage(metric) &&
+    metric !== "free" &&
+    getMetricDefinition(metric).graph.logarithmic &&
     !graphMetricAllowsNegative(metric)
   );
 }
@@ -96,19 +63,5 @@ export function formatGraphMetricValue(
   metric: GraphAxisMetric,
   value: number,
 ): string {
-  if (metric === "year") return String(Math.round(value));
-  if (graphMetricIsPercentage(metric)) {
-    return new Intl.NumberFormat(undefined, {
-      style: "percent",
-      maximumFractionDigits: 1,
-    }).format(value);
-  }
-  if (metric === "citation-velocity" || metric === "citation-acceleration") {
-    return new Intl.NumberFormat(undefined, {
-      maximumFractionDigits: 2,
-    }).format(value);
-  }
-  return new Intl.NumberFormat(undefined, {
-    maximumFractionDigits: value >= 100 ? 0 : 1,
-  }).format(value);
+  return metric === "free" ? "" : formatMetricValue(metric as MetricID, value);
 }

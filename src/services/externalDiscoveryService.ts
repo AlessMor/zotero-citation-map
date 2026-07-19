@@ -1,243 +1,212 @@
+import type {
+  CitationProviderID,
+  RelatedWorkMetadata,
+  WorkIdentifiers,
+} from "../domain/citationTypes";
 import type { CitationGraphNode } from "../domain/graphTypes";
-import type { RelatedWorkMetadata } from "../domain/citationTypes";
-import { requestJSON } from "../providers/http";
-import { normalizeDOI } from "./citationIdentifiers";
+import { getCitationProvider } from "../providers/registry";
+import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
 import { getCitationMetricRecord } from "./citationMetricsStore";
 
-export interface ExternalWork {
-  providerWorkID: string;
-  doi: string | null;
-  title: string;
-  year: number | null;
-  authors: string[];
-  citationCount: number | null;
-  referenceCount: number | null;
+function nodeLibraryID(node: CitationGraphNode): number {
+  const item = Zotero.Items.get(node.itemID) as Zotero.Item | null;
+  const libraryID = Number(item?.libraryID);
+  return Number.isFinite(libraryID)
+    ? libraryID
+    : Zotero.Libraries.userLibraryID;
+}
+
+export interface ExternalWork extends RelatedWorkMetadata {
   recommendationScore?: number;
   citingNodeKeys?: string[];
+  inLibraryItemKey?: string | null;
 }
 
-interface OpenAlexWork {
-  id?: string;
-  doi?: string | null;
-  display_name?: string | null;
-  title?: string | null;
-  publication_year?: number | null;
-  cited_by_count?: number | null;
-  referenced_works_count?: number | null;
-  authorships?: Array<{ author?: { display_name?: string | null } }>;
-}
-
-interface OpenAlexListResponse {
-  results?: OpenAlexWork[];
-}
-
-interface RecommendationCandidate {
-  score: number;
-  citingNodeKeys: Set<string>;
-}
-
-const workCache = new Map<string, ExternalWork | null>();
-
-function shortID(value: unknown): string | null {
-  if (typeof value !== "string" || !value.trim()) return null;
-  return value.replace(/^https:\/\/openalex\.org\//i, "");
-}
-
-function toExternalWork(work: OpenAlexWork): ExternalWork | null {
-  const providerWorkID = shortID(work.id);
-  const title = String(work.display_name ?? work.title ?? "").trim();
-  if (!providerWorkID || !title) return null;
+function toExternal(
+  work: RelatedWorkMetadata,
+  localByDOI: Map<string, string>,
+  localByTitle: Map<string, string>,
+): ExternalWork {
+  const doi = normalizeDOI(work.doi);
+  const title = normalizeExactTitle(work.title);
   return {
-    providerWorkID,
-    doi: normalizeDOI(work.doi),
-    title,
-    year:
-      work.publication_year === null || work.publication_year === undefined
-        ? null
-        : Number(work.publication_year),
-    authors: (work.authorships ?? [])
-      .map((entry) => String(entry.author?.display_name ?? "").trim())
-      .filter(Boolean),
-    citationCount:
-      work.cited_by_count === null || work.cited_by_count === undefined
-        ? null
-        : Number(work.cited_by_count),
-    referenceCount:
-      work.referenced_works_count === null ||
-      work.referenced_works_count === undefined
-        ? null
-        : Number(work.referenced_works_count),
+    ...work,
+    inLibraryItemKey:
+      (doi ? localByDOI.get(doi) : null) ??
+      (title ? localByTitle.get(title) : null) ??
+      work.zoteroItemKey ??
+      null,
   };
 }
 
-async function fetchOpenAlexWork(
-  providerWorkID: string,
-): Promise<ExternalWork | null> {
-  const id = shortID(providerWorkID);
-  if (!id) return null;
-  if (workCache.has(id)) return workCache.get(id) ?? null;
-
-  const select = [
-    "id",
-    "doi",
-    "display_name",
-    "publication_year",
-    "cited_by_count",
-    "referenced_works_count",
-    "authorships",
-  ].join(",");
-  const response = await requestJSON<OpenAlexWork>(
-    "openalex",
-    `https://api.openalex.org/works/${encodeURIComponent(id)}?select=${encodeURIComponent(select)}`,
-  );
-  const result =
-    response.ok && response.data ? toExternalWork(response.data) : null;
-  workCache.set(id, result);
-  return result;
+function localIndexes(nodes: CitationGraphNode[]): {
+  byDOI: Map<string, string>;
+  byTitle: Map<string, string>;
+} {
+  const byDOI = new Map<string, string>();
+  const byTitle = new Map<string, string>();
+  for (const node of nodes) {
+    const doi = normalizeDOI(node.doi);
+    const title = normalizeExactTitle(node.title);
+    if (doi && !byDOI.has(doi)) byDOI.set(doi, node.itemKey);
+    if (title && !byTitle.has(title)) byTitle.set(title, node.itemKey);
+  }
+  return { byDOI, byTitle };
 }
 
-function metadataToExternal(
-  reference: RelatedWorkMetadata,
-): ExternalWork | null {
-  const id = shortID(reference.providerWorkID);
-  if (!id || !reference.title) return null;
-  return {
-    providerWorkID: id,
-    doi: normalizeDOI(reference.doi),
-    title: reference.title,
-    year: reference.year,
-    authors: [...reference.authors],
-    citationCount: null,
-    referenceCount: null,
-  };
+async function fetchFromProvider(
+  node: CitationGraphNode,
+  direction: "references" | "cited-by",
+  maximum: number,
+  offset: number,
+): Promise<RelatedWorkMetadata[]> {
+  if (!node.provider || !node.providerWorkID) return [];
+  const provider = getCitationProvider(node.provider);
+  const fetcher =
+    direction === "references"
+      ? provider.fetchReferencedWorks
+      : provider.fetchCitingWorks;
+  if (!fetcher) return [];
+  return fetcher(node.providerWorkID, maximum, offset);
 }
 
 export async function getExternalReferences(
   node: CitationGraphNode,
-  maximum = 60,
+  libraryNodes: CitationGraphNode[],
+  maximum = 100,
+  offset = 0,
 ): Promise<ExternalWork[]> {
-  const record = getCitationMetricRecord(
-    Zotero.Libraries.userLibraryID,
-    node.itemKey,
-  );
-  if (!record) return [];
-
-  const results: ExternalWork[] = [];
-  for (const reference of record.references.slice(0, maximum)) {
-    const embedded = metadataToExternal(reference);
-    const resolved =
-      embedded ??
-      (record.provider === "openalex" && reference.providerWorkID
-        ? await fetchOpenAlexWork(reference.providerWorkID)
-        : null);
-    if (resolved) results.push(resolved);
-  }
-  return results;
+  const indexes = localIndexes(libraryNodes);
+  const record = getCitationMetricRecord(nodeLibraryID(node), node.itemKey);
+  const cached = record?.references.slice(offset, offset + maximum) ?? [];
+  const works =
+    cached.length > 0
+      ? cached
+      : await fetchFromProvider(node, "references", maximum, offset);
+  return works.map((work) => toExternal(work, indexes.byDOI, indexes.byTitle));
 }
 
 export async function getExternalCitedBy(
   node: CitationGraphNode,
-  maximum = 50,
+  libraryNodes: CitationGraphNode[],
+  maximum = 100,
+  offset = 0,
 ): Promise<ExternalWork[]> {
-  if (node.provider !== "openalex") return [];
-  const id = shortID(node.providerWorkID);
-  if (!id) return [];
-  const select = [
-    "id",
-    "doi",
-    "display_name",
-    "publication_year",
-    "cited_by_count",
-    "referenced_works_count",
-    "authorships",
-  ].join(",");
-  const url =
-    `https://api.openalex.org/works?filter=cites:${encodeURIComponent(id)}` +
-    `&sort=cited_by_count:desc&per-page=${Math.min(200, maximum)}` +
-    `&select=${encodeURIComponent(select)}`;
-  const response = await requestJSON<OpenAlexListResponse>("openalex", url);
-  if (!response.ok || !response.data) return [];
-  return (response.data.results ?? [])
-    .map(toExternalWork)
-    .filter((work): work is ExternalWork => Boolean(work));
+  const indexes = localIndexes(libraryNodes);
+  const providers: CitationProviderID[] = [
+    node.provider ?? "semantic-scholar",
+    "semantic-scholar",
+    "openalex",
+  ];
+  for (const providerID of [...new Set(providers)]) {
+    try {
+      const provider = getCitationProvider(providerID);
+      if (!provider.fetchCitingWorks) continue;
+      let providerIDForLookup =
+        providerID === node.provider ? node.providerWorkID : null;
+      if (!providerIDForLookup) {
+        const identifiers: WorkIdentifiers = {
+          doi: normalizeDOI(node.doi),
+          pmid: null,
+          arxiv: null,
+          isbn: null,
+          title: node.title,
+          normalizedTitle: normalizeExactTitle(node.title),
+          year: node.year,
+          authors: node.authors,
+          sourceTitle: node.sourceTitle,
+        };
+        if (!provider.supports(identifiers)) continue;
+        const match = await provider.lookup(identifiers);
+        if (match.status !== "success" || !match.providerWorkID) continue;
+        providerIDForLookup = match.providerWorkID;
+      }
+      const works = await provider.fetchCitingWorks(
+        providerIDForLookup,
+        maximum,
+        offset,
+      );
+      if (works.length > 0) {
+        return works.map((work) =>
+          toExternal(work, indexes.byDOI, indexes.byTitle),
+        );
+      }
+    } catch (error) {
+      Zotero.debug(
+        `Citation Map: ${providerID} cited-by lookup failed: ${String(error)}`,
+      );
+    }
+  }
+  return [];
 }
 
 export async function getMissingPaperRecommendations(
   visibleNodes: CitationGraphNode[],
   libraryNodes: CitationGraphNode[],
-  maximum = 25,
+  maximum = 50,
+  minimumConnections = 2,
 ): Promise<ExternalWork[]> {
-  const libraryOpenAlexIDs = new Set(
-    libraryNodes
-      .filter((node) => node.provider === "openalex")
-      .map((node) => shortID(node.providerWorkID))
-      .filter((id): id is string => Boolean(id)),
-  );
-  const libraryDOIs = new Set(
-    libraryNodes
-      .map((node) => normalizeDOI(node.doi))
-      .filter((doi): doi is string => Boolean(doi)),
-  );
+  const indexes = localIndexes(libraryNodes);
+  const candidates = new Map<
+    string,
+    {
+      work: RelatedWorkMetadata;
+      score: number;
+      citingNodeKeys: Set<string>;
+    }
+  >();
 
-  const candidates = new Map<string, RecommendationCandidate>();
   for (const node of visibleNodes) {
-    const record = getCitationMetricRecord(
-      Zotero.Libraries.userLibraryID,
-      node.itemKey,
-    );
-    if (!record || record.provider !== "openalex") continue;
-
-    const seenForPaper = new Set<string>();
+    const record = getCitationMetricRecord(nodeLibraryID(node), node.itemKey);
+    if (!record) continue;
+    const seen = new Set<string>();
     for (const reference of record.references) {
-      const id = shortID(reference.providerWorkID);
       const doi = normalizeDOI(reference.doi);
+      const title = normalizeExactTitle(reference.title);
       if (
-        !id ||
-        libraryOpenAlexIDs.has(id) ||
-        (doi !== null && libraryDOIs.has(doi)) ||
-        seenForPaper.has(id)
+        (doi && indexes.byDOI.has(doi)) ||
+        (title && indexes.byTitle.has(title))
       ) {
         continue;
       }
-      seenForPaper.add(id);
-      const candidate = candidates.get(id) ?? {
+      const identity =
+        doi ??
+        (reference.providerWorkID
+          ? `${reference.provider}:${reference.providerWorkID}`
+          : title);
+      if (!identity || seen.has(identity)) continue;
+      seen.add(identity);
+      const current = candidates.get(identity) ?? {
+        work: reference,
         score: 0,
         citingNodeKeys: new Set<string>(),
       };
-      candidate.score += 1;
-      candidate.citingNodeKeys.add(node.key);
-      candidates.set(id, candidate);
+      current.score += 1;
+      current.citingNodeKeys.add(node.key);
+      // Prefer the richer record when providers supplied duplicates.
+      if (
+        !current.work.abstract &&
+        (reference.abstract || reference.citationCount != null)
+      ) {
+        current.work = reference;
+      }
+      candidates.set(identity, current);
     }
   }
 
-  const shortlistSize = Math.max(maximum * 2, 40);
-  const shortlist = [...candidates.entries()]
-    .sort(
-      ([leftID, left], [rightID, right]) =>
-        right.score - left.score || leftID.localeCompare(rightID),
-    )
-    .slice(0, shortlistSize);
-
-  const resolved: ExternalWork[] = [];
-  for (const [id, candidate] of shortlist) {
-    const work = await fetchOpenAlexWork(id);
-    if (!work) continue;
-    const doi = normalizeDOI(work.doi);
-    if (doi && libraryDOIs.has(doi)) continue;
-    resolved.push({
-      ...work,
+  return [...candidates.values()]
+    .filter((candidate) => candidate.score >= minimumConnections)
+    .map((candidate) => ({
+      ...toExternal(candidate.work, indexes.byDOI, indexes.byTitle),
       recommendationScore: candidate.score,
       citingNodeKeys: [...candidate.citingNodeKeys],
-    });
-  }
-
-  return resolved
+    }))
     .sort(
       (left, right) =>
         (right.recommendationScore ?? 0) - (left.recommendationScore ?? 0) ||
         (right.citationCount ?? -1) - (left.citationCount ?? -1) ||
         (right.year ?? -1) - (left.year ?? -1) ||
-        left.title.localeCompare(right.title),
+        String(left.title).localeCompare(String(right.title)),
     )
     .slice(0, maximum);
 }
@@ -245,18 +214,80 @@ export async function getMissingPaperRecommendations(
 export async function importExternalWork(
   work: ExternalWork,
   libraryID: number,
-  collectionIDs: number[] = [],
+  collectionIDs: number[],
 ): Promise<Zotero.Item[]> {
-  if (!work.doi) {
-    throw new Error("This work has no DOI available for Zotero import.");
+  if (work.inLibraryItemKey) {
+    const existing = Zotero.Items.getByLibraryAndKey?.(
+      libraryID,
+      work.inLibraryItemKey,
+    );
+    if (existing) {
+      for (const collectionID of collectionIDs) {
+        const collection = Zotero.Collections.get(collectionID);
+        if (collection && !collection.hasItem?.(existing.id)) {
+          collection.addItem(existing.id);
+          await collection.saveTx?.();
+        }
+      }
+      return [existing];
+    }
   }
-  const translate = new (Zotero.Translate as any).Search();
-  translate.setIdentifier({ DOI: work.doi });
-  const translators = await translate.getTranslators();
-  translate.setTranslator(translators);
-  return (await translate.translate({
-    libraryID,
-    collections: collectionIDs.length > 0 ? collectionIDs : false,
-    saveAttachments: true,
-  })) as Zotero.Item[];
+
+  const identifier = work.doi
+    ? { DOI: work.doi }
+    : work.pmid
+      ? { PMID: work.pmid }
+      : work.arxiv
+        ? { arXiv: work.arxiv }
+        : work.isbn
+          ? { ISBN: work.isbn }
+          : null;
+
+  if (identifier) {
+    const translate = new (Zotero.Translate as any).Search();
+    translate.setIdentifier(identifier);
+    const translators = await translate.getTranslators();
+    translate.setTranslator(translators);
+    const items = (await translate.translate({
+      libraryID,
+      collections: collectionIDs.length > 0 ? collectionIDs : false,
+      saveAttachments: true,
+    })) as Zotero.Item[];
+    return items;
+  }
+
+  // Provider metadata can still be imported safely even when no resolvable
+  // identifier is available. This is not used for manual citation relations;
+  // it creates a normal Zotero bibliographic item first.
+  const item = new Zotero.Item("journalArticle");
+  item.libraryID = libraryID;
+  item.setField(
+    "title",
+    work.title?.trim() ||
+      work.doi?.trim() ||
+      work.providerWorkID?.trim() ||
+      "Untitled work",
+  );
+  if (work.year) item.setField("date", String(work.year));
+  if (work.sourceTitle) item.setField("publicationTitle", work.sourceTitle);
+  if (work.abstract) item.setField("abstractNote", work.abstract);
+  if (work.doi) item.setField("DOI", work.doi);
+  if (work.isbn) item.setField("ISBN", work.isbn);
+  for (const [index, creator] of work.authors.entries()) {
+    const parts = creator.trim().split(/\s+/);
+    item.setCreator(index, {
+      creatorType: "author",
+      firstName: parts.slice(0, -1).join(" "),
+      lastName: parts.at(-1) ?? creator,
+    });
+  }
+  const id = await item.saveTx();
+  for (const collectionID of collectionIDs) {
+    const collection = Zotero.Collections.get(collectionID);
+    if (collection) {
+      collection.addItem(id);
+      await collection.saveTx?.();
+    }
+  }
+  return [item];
 }

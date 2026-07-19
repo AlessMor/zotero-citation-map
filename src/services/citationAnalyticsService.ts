@@ -7,6 +7,8 @@ import {
 import {
   getCitationMetricRecords,
   getCitationMetricsRevision,
+  getIgnoredRelations,
+  getManualRelations,
 } from "./citationMetricsStore";
 
 export interface CitationDerivedAnalytics extends NetworkMetricValues {
@@ -19,20 +21,15 @@ export interface CitationDerivedAnalytics extends NetworkMetricValues {
   futureReferenceCount: number | null;
 }
 
-interface CachedLibraryAnalytics {
+interface CacheEntry {
   revision: number;
   values: Map<string, CitationDerivedAnalytics>;
 }
-
-const cache = new Map<number, CachedLibraryAnalytics>();
+const cache = new Map<number, CacheEntry>();
 
 function ratio(numerator: number, denominator: number | null): number | null {
-  if (denominator === null || denominator < 0) {
-    return null;
-  }
-  if (denominator === 0) {
-    return numerator === 0 ? 1 : null;
-  }
+  if (denominator === null || denominator < 0) return null;
+  if (denominator === 0) return numerator === 0 ? 1 : null;
   return numerator / denominator;
 }
 
@@ -40,27 +37,20 @@ function referenceAgeStats(record: CitationMetricRecord): {
   mean: number | null;
   spread: number | null;
 } {
-  if (record.year === null) {
-    return { mean: null, spread: null };
-  }
-
+  if (record.year === null) return { mean: null, spread: null };
   const ages = record.references
     .map((reference) =>
       reference.year === null ? null : record.year! - reference.year,
     )
     .filter((age): age is number => age !== null && Number.isFinite(age));
-
-  if (ages.length === 0) {
-    return { mean: null, spread: null };
-  }
-
+  if (!ages.length) return { mean: null, spread: null };
   const mean = ages.reduce((sum, age) => sum + age, 0) / ages.length;
   const variance =
     ages.reduce((sum, age) => sum + (age - mean) ** 2, 0) / ages.length;
   return { mean, spread: Math.sqrt(variance) };
 }
 
-function normalizedAuthorKeys(authors: string[]): Set<string> {
+function surnameKeys(authors: string[]): Set<string> {
   return new Set(
     authors
       .map((author) =>
@@ -73,56 +63,46 @@ function normalizedAuthorKeys(authors: string[]): Set<string> {
           .split(/\s+/)
           .at(-1),
       )
-      .filter((author): author is string => Boolean(author)),
+      .filter((value): value is string => Boolean(value)),
   );
 }
 
 export function calculateSelfCitationEstimate(
   record: CitationMetricRecord,
 ): number | null {
-  const sourceAuthors = normalizedAuthorKeys(record.authors);
-  if (sourceAuthors.size === 0) {
-    return null;
-  }
-
+  const source = surnameKeys(record.authors);
+  if (!source.size) return null;
   let comparable = 0;
   let shared = 0;
   for (const reference of record.references) {
-    const targetAuthors = normalizedAuthorKeys(reference.authors);
-    if (targetAuthors.size === 0) {
-      continue;
-    }
+    const target = surnameKeys(reference.authors);
+    if (!target.size) continue;
     comparable += 1;
-    if ([...targetAuthors].some((author) => sourceAuthors.has(author))) {
-      shared += 1;
-    }
+    if ([...target].some((author) => source.has(author))) shared += 1;
   }
-
-  return comparable > 0 ? shared / comparable : null;
+  return comparable ? shared / comparable : null;
 }
 
 export function calculateFutureReferenceCount(
   record: CitationMetricRecord,
 ): number | null {
-  if (record.year === null) {
-    return null;
-  }
+  if (record.year === null) return null;
   return record.references.filter(
     (reference) => reference.year !== null && reference.year > record.year!,
   ).length;
 }
 
-function buildLibraryAnalytics(
-  libraryID: number,
-): Map<string, CitationDerivedAnalytics> {
+function build(libraryID: number): Map<string, CitationDerivedAnalytics> {
   const records = getCitationMetricRecords(libraryID);
-  const edges = resolveRecordCitationEdges(records);
-  const network = computeNetworkAnalytics(
-    records.map((record) => record.itemKey),
-    edges,
+  const keys = records.map((record) => record.itemKey);
+  const edges = resolveRecordCitationEdges(
+    records,
+    keys,
+    getManualRelations(libraryID),
+    getIgnoredRelations(libraryID),
   );
+  const network = computeNetworkAnalytics(keys, edges);
   const result = new Map<string, CitationDerivedAnalytics>();
-
   for (const record of records) {
     const metrics = network.get(record.itemKey) ?? {
       incoming: 0,
@@ -135,7 +115,6 @@ function buildLibraryAnalytics(
       isIsolated: true,
     };
     const age = referenceAgeStats(record);
-
     result.set(record.itemKey, {
       ...metrics,
       referenceCoverage: ratio(
@@ -150,7 +129,6 @@ function buildLibraryAnalytics(
       futureReferenceCount: calculateFutureReferenceCount(record),
     });
   }
-
   return result;
 }
 
@@ -159,11 +137,8 @@ export function getLibraryCitationAnalytics(
 ): Map<string, CitationDerivedAnalytics> {
   const revision = getCitationMetricsRevision();
   const existing = cache.get(libraryID);
-  if (existing?.revision === revision) {
-    return existing.values;
-  }
-
-  const values = buildLibraryAnalytics(libraryID);
+  if (existing?.revision === revision) return existing.values;
+  const values = build(libraryID);
   cache.set(libraryID, { revision, values });
   return values;
 }
@@ -173,10 +148,4 @@ export function getItemCitationAnalytics(
   itemKey: string,
 ): CitationDerivedAnalytics | null {
   return getLibraryCitationAnalytics(libraryID).get(itemKey) ?? null;
-}
-
-export function calculateRecordReferenceAgeStats(
-  record: CitationMetricRecord,
-): { mean: number | null; spread: number | null } {
-  return referenceAgeStats(record);
 }

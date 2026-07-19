@@ -1,4 +1,3 @@
-import { config } from "../../package.json";
 import type { LibrarySnapshot } from "../domain/types";
 import {
   destroyCitationMapView,
@@ -8,318 +7,228 @@ import { loadWholeLibrary } from "./zoteroLibraryService";
 
 const TAB_TYPE = "citationmap";
 const TAB_STATE_FILTER_MARKER = "__citationMapStateFilterInstalled";
-const WINDOW_MOUNT_ID = "citation-map-window-mount";
-const LEGACY_GRAPH_URI = `chrome://${config.addonRef}/content/graph.xhtml`;
 const NETWORK_ICON_TYPE = "citation-map-network";
+const CONTEXT_HANDLER_MARKER = "__citationMapContextHandlerInstalled";
+let pendingSelectionItemID: number | null = null;
 
-function getDefaultMainWindow(): _ZoteroTypes.MainWindow {
-  const mainWindow = Zotero.getMainWindows().find(
+function defaultMainWindow(): _ZoteroTypes.MainWindow {
+  const win = Zotero.getMainWindows().find(
     (candidate: any) => candidate?.ZoteroPane,
   );
-
-  if (!mainWindow) {
-    throw new Error("No Zotero main window is available.");
-  }
-
-  return mainWindow;
+  if (!win) throw new Error("No Zotero main window is available.");
+  return win;
 }
 
-function getTabs(mainWindow: _ZoteroTypes.MainWindow): any {
-  const tabs = (mainWindow as any).Zotero_Tabs;
-
-  if (!tabs) {
-    throw new Error("Zotero tabs are unavailable.");
-  }
-
-  return tabs;
+function tabs(win: _ZoteroTypes.MainWindow): any {
+  const value = (win as any).Zotero_Tabs;
+  if (!value) throw new Error("Zotero tabs are unavailable.");
+  return value;
 }
 
-function installTabStateFilter(tabs: any): void {
-  if (tabs[TAB_STATE_FILTER_MARKER]) {
-    return;
+function installTabHooks(win: _ZoteroTypes.MainWindow): void {
+  const manager = tabs(win);
+  if (!manager[TAB_STATE_FILTER_MARKER]) {
+    const originalGetState = manager.getState.bind(manager);
+    manager.getState = (): any[] =>
+      originalGetState().filter((tab: any) => tab.type !== TAB_TYPE);
+    manager[TAB_STATE_FILTER_MARKER] = true;
   }
-
-  const originalGetState = tabs.getState.bind(tabs);
-
-  tabs.getState = (): any[] =>
-    originalGetState().filter((tab: any) => tab.type !== TAB_TYPE);
-
-  tabs[TAB_STATE_FILTER_MARKER] = true;
-}
-
-function focusGraphTab(mainWindow: _ZoteroTypes.MainWindow, tab: any): void {
-  try {
-    const container = getTabs(mainWindow).getTabContent(tab.id);
-    const focusTarget = container?.querySelector(
-      ".cm-search-input",
-    ) as HTMLElement | null;
-
-    focusTarget?.focus();
-  } catch (error) {
-    Zotero.debug(`Citation Map: could not focus graph tab: ${error}`);
-  }
-}
-
-function installTabHooks(mainWindow: _ZoteroTypes.MainWindow): void {
-  const tabs = getTabs(mainWindow);
-  installTabStateFilter(tabs);
-
-  tabs.tabHooks.restoreState ??= {};
-  tabs.tabHooks.getTitle ??= {};
-  tabs.tabHooks.focusFirst ??= {};
-  tabs.tabHooks.refocus ??= {};
-
-  tabs.tabHooks.restoreState[TAB_TYPE] = async () => ({
-    itemID: null,
-  });
-
-  tabs.tabHooks.getTitle[TAB_TYPE] = async () => "Citation Map";
-
-  tabs.tabHooks.focusFirst[TAB_TYPE] = async (tab: any) => {
-    focusGraphTab(mainWindow, tab);
+  manager.tabHooks.restoreState ??= {};
+  manager.tabHooks.getTitle ??= {};
+  manager.tabHooks.focusFirst ??= {};
+  manager.tabHooks.refocus ??= {};
+  manager.tabHooks.restoreState[TAB_TYPE] = async () => ({ itemID: null });
+  manager.tabHooks.getTitle[TAB_TYPE] = async () => "Citation Map";
+  const focus = async (tab: any): Promise<void> => {
+    const container = manager.getTabContent(tab.id);
+    (container?.querySelector(".cm-search") as HTMLElement | null)?.focus();
   };
-
-  tabs.tabHooks.refocus[TAB_TYPE] = async (tab: any) => {
-    focusGraphTab(mainWindow, tab);
-  };
+  manager.tabHooks.focusFirst[TAB_TYPE] = focus;
+  manager.tabHooks.refocus[TAB_TYPE] = focus;
 }
 
-async function selectPaperInZotero(
-  mainWindow: _ZoteroTypes.MainWindow,
+async function selectPaper(
+  win: _ZoteroTypes.MainWindow,
   itemID: number,
 ): Promise<void> {
-  getTabs(mainWindow).select("zotero-pane");
-  await mainWindow.ZoteroPane.selectItem(itemID);
-  mainWindow.focus();
+  tabs(win).select("zotero-pane");
+  await win.ZoteroPane.selectItem(itemID);
+  win.focus();
 }
 
-function prepareTabContainer(container: any): void {
+function hideGlobalContextPane(
+  win: _ZoteroTypes.MainWindow,
+  container: HTMLElement,
+): void {
+  const controller = (win as any).ZoteroContextPane;
+  const contextPane = win.document.getElementById("zotero-context-pane");
+  controller?.splitter?.setAttribute?.("hidden", "true");
+  contextPane?.setAttribute("collapsed", "true");
+  if (controller?.sidenav) controller.sidenav.hidden = true;
+
+  const tabContent = container as HTMLElement & {
+    setBottomPlaceholderHeight?: (height: number) => void;
+    setContextPaneOpen?: (open: boolean) => void;
+  };
+  tabContent.setBottomPlaceholderHeight?.(0);
+  tabContent.setContextPaneOpen?.(false);
+}
+
+function prepareContainer(
+  win: _ZoteroTypes.MainWindow,
+  container: HTMLElement,
+): void {
   container.setAttribute("flex", "1");
-  container.style.width = "100%";
-  container.style.height = "100%";
-  container.style.overflow = "hidden";
+  Object.assign(container.style, {
+    display: "flex",
+    flex: "1 1 0",
+    flexDirection: "column",
+    alignItems: "stretch",
+    width: "100%",
+    minWidth: "0",
+    minHeight: "0",
+    overflow: "hidden",
+  });
+
+  const marked = container as HTMLElement & Record<string, unknown>;
+  if (!marked[CONTEXT_HANDLER_MARKER]) {
+    container.addEventListener("tab-selection-change", (event: Event) => {
+      const selected = Boolean(
+        (event as CustomEvent<{ selected?: boolean }>).detail?.selected,
+      );
+      if (selected) hideGlobalContextPane(win, container);
+    });
+    marked[CONTEXT_HANDLER_MARKER] = true;
+  }
+
+  if (tabs(win).selectedID === container.id) {
+    hideGlobalContextPane(win, container);
+  }
 }
 
 function renderTab(
-  mainWindow: _ZoteroTypes.MainWindow,
-  container: any,
+  win: _ZoteroTypes.MainWindow,
+  container: HTMLElement,
   snapshot: LibrarySnapshot,
 ): void {
-  prepareTabContainer(container);
-
-  let remainingAttempts = 10;
+  prepareContainer(win, container);
+  let attempts = 10;
   const render = (): void => {
-    if (mainWindow.closed) {
+    if (win.closed) return;
+    if (!container.isConnected && attempts > 0) {
+      attempts -= 1;
+      win.setTimeout(() => win.requestAnimationFrame(render), 50);
       return;
     }
-
-    if (!container?.isConnected && remainingAttempts > 0) {
-      remainingAttempts -= 1;
-      mainWindow.setTimeout(() => mainWindow.requestAnimationFrame(render), 50);
-      return;
-    }
-
-    renderCitationMapView(mainWindow.document, container, snapshot, {
+    const initialItemID = pendingSelectionItemID;
+    pendingSelectionItemID = null;
+    renderCitationMapView(win.document, container, snapshot, {
       mode: "tab",
-      onSelectPaper: (itemID) => selectPaperInZotero(mainWindow, itemID),
+      onSelectPaper: (itemID) => selectPaper(win, itemID),
+      initialItemID,
     });
   };
-
-  mainWindow.requestAnimationFrame(render);
+  win.requestAnimationFrame(render);
 }
 
-function findExistingGraphTab(tabs: any): any | null {
+function existingGraphTab(manager: any): any | null {
   if (addon.data.graphTabID) {
     try {
-      const tabInfo = tabs.getTabInfo(addon.data.graphTabID);
-
-      if (tabInfo) {
-        return tabInfo;
-      }
+      const info = manager.getTabInfo(addon.data.graphTabID);
+      if (info) return info;
     } catch {
       addon.data.graphTabID = null;
     }
   }
-
-  const existingTab = tabs._tabs?.find((tab: any) => tab.type === TAB_TYPE);
-
-  if (existingTab) {
-    addon.data.graphTabID = existingTab.id;
-    return existingTab;
-  }
-
-  return null;
+  const existing = manager._tabs?.find((tab: any) => tab.type === TAB_TYPE);
+  if (existing) addon.data.graphTabID = existing.id;
+  return existing ?? null;
 }
 
-/** Open Citation Map inside Zotero's main tab bar. */
 export async function openCitationMapWindow(
   hostWindow?: _ZoteroTypes.MainWindow,
 ): Promise<void> {
-  const mainWindow = hostWindow ?? getDefaultMainWindow();
-  installTabHooks(mainWindow);
-
+  const win = hostWindow ?? defaultMainWindow();
+  installTabHooks(win);
   const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
-
-  const tabs = getTabs(mainWindow);
-  const existingTab = findExistingGraphTab(tabs);
-
-  if (existingTab) {
-    const container = tabs.getTabContent(existingTab.id);
-    renderTab(mainWindow, container, snapshot);
-    tabs.select(existingTab.id);
-    return;
-  }
-
-  // Zotero's current tab-list UI assumes that every non-library tab has an
-  // itemID. A real regular item is used only to satisfy that UI assumption.
-  const representativeItemID = snapshot.papers[0]?.itemID;
-
-  if (!representativeItemID) {
+  if (!snapshot.papers.length) {
     throw new Error("Citation Map requires at least one regular Zotero item.");
   }
-
-  const tabResult = tabs.add({
+  const manager = tabs(win);
+  const existing = existingGraphTab(manager);
+  if (existing) {
+    renderTab(win, manager.getTabContent(existing.id), snapshot);
+    manager.select(existing.id);
+    return;
+  }
+  const result = manager.add({
     type: TAB_TYPE,
     title: "Citation Map",
     data: {
-      itemID: representativeItemID,
+      itemID: snapshot.papers[0].itemID,
       libraryID: snapshot.libraryID,
       citationMap: true,
       icon: NETWORK_ICON_TYPE,
     },
     select: true,
     onClose: () => {
-      destroyCitationMapView(tabResult.container);
-      if (addon.data.graphTabID === tabResult.id) {
-        addon.data.graphTabID = null;
-      }
+      destroyCitationMapView(result.container);
+      if (addon.data.graphTabID === result.id) addon.data.graphTabID = null;
     },
   });
-
-  addon.data.graphTabID = tabResult.id;
-  renderTab(mainWindow, tabResult.container, snapshot);
+  addon.data.graphTabID = result.id;
+  renderTab(win, result.container, snapshot);
 }
 
-export async function detachCitationMapTab(
-  _requestedTabID?: string,
-  _hostWindow?: _ZoteroTypes.MainWindow,
+export async function openCitationMapAndSelectItem(
+  itemID: number,
 ): Promise<void> {
-  Zotero.debug(
-    "Citation Map: detached windows are disabled to guarantee clean Zotero shutdown.",
-  );
+  pendingSelectionItemID = itemID;
+  await openCitationMapWindow();
 }
 
 export async function refreshOpenCitationMapViews(): Promise<void> {
-  if (!addon.data.graphTabID) return;
-
+  const tabID = addon.data.graphTabID;
+  if (!tabID) return;
   const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
-  for (const mainWindow of Zotero.getMainWindows()) {
+  for (const win of Zotero.getMainWindows()) {
     try {
-      const tabs = getTabs(mainWindow);
-      const tabInfo = tabs.getTabInfo(addon.data.graphTabID);
-      if (!tabInfo) continue;
-      const container = tabs.getTabContent(addon.data.graphTabID);
-      renderTab(mainWindow, container, snapshot);
-      break;
-    } catch {
-      // Try the next Zotero main window.
-    }
-  }
-}
-
-function closeEnumeratedPluginWindows(): void {
-  try {
-    const services = (globalThis as any).Services;
-    const enumerator = services?.wm?.getEnumerator?.(null);
-    if (!enumerator) {
+      const manager = tabs(win);
+      if (!manager.getTabInfo(tabID)) continue;
+      renderTab(win, manager.getTabContent(tabID), snapshot);
       return;
+    } catch {
+      // Try the next window.
     }
-
-    const windows: Window[] = [];
-    while (enumerator.hasMoreElements()) {
-      windows.push(enumerator.getNext() as Window);
-    }
-
-    for (const candidate of windows) {
-      try {
-        if (!candidate || candidate.closed) {
-          continue;
-        }
-        const document = candidate.document;
-        const root = document?.documentElement;
-        const windowType = root?.getAttribute?.("windowtype") ?? "";
-        const documentURI = String(document?.documentURI ?? "");
-        const isCitationMapWindow =
-          windowType === "citationmap:window" ||
-          documentURI.startsWith(LEGACY_GRAPH_URI) ||
-          Boolean(document?.getElementById?.(WINDOW_MOUNT_ID));
-
-        // Never close a window based on its title alone. In particular, do not
-        // touch Zotero's own hidden or auxiliary application windows.
-        if (isCitationMapWindow) {
-          candidate.close();
-        }
-      } catch {
-        // A window may already be in the middle of native teardown.
-      }
-    }
-  } catch (error) {
-    Zotero.debug(`Citation Map: top-level window sweep failed: ${error}`);
   }
 }
 
 export function closeCitationMapWindow(closeTab = true): void {
-  if (addon.data.graphWindow && !addon.data.graphWindow.closed) {
-    addon.data.graphWindow.close();
-  }
-
-  addon.data.graphWindow = null;
-  closeEnumeratedPluginWindows();
-
   const tabID = addon.data.graphTabID;
-
+  if (!tabID) return;
   if (!closeTab) {
-    // The main Zotero window is already closing. Destroy the graph renderer and
-    // its observers, but do not call Zotero_Tabs.close() during native teardown.
-    if (tabID) {
-      for (const mainWindow of Zotero.getMainWindows()) {
-        try {
-          const container = getTabs(mainWindow).getTabContent(tabID);
-          if (container) {
-            destroyCitationMapView(container);
-          }
-        } catch {
-          // The main window or tab content may already be unloading.
-        }
+    for (const win of Zotero.getMainWindows()) {
+      try {
+        const container = tabs(win).getTabContent(tabID);
+        if (container) destroyCitationMapView(container);
+      } catch {
+        // Window may be unloading.
       }
     }
     addon.data.graphTabID = null;
-    closeEnumeratedPluginWindows();
     return;
   }
-
-  if (!tabID) {
-    closeEnumeratedPluginWindows();
-    return;
-  }
-
-  for (const mainWindow of Zotero.getMainWindows()) {
+  for (const win of Zotero.getMainWindows()) {
     try {
-      const tabs = getTabs(mainWindow);
-      const tabInfo = tabs.getTabInfo(tabID);
-
-      if (tabInfo) {
-        tabs.close(tabID);
-      }
+      const manager = tabs(win);
+      if (manager.getTabInfo(tabID)) manager.close(tabID);
     } catch {
-      // The tab may already have been closed.
+      // Tab may already be closed.
     }
   }
-
   addon.data.graphTabID = null;
-  closeEnumeratedPluginWindows();
 }
 
 export function getDefaultHostWindow(): _ZoteroTypes.MainWindow {
-  return getDefaultMainWindow();
+  return defaultMainWindow();
 }

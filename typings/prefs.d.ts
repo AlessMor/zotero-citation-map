@@ -9,9 +9,16 @@ declare namespace _ZoteroTypes {
     PluginPrefsMap: {
       "provider": string;
       "automaticUpdates": boolean;
+      "updateNewItems": boolean;
       "cacheDays": number;
-      "nodeSizeMetric": string;
-      "nodeLabelMode": string;
+      "exactTitleFallback": boolean;
+      "localRelations": boolean;
+      "noteExtraction": boolean;
+      "pdfExtraction": boolean;
+      "debugLogging": boolean;
+      "detailPanelWidth": number;
+      "detailPanelCollapsed": boolean;
+      "graphAppearance": string;
     };
   }
 }

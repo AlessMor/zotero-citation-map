@@ -6,12 +6,21 @@ export { initLocale, getString, getLocaleID };
 /**
  * Initialize locale data
  */
-function initLocale() {
-  const l10n = new (
+function initLocale(): void {
+  const LocalizationConstructor =
     typeof Localization === "undefined"
-      ? ztoolkit.getGlobal("Localization")
-      : Localization
-  )([`${config.addonRef}-addon.ftl`], true);
+      ? (globalThis as any).Localization
+      : Localization;
+
+  if (!LocalizationConstructor) {
+    throw new Error("Zotero Localization API is unavailable.");
+  }
+
+  const l10n = new LocalizationConstructor(
+    [`${config.addonRef}-addon.ftl`],
+    true,
+  );
+
   addon.data.locale = {
     current: l10n,
   };

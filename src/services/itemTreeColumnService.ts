@@ -1,46 +1,72 @@
 import { config } from "../../package.json";
-import type { CitationMetricSummary } from "../domain/citationTypes";
-import type { GraphAxisMetric } from "../domain/graphTypes";
-import type { CitationDerivedAnalytics } from "./citationAnalyticsService";
-import { getItemCitationAnalytics } from "./citationAnalyticsService";
-import { getItemCitationMetrics } from "./citationMetricsStore";
-import { graphMetricDescription } from "./graphMetricDefinitions";
+import type { CitationGraphNode } from "../domain/graphTypes";
+import {
+  formatMetricValue,
+  METRIC_DEFINITIONS,
+  type MetricDefinition,
+} from "./metricRegistry";
+import { createMetricNodeForItem } from "./itemMetricContext";
 
 const registeredDataKeys: string[] = [];
+const columnDescriptionsByDataKey = new Map<string, string>();
+const tooltipHandlersByWindow = new Map<Window, EventListener>();
 const VALUE_SEPARATOR = "\u001f";
-
-type ColumnKind = "integer" | "decimal" | "percentage";
-type ColumnValue = number | null;
-
-interface ColumnContext {
-  metrics: CitationMetricSummary;
-  analytics: CitationDerivedAnalytics | null;
-}
-
-interface ColumnSpec {
-  dataKey: string;
-  label: string;
-  width: number;
-  kind: ColumnKind;
-  decimals?: number;
-  value: (context: ColumnContext) => ColumnValue;
-  metric?: GraphAxisMetric;
-  primary?: boolean;
-}
 
 interface EncodedCell {
   display: string;
   title: string;
+  className?: string;
 }
 
-function getContext(item: Zotero.Item): ColumnContext | null {
-  if (!item?.isRegularItem?.()) return null;
-  const libraryID = Number(item.libraryID);
-  const itemKey = String(item.key);
-  return {
-    metrics: getItemCitationMetrics(libraryID, itemKey),
-    analytics: getItemCitationAnalytics(libraryID, itemKey),
-  };
+interface SupplementaryColumn {
+  dataKey: string;
+  label: string;
+  description: string;
+  width: number;
+  value: (node: CitationGraphNode) => string | number | boolean | null;
+  format: (value: string | number | boolean) => string;
+}
+
+const SUPPLEMENTARY_COLUMNS: SupplementaryColumn[] = [
+  {
+    dataKey: "openAccessStatus",
+    label: "Open Access",
+    description:
+      "Whether the active scholarly-data provider reports that this work is openly accessible.",
+    width: 104,
+    value: (node) => node.isOpenAccess,
+    format: (value) => (value ? "Yes" : "No"),
+  },
+  {
+    dataKey: "retractionStatus",
+    label: "Retracted",
+    description:
+      "Whether a trusted provider reports that this work has been retracted. Verify critical cases with the publisher.",
+    width: 92,
+    value: (node) => node.isRetracted,
+    format: (value) => (value ? "Yes" : "No"),
+  },
+  {
+    dataKey: "citationProvider",
+    label: "Citation provider",
+    description:
+      "The provider supplying the canonical work identity and citation relationships for this item.",
+    width: 126,
+    value: (node) => node.provider,
+    format: (value) => String(value),
+  },
+];
+
+function escapeAttribute(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function columnLabel(label: string, description: string): string {
+  return `<span title="${escapeAttribute(description)}">${escapeAttribute(label)} <span aria-hidden="true">ⓘ</span></span>`;
 }
 
 function floatSortKey(value: number): string {
@@ -48,35 +74,23 @@ function floatSortKey(value: number): string {
   const view = new DataView(buffer);
   view.setFloat64(0, value, false);
   let bits = view.getBigUint64(0, false);
-  const signBit = 1n << 63n;
-  bits = bits & signBit ? ~bits & ((1n << 64n) - 1n) : bits ^ signBit;
+  const sign = 1n << 63n;
+  bits = bits & sign ? ~bits & ((1n << 64n) - 1n) : bits ^ sign;
   return bits.toString(16).padStart(16, "0");
 }
 
-function formatValue(value: number, kind: ColumnKind, decimals = 2): string {
-  if (kind === "percentage") {
-    return new Intl.NumberFormat(undefined, {
-      style: "percent",
-      maximumFractionDigits: decimals,
-    }).format(value);
-  }
-  return new Intl.NumberFormat(undefined, {
-    maximumFractionDigits: kind === "integer" ? 0 : decimals,
-  }).format(value);
+function stringSortKey(value: string): string {
+  return value.toLocaleLowerCase().padEnd(64, " ").slice(0, 64);
 }
 
-function encodeCell(spec: ColumnSpec, item: Zotero.Item): string {
-  const context = getContext(item);
-  if (!context) return "";
-  const value = spec.value(context);
-  if (value === null || !Number.isFinite(value)) return "";
-  const display = formatValue(value, spec.kind, spec.decimals);
-  const description = spec.metric ? graphMetricDescription(spec.metric) : null;
-  const encoded: EncodedCell = {
-    display,
-    title: description ? `${description}\nValue: ${display}` : display,
-  };
-  return `${floatSortKey(value)}${VALUE_SEPARATOR}${JSON.stringify(encoded)}`;
+function encodeCell(
+  sortKey: string,
+  display: string,
+  title: string,
+  className?: string,
+): string {
+  const payload: EncodedCell = { display, title, className };
+  return `${sortKey}${VALUE_SEPARATOR}${JSON.stringify(payload)}`;
 }
 
 function decodeCell(data: string): EncodedCell | null {
@@ -103,111 +117,168 @@ function renderCell(
   if (decoded) {
     span.textContent = decoded.display;
     span.title = decoded.title;
+    if (decoded.className) span.classList.add(decoded.className);
   }
   return span;
 }
 
-function escapeHTMLAttribute(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+function metricData(spec: MetricDefinition, item: Zotero.Item): string {
+  if (!item?.isRegularItem?.()) return "";
+  const node = createMetricNodeForItem(item);
+  const raw = spec.value(node);
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return "";
+  const display = formatMetricValue(spec.id, raw);
+  const title = [spec.description, spec.interpretation, `Value: ${display}`]
+    .filter(Boolean)
+    .join("\n");
+  return encodeCell(floatSortKey(raw), display, title);
 }
 
-function columnHTMLLabel(spec: ColumnSpec): string | undefined {
-  const description = spec.metric ? graphMetricDescription(spec.metric) : null;
-  if (!description) return undefined;
-  return `<span title="${escapeHTMLAttribute(description)}">${spec.label} <span aria-hidden="true">ⓘ</span></span>`;
+function supplementaryData(
+  spec: SupplementaryColumn,
+  item: Zotero.Item,
+): string {
+  if (!item?.isRegularItem?.()) return "";
+  const value = spec.value(createMetricNodeForItem(item));
+  if (value === null || value === undefined || value === "") return "";
+  const display = spec.format(value);
+  const sortKey =
+    typeof value === "number"
+      ? floatSortKey(value)
+      : typeof value === "boolean"
+        ? floatSortKey(value ? 1 : 0)
+        : stringSortKey(String(value));
+  const className =
+    spec.dataKey === "retractionStatus" && value === true
+      ? "citation-map-column-warning"
+      : undefined;
+  return encodeCell(
+    sortKey,
+    display,
+    `${spec.description}\nValue: ${display}`,
+    className,
+  );
 }
 
-const COLUMN_SPECS: ColumnSpec[] = [
-  {
-    dataKey: "citationCount",
-    label: "Citations",
-    width: 88,
-    kind: "integer",
-    primary: true,
-    value: ({ metrics }) => metrics.citationCount,
-  },
-  {
-    dataKey: "referenceCount",
-    label: "References",
-    width: 92,
-    kind: "integer",
-    primary: true,
-    value: ({ metrics }) => metrics.referenceCount,
-  },
-  {
-    dataKey: "libraryCoverage",
-    label: "Library Coverage",
-    width: 124,
-    kind: "percentage",
-    decimals: 1,
-    metric: "library-coverage",
-    value: ({ analytics }) => analytics?.libraryCoverage ?? null,
-  },
-  {
-    dataKey: "citationVelocity",
-    label: "Citation Velocity",
-    width: 128,
-    kind: "decimal",
-    decimals: 2,
-    metric: "citation-velocity",
-    value: ({ metrics }) => metrics.citationVelocity,
-  },
-  {
-    dataKey: "citationAcceleration",
-    label: "Citation Acceleration",
-    width: 142,
-    kind: "decimal",
-    decimals: 2,
-    metric: "citation-acceleration",
-    value: ({ metrics }) => metrics.citationAcceleration,
-  },
-];
+async function registerMetricColumn(spec: MetricDefinition): Promise<void> {
+  if (!spec.column) return;
+  const dataKey = await (Zotero.ItemTreeManager.registerColumn as any)({
+    dataKey: spec.id,
+    label: spec.label,
+    htmlLabel: columnLabel(spec.label, spec.description),
+    pluginID: config.addonID,
+    enabledTreeIDs: ["main"],
+    width: String(spec.column.width),
+    minWidth: Math.min(spec.column.width, 64),
+    flex: 0,
+    sortReverse: true,
+    showInColumnPicker: true,
+    columnPickerSubMenu: !spec.column.primary,
+    zoteroPersist: ["width", "ordinal", "hidden", "sortDirection"],
+    dataProvider: (item: Zotero.Item) => metricData(spec, item),
+    renderCell: (
+      _index: number,
+      data: string,
+      column: { className: string },
+      _isFirstColumn: boolean,
+      document: Document,
+    ) => renderCell(data, column, document),
+  });
+  if (typeof dataKey === "string") {
+    registeredDataKeys.push(dataKey);
+    columnDescriptionsByDataKey.set(dataKey, spec.description);
+  }
+}
+
+async function registerSupplementaryColumn(
+  spec: SupplementaryColumn,
+): Promise<void> {
+  const dataKey = await (Zotero.ItemTreeManager.registerColumn as any)({
+    dataKey: spec.dataKey,
+    label: spec.label,
+    htmlLabel: columnLabel(spec.label, spec.description),
+    pluginID: config.addonID,
+    enabledTreeIDs: ["main"],
+    width: String(spec.width),
+    minWidth: Math.min(spec.width, 64),
+    flex: 0,
+    sortReverse: true,
+    showInColumnPicker: true,
+    columnPickerSubMenu: true,
+    zoteroPersist: ["width", "ordinal", "hidden", "sortDirection"],
+    dataProvider: (item: Zotero.Item) => supplementaryData(spec, item),
+    renderCell: (
+      _index: number,
+      data: string,
+      column: { className: string },
+      _isFirstColumn: boolean,
+      document: Document,
+    ) => renderCell(data, column, document),
+  });
+  if (typeof dataKey === "string") {
+    registeredDataKeys.push(dataKey);
+    columnDescriptionsByDataKey.set(dataKey, spec.description);
+  }
+}
+
+export function installCitationColumnTooltips(
+  win: _ZoteroTypes.MainWindow,
+): void {
+  if (tooltipHandlersByWindow.has(win)) return;
+  const handler: EventListener = (event) => {
+    const target = event.target as Element | null;
+    const cell = target?.closest?.(".virtualized-table-header .cell");
+    if (!cell) return;
+    for (const [dataKey, description] of columnDescriptionsByDataKey) {
+      if (!cell.classList.contains(dataKey)) continue;
+      cell.setAttribute("title", description);
+      cell.querySelector(".label")?.setAttribute("title", description);
+      event.stopImmediatePropagation();
+      return;
+    }
+  };
+  win.document.addEventListener("mouseover", handler, true);
+  tooltipHandlersByWindow.set(win, handler);
+}
+
+export function uninstallCitationColumnTooltips(
+  win: _ZoteroTypes.MainWindow,
+): void {
+  const handler = tooltipHandlersByWindow.get(win);
+  if (!handler) return;
+  win.document.removeEventListener("mouseover", handler, true);
+  tooltipHandlersByWindow.delete(win);
+}
 
 export async function registerCitationColumns(): Promise<void> {
   if (registeredDataKeys.length > 0) return;
-  for (const spec of COLUMN_SPECS) {
-    const dataKey = await Zotero.ItemTreeManager.registerColumn({
-      dataKey: spec.dataKey,
-      label: spec.label,
-      htmlLabel: columnHTMLLabel(spec),
-      pluginID: config.addonID,
-      enabledTreeIDs: ["main"],
-      width: String(spec.width),
-      minWidth: Math.min(spec.width, 64),
-      flex: 0,
-      sortReverse: true,
-      showInColumnPicker: true,
-      columnPickerSubMenu: !spec.primary,
-      zoteroPersist: ["width", "ordinal", "hidden", "sortDirection"],
-      dataProvider: (item: Zotero.Item) => encodeCell(spec, item),
-      renderCell: (
-        _index: number,
-        data: string,
-        column: { className: string },
-        _isFirstColumn: boolean,
-        document: Document,
-      ) => renderCell(data, column, document),
-    });
-    if (typeof dataKey === "string") registeredDataKeys.push(dataKey);
+  for (const spec of METRIC_DEFINITIONS) await registerMetricColumn(spec);
+  for (const spec of SUPPLEMENTARY_COLUMNS) {
+    await registerSupplementaryColumn(spec);
   }
-  Zotero.ItemTreeManager.refreshColumns();
+  refreshCitationColumns();
 }
 
 export function refreshCitationColumns(): void {
-  Zotero.ItemTreeManager.refreshColumns();
+  try {
+    Zotero.ItemTreeManager.refreshColumns();
+  } catch (error) {
+    Zotero.debug(`Citation Map: could not refresh columns: ${String(error)}`);
+  }
 }
 
 export function unregisterCitationColumns(): void {
+  for (const [win, handler] of tooltipHandlersByWindow) {
+    win.document.removeEventListener("mouseover", handler, true);
+  }
+  tooltipHandlersByWindow.clear();
+  columnDescriptionsByDataKey.clear();
   for (const dataKey of registeredDataKeys.splice(0)) {
     try {
       Zotero.ItemTreeManager.unregisterColumn(dataKey);
     } catch (error) {
       Zotero.debug(
-        `Citation Map: failed to unregister column ${dataKey}: ${error}`,
+        `Citation Map: failed to unregister column ${dataKey}: ${String(error)}`,
       );
     }
   }

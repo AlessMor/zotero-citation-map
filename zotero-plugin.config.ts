@@ -12,7 +12,6 @@ export default defineConfig({
   }`,
   xpiDownloadLink:
     "https://github.com/{{owner}}/{{repo}}/releases/download/v{{version}}/{{xpiName}}.xpi",
-
   build: {
     assets: ["addon/**/*.*"],
     define: {
@@ -23,15 +22,11 @@ export default defineConfig({
       buildVersion: pkg.version,
       buildTime: "{{buildTime}}",
     },
-    prefs: {
-      prefix: pkg.config.prefsPrefix,
-    },
+    prefs: { prefix: pkg.config.prefsPrefix },
     esbuildOptions: [
       {
         entryPoints: ["src/index.ts"],
-        define: {
-          __env__: `"${process.env.NODE_ENV}"`,
-        },
+        define: { __env__: `"${process.env.NODE_ENV}"` },
         bundle: true,
         target: "firefox140",
         sourcemap: process.env.NODE_ENV !== "production",
@@ -39,7 +34,6 @@ export default defineConfig({
       },
     ],
   },
-
   test: {
     waitForPlugin: `() => Zotero.${pkg.config.addonInstance}.data.initialized`,
   },

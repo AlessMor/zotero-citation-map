@@ -1,10 +1,3 @@
-/**
- * Most of this code is from Zotero team's official Make It Red example[1]
- * or the Zotero 7 documentation[2].
- * [1] https://github.com/zotero/make-it-red
- * [2] https://www.zotero.org/support/dev/zotero_7_for_developers
- */
-
 var chromeHandle;
 
 function install(data, reason) {}
@@ -17,16 +10,8 @@ async function startup({ id, version, resourceURI, rootURI }, reason) {
   chromeHandle = aomStartup.registerChrome(manifestURI, [
     ["content", "__addonRef__", rootURI + "content/"],
   ]);
-
-  /**
-   * Global variables for plugin code.
-   * The `_globalThis` is the global root variable of the plugin sandbox environment
-   * and all child variables assigned to it is globally accessible.
-   * See `src/index.ts` for details.
-   */
   const ctx = { rootURI };
   ctx._globalThis = ctx;
-
   Services.scriptloader.loadSubScript(
     `${rootURI}/content/scripts/__addonRef__.js`,
     ctx,
@@ -43,12 +28,8 @@ async function onMainWindowUnload({ window }, reason) {
 }
 
 async function shutdown({ id, version, resourceURI, rootURI }, reason) {
-  if (reason === APP_SHUTDOWN) {
-    return;
-  }
-
+  if (reason === APP_SHUTDOWN) return;
   await Zotero.__addonInstance__?.hooks.onShutdown();
-
   if (chromeHandle) {
     chromeHandle.destruct();
     chromeHandle = null;
