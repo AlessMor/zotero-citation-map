@@ -16,8 +16,6 @@ import {
 interface Position {
   x: number;
   y: number;
-  vx: number;
-  vy: number;
 }
 
 export interface GhostPreview {
@@ -37,6 +35,7 @@ export interface CitationGraphRendererOptions {
   collectionLabelsByNodeKey: Map<string, string[]>;
   onSelectionChange: (node: CitationGraphNode | null) => void;
   onOpenNode: (node: CitationGraphNode) => void;
+  onBackgroundInteraction?: () => void;
 }
 
 const WORLD_WIDTH = 1100;
@@ -73,8 +72,7 @@ function hash(value: string): number {
 
 function categoricalColor(value: string | null | undefined): string {
   if (!value) return "hsl(220 7% 58%)";
-  const hue = hash(value) % 360;
-  return `hsl(${hue} 58% 52%)`;
+  return `hsl(${hash(value) % 360} 58% 52%)`;
 }
 
 interface RGB {
@@ -123,22 +121,6 @@ function scaleValue(
   return (value - minimum) / (maximum - minimum);
 }
 
-function unscaleValue(
-  position: number,
-  minimum: number,
-  maximum: number,
-  scale: GraphScaleType,
-): number {
-  if (maximum <= minimum) return minimum;
-  if (scale === "log") {
-    if (minimum <= 0 || maximum <= 0) return minimum;
-    const exponent =
-      Math.log(minimum) + position * (Math.log(maximum) - Math.log(minimum));
-    return Math.exp(clamp(exponent, -700, 700));
-  }
-  return minimum + position * (maximum - minimum);
-}
-
 function metricNumber(
   node: CitationGraphNode,
   metric: GraphAxisMetric | MetricID,
@@ -148,77 +130,102 @@ function metricNumber(
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function metricDomain(
+function metricExtent(
   nodes: CitationGraphNode[],
   metric: GraphAxisMetric | MetricID,
+  scale: GraphScaleType = "linear",
+): [number, number] | null {
+  if (metric === "free") return null;
+  const values = nodes
+    .map((node) => metricNumber(node, metric))
+    .filter(
+      (value): value is number =>
+        value !== null && (scale !== "log" || value > 0),
+    );
+  if (!values.length) return null;
+  return [Math.min(...values), Math.max(...values)];
+}
+
+function axisDomain(
+  nodes: CitationGraphNode[],
+  metric: GraphAxisMetric,
   scale: GraphScaleType,
 ): [number, number] | null {
   if (metric === "free") return null;
   let values = nodes
     .map((node) => metricNumber(node, metric))
-    .filter((value): value is number => value !== null);
-  if (scale === "log") values = values.filter((value) => value > 0);
+    .filter(
+      (value): value is number =>
+        value !== null && (scale !== "log" || value > 0),
+    )
+    .sort((a, b) => a - b);
   if (!values.length) return null;
-  values.sort((a, b) => a - b);
-  // Robust clipping prevents one extreme paper flattening the visual scale.
-  const low = values[Math.floor((values.length - 1) * 0.01)];
-  const high = values[Math.ceil((values.length - 1) * 0.99)];
-  return low === high ? [low - 0.5, high + 0.5] : [low, high];
+  if (values.length > 20) {
+    values = values.slice(
+      Math.floor(values.length * 0.01),
+      Math.ceil(values.length * 0.99),
+    );
+  }
+  const minimum = values[0];
+  const maximum = values.at(-1)!;
+  if (minimum !== maximum) return [minimum, maximum];
+  if (scale === "log" && minimum > 0) {
+    return [minimum / 1.25, minimum * 1.25];
+  }
+  const integer = getMetricDefinition(metric).valueType === "integer";
+  const padding = integer
+    ? Math.max(1, Math.ceil(Math.abs(minimum) * 0.02))
+    : Math.max(0.5, Math.abs(minimum) * 0.02);
+  return [minimum - padding, maximum + padding];
 }
 
-function linearTickValues(
+function tickValues(
   minimum: number,
   maximum: number,
-  targetCount = 7,
+  metric: GraphAxisMetric,
+  scale: GraphScaleType,
+  target = 6,
 ): number[] {
   if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) return [];
   if (minimum === maximum) return [minimum];
-  const range = Math.abs(maximum - minimum);
-  const rawStep = range / Math.max(1, targetCount);
+  if (scale === "log") {
+    if (minimum <= 0 || maximum <= 0) return [];
+    const values: number[] = [];
+    const firstExponent = Math.floor(Math.log10(minimum));
+    const lastExponent = Math.ceil(Math.log10(maximum));
+    for (
+      let exponent = firstExponent;
+      exponent <= lastExponent;
+      exponent += 1
+    ) {
+      const power = 10 ** exponent;
+      for (const multiplier of [1, 2, 5]) {
+        const value = multiplier * power;
+        if (value >= minimum && value <= maximum) values.push(value);
+      }
+    }
+    return values.length ? values : [minimum, maximum];
+  }
+  const rawStep = Math.abs(maximum - minimum) / Math.max(1, target);
   const magnitude = 10 ** Math.floor(Math.log10(rawStep));
   const normalized = rawStep / magnitude;
-  const niceNormalized =
+  const nice =
     normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
-  const step = niceNormalized * magnitude;
-  const start = Math.ceil(minimum / step) * step;
+  const integer =
+    metric !== "free" && getMetricDefinition(metric).valueType === "integer";
+  const step = integer
+    ? Math.max(1, Math.ceil(nice * magnitude))
+    : nice * magnitude;
   const values: number[] = [];
-  for (let value = start; value <= maximum + step * 1e-8; value += step) {
-    values.push(Number(value.toPrecision(12)));
-    if (values.length >= 100) break;
-  }
-  return values;
-}
-
-function logarithmicTickValues(minimum: number, maximum: number): number[] {
-  if (
-    !Number.isFinite(minimum) ||
-    !Number.isFinite(maximum) ||
-    minimum <= 0 ||
-    maximum <= 0
+  for (
+    let value = Math.ceil(minimum / step) * step;
+    value <= maximum + step * 1e-8;
+    value += step
   ) {
-    return [];
+    values.push(Number(value.toPrecision(12)));
+    if (values.length > 20) break;
   }
-  const values: number[] = [];
-  const firstExponent = Math.floor(Math.log10(minimum));
-  const lastExponent = Math.ceil(Math.log10(maximum));
-  for (let exponent = firstExponent; exponent <= lastExponent; exponent += 1) {
-    const power = 10 ** exponent;
-    for (const multiplier of [1, 2, 5]) {
-      const value = multiplier * power;
-      if (value >= minimum && value <= maximum) values.push(value);
-    }
-  }
-  return values;
-}
-
-function axisTickValues(
-  minimum: number,
-  maximum: number,
-  scale: GraphScaleType,
-): number[] {
-  return scale === "log"
-    ? logarithmicTickValues(minimum, maximum)
-    : linearTickValues(minimum, maximum);
+  return values.length ? values : [minimum, maximum];
 }
 
 export class CitationGraphRenderer {
@@ -230,40 +237,28 @@ export class CitationGraphRenderer {
   private readonly collectionLabelsByNodeKey: Map<string, string[]>;
   private readonly onSelectionChange: (node: CitationGraphNode | null) => void;
   private readonly onOpenNode: (node: CitationGraphNode) => void;
+  private readonly onBackgroundInteraction: () => void;
   private visibleKeys: Set<string>;
   private searchMatches: Set<string> | null = null;
   private layout: GraphLayoutOptions;
   private selectedKey: string | null = null;
   private hoverKey: string | null = null;
   private ghostPreview: GhostPreview | null = null;
-  private animationFrame: number | null = null;
-  private simulationStepsRemaining = 0;
-  private initialFitFrame: number | null = null;
-  private resizeObserver: ResizeObserver | null = null;
-  private destroyed = false;
-  private initialFitComplete = false;
-  private readonly onResize = (): void => {
-    const previousWidth = this.canvas.width;
-    const previousHeight = this.canvas.height;
-    this.resizeCanvas();
-
-    if (!this.initialFitComplete) {
-      this.scheduleInitialFit();
-      this.draw();
-      return;
-    }
-
-    if (previousWidth > 1 && previousHeight > 1) {
-      this.transform.x += (this.canvas.width - previousWidth) / 2;
-      this.transform.y += (this.canvas.height - previousHeight) / 2;
-    }
-    this.draw();
-  };
   private transform = { x: 0, y: 0, scale: 1 };
-  private pointer = { dragging: false, panning: false, x: 0, y: 0 };
-  private movedDuringPointer = false;
-  private lastClickAt = 0;
-  private lastClickedKey: string | null = null;
+  private pointer = {
+    down: false,
+    panning: false,
+    x: 0,
+    y: 0,
+    startX: 0,
+    startY: 0,
+    moved: false,
+  };
+  private resizeObserver: ResizeObserver | null = null;
+  private colorSchemeQuery: MediaQueryList | null = null;
+  private initialFitFrame: number | null = null;
+  private initialFitComplete = false;
+  private destroyed = false;
 
   constructor(options: CitationGraphRendererOptions) {
     this.canvas = options.canvas;
@@ -276,26 +271,31 @@ export class CitationGraphRenderer {
     this.collectionLabelsByNodeKey = options.collectionLabelsByNodeKey;
     this.onSelectionChange = options.onSelectionChange;
     this.onOpenNode = options.onOpenNode;
+    this.onBackgroundInteraction =
+      options.onBackgroundInteraction ?? (() => undefined);
     this.visibleKeys = new Set(this.model.nodes.map((node) => node.key));
     this.initializePositions();
-    this.projectPositionsToLayout();
     this.installEvents();
-
     const view = this.canvas.ownerDocument.defaultView;
+    this.colorSchemeQuery =
+      view?.matchMedia?.("(prefers-color-scheme: dark)") ?? null;
+    this.colorSchemeQuery?.addEventListener?.(
+      "change",
+      this.onColorSchemeChange,
+    );
     const ResizeObserverConstructor = (view as any)?.ResizeObserver as
-      | typeof ResizeObserver
-      | undefined;
-
+      typeof ResizeObserver | undefined;
     if (ResizeObserverConstructor) {
-      this.resizeObserver = new ResizeObserverConstructor(this.onResize);
+      this.resizeObserver = new ResizeObserverConstructor(() => {
+        this.resizeViewport();
+        if (!this.initialFitComplete) this.scheduleInitialFit();
+      });
       this.resizeObserver.observe(this.canvas.parentElement ?? this.canvas);
     } else {
-      view?.addEventListener("resize", this.onResize);
+      view?.addEventListener("resize", this.resizeViewport);
     }
-
-    this.resizeCanvas();
+    this.resizeViewport();
     this.draw();
-    this.restartSimulation();
     this.scheduleInitialFit();
   }
 
@@ -310,73 +310,131 @@ export class CitationGraphRenderer {
     const view = this.canvas.ownerDocument.defaultView;
     if (!view) return;
 
-    let lastWidth = -1;
-    let lastHeight = -1;
+    let previousWidth = -1;
+    let previousHeight = -1;
     let stableFrames = 0;
     let attempts = 0;
     const check = (): void => {
       this.initialFitFrame = null;
       if (this.destroyed || this.initialFitComplete) return;
-
-      this.resizeCanvas();
-      const rect = this.canvas.getBoundingClientRect();
+      this.resizeViewport();
+      const rect = (
+        this.canvas.parentElement ?? this.canvas
+      ).getBoundingClientRect();
       const ready = rect.width >= 240 && rect.height >= 180;
       if (ready) {
         if (
-          Math.abs(rect.width - lastWidth) < 0.5 &&
-          Math.abs(rect.height - lastHeight) < 0.5
+          Math.abs(rect.width - previousWidth) < 0.5 &&
+          Math.abs(rect.height - previousHeight) < 0.5
         ) {
           stableFrames += 1;
         } else {
           stableFrames = 0;
         }
-        lastWidth = rect.width;
-        lastHeight = rect.height;
+        previousWidth = rect.width;
+        previousHeight = rect.height;
         if (stableFrames >= 2) {
           this.fitView();
           return;
         }
       }
-
       attempts += 1;
       if (attempts < 120) {
         this.initialFitFrame = view.requestAnimationFrame(check);
       }
     };
-
     this.initialFitFrame = view.requestAnimationFrame(check);
   }
 
-  private initializePositions(): void {
-    const centerX = WORLD_WIDTH / 2;
-    const centerY = WORLD_HEIGHT / 2;
-    this.model.nodes.forEach((node, index) => {
-      const angle = (index * 2.399963229728653) % (Math.PI * 2);
-      const radius = 30 + Math.sqrt(index + 1) * 16;
-      this.positions.set(node.key, {
-        x: centerX + Math.cos(angle) * radius,
-        y: centerY + Math.sin(angle) * radius,
-        vx: 0,
-        vy: 0,
-      });
-    });
-  }
-
-  private resizeCanvas(): void {
-    const rect = this.canvas.getBoundingClientRect();
-    const ratio = this.canvas.ownerDocument.defaultView?.devicePixelRatio ?? 1;
-    const width = Math.max(1, Math.round(rect.width * ratio));
-    const height = Math.max(1, Math.round(rect.height * ratio));
-    if (this.canvas.width !== width || this.canvas.height !== height) {
-      this.canvas.width = width;
-      this.canvas.height = height;
+  private markViewAdjusted(): void {
+    this.initialFitComplete = true;
+    if (this.initialFitFrame !== null) {
+      this.canvas.ownerDocument.defaultView?.cancelAnimationFrame(
+        this.initialFitFrame,
+      );
+      this.initialFitFrame = null;
     }
   }
 
-  private screenToWorld(
-    clientX: number,
-    clientY: number,
-  ): { x: number; y: number } {
+  private initializePositions(): void {
+    this.model.nodes.forEach((node, index) => {
+      const angle = (index * 2.399963229728653) % (Math.PI * 2);
+      const radius = 25 + Math.sqrt(index + 1) * 17;
+      this.positions.set(node.key, {
+        x: WORLD_WIDTH / 2 + Math.cos(angle) * radius,
+        y: WORLD_HEIGHT / 2 + Math.sin(angle) * radius,
+      });
+    });
+    this.projectPositionsToLayout();
+  }
+
+  private installEvents(): void {
+    this.canvas.tabIndex = 0;
+    this.canvas.addEventListener("pointerdown", this.onPointerDown);
+    this.canvas.addEventListener("pointermove", this.onPointerMove);
+    this.canvas.addEventListener("pointerup", this.onPointerUp);
+    this.canvas.addEventListener("pointercancel", this.onPointerUp);
+    this.canvas.addEventListener("pointerleave", this.onPointerLeave);
+    this.canvas.addEventListener("dblclick", this.onDoubleClick);
+    this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
+    this.canvas.addEventListener("keydown", this.onKeyDown);
+  }
+
+  private visibleNodes(): CitationGraphNode[] {
+    return this.model.nodes.filter((node) => this.visibleKeys.has(node.key));
+  }
+
+  private visibleEdges() {
+    return this.model.edges.filter(
+      (edge) =>
+        this.visibleKeys.has(edge.source) && this.visibleKeys.has(edge.target),
+    );
+  }
+
+  private projectPositionsToLayout(): void {
+    const nodes = this.visibleNodes();
+    const xDomain = axisDomain(nodes, this.layout.xMetric, this.layout.xScale);
+    const yDomain = axisDomain(nodes, this.layout.yMetric, this.layout.yScale);
+    for (const [index, node] of nodes.entries()) {
+      const position = this.positions.get(node.key)!;
+      if (this.layout.xMetric === "free") {
+        const angle = (index * 2.399963229728653) % (Math.PI * 2);
+        position.x =
+          WORLD_WIDTH / 2 + Math.cos(angle) * (60 + Math.sqrt(index + 1) * 18);
+      } else if (xDomain) {
+        const value = metricNumber(node, this.layout.xMetric);
+        position.x =
+          value === null
+            ? PLOT_LEFT - 35
+            : PLOT_LEFT +
+              clamp(
+                scaleValue(value, xDomain[0], xDomain[1], this.layout.xScale),
+                0,
+                1,
+              ) *
+                (PLOT_RIGHT - PLOT_LEFT);
+      }
+      if (this.layout.yMetric === "free") {
+        const angle = (index * 2.399963229728653) % (Math.PI * 2);
+        position.y =
+          WORLD_HEIGHT / 2 + Math.sin(angle) * (60 + Math.sqrt(index + 1) * 18);
+      } else if (yDomain) {
+        const value = metricNumber(node, this.layout.yMetric);
+        position.y =
+          value === null
+            ? PLOT_BOTTOM + 35
+            : PLOT_BOTTOM -
+              clamp(
+                scaleValue(value, yDomain[0], yDomain[1], this.layout.yScale),
+                0,
+                1,
+              ) *
+                (PLOT_BOTTOM - PLOT_TOP);
+      }
+    }
+  }
+
+  private screenToWorld(clientX: number, clientY: number): Position {
     const rect = this.canvas.getBoundingClientRect();
     const ratio = this.canvas.width / Math.max(1, rect.width);
     const x = (clientX - rect.left) * ratio;
@@ -387,129 +445,140 @@ export class CitationGraphRenderer {
     };
   }
 
-  private isDarkMode(): boolean {
-    const view = this.canvas.ownerDocument.defaultView;
-    return Boolean(view?.matchMedia?.("(prefers-color-scheme: dark)")?.matches);
+  private nodeRadius(
+    node: CitationGraphNode,
+    domain?: [number, number] | null,
+  ): number {
+    const metric = this.layout.nodeSizeMetric;
+    if (metric === "uniform") return 7;
+    const value = metricNumber(node, metric);
+    if (value === null) return MIN_NODE_RADIUS;
+    const visibleNodes = this.visibleNodes();
+    const resolved = domain ?? metricExtent(visibleNodes, metric);
+    if (!resolved) return 7;
+    if (resolved[0] === resolved[1]) {
+      const hasMissingValues = visibleNodes.some(
+        (visibleNode) => metricNumber(visibleNode, metric) === null,
+      );
+      return hasMissingValues
+        ? MAX_NODE_RADIUS
+        : (MIN_NODE_RADIUS + MAX_NODE_RADIUS) / 2;
+    }
+    const normalized = clamp(
+      scaleValue(value, resolved[0], resolved[1], "linear"),
+      0,
+      1,
+    );
+    return Math.sqrt(
+      MIN_NODE_RADIUS * MIN_NODE_RADIUS +
+        normalized *
+          (MAX_NODE_RADIUS * MAX_NODE_RADIUS -
+            MIN_NODE_RADIUS * MIN_NODE_RADIUS),
+    );
   }
 
-  private draggableDimensions(): { x: boolean; y: boolean } {
-    return {
-      x: this.layout.xMetric === "free",
-      y: this.layout.yMetric === "free",
-    };
-  }
-
-  private installEvents(): void {
-    this.canvas.addEventListener("pointerdown", this.onPointerDown);
-    this.canvas.addEventListener("pointermove", this.onPointerMove);
-    this.canvas.addEventListener("pointerup", this.onPointerUp);
-    this.canvas.addEventListener("pointercancel", this.onPointerUp);
-    this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
-    this.canvas.addEventListener("mouseleave", this.onMouseLeave);
-    this.canvas.ownerDocument.addEventListener("keydown", this.onKeyDown);
+  private hitTest(x: number, y: number): CitationGraphNode | null {
+    const domain =
+      this.layout.nodeSizeMetric === "uniform"
+        ? null
+        : metricExtent(this.visibleNodes(), this.layout.nodeSizeMetric);
+    const nodes = this.visibleNodes();
+    for (let index = nodes.length - 1; index >= 0; index -= 1) {
+      const node = nodes[index];
+      const position = this.positions.get(node.key);
+      if (!position) continue;
+      if (
+        Math.hypot(position.x - x, position.y - y) <=
+        this.nodeRadius(node, domain) + 5
+      )
+        return node;
+    }
+    return null;
   }
 
   private onPointerDown = (event: PointerEvent): void => {
+    this.markViewAdjusted();
     this.canvas.setPointerCapture?.(event.pointerId);
     const world = this.screenToWorld(event.clientX, event.clientY);
-    const hit = this.hitTest(world.x, world.y);
-    const draggable = this.draggableDimensions();
-    const canDragNode = Boolean(hit) && (draggable.x || draggable.y);
+    const node = this.hitTest(world.x, world.y);
     this.pointer = {
-      dragging: canDragNode,
-      panning: !hit,
+      down: true,
+      panning: !node,
       x: event.clientX,
       y: event.clientY,
+      startX: event.clientX,
+      startY: event.clientY,
+      moved: false,
     };
-    this.movedDuringPointer = false;
-    if (hit) {
-      this.selectedKey = hit.key;
-      this.onSelectionChange(hit);
-      this.canvas.style.cursor = canDragNode ? "grabbing" : "pointer";
+    if (node) {
+      this.selectedKey = node.key;
+      this.onSelectionChange(node);
       this.draw();
-    } else {
-      this.canvas.style.cursor = "grabbing";
+      return;
     }
+    // Defer background-click handling until pointerup so that a click can be
+    // distinguished from a pan gesture. Graph controls and settings live
+    // outside the canvas and therefore never clear the current selection.
   };
 
   private onPointerMove = (event: PointerEvent): void => {
-    const dx = event.clientX - this.pointer.x;
-    const dy = event.clientY - this.pointer.y;
-    if (Math.abs(dx) + Math.abs(dy) > 2) this.movedDuringPointer = true;
-    if (this.pointer.panning) {
-      const ratio = this.canvas.width / Math.max(1, this.canvas.clientWidth);
-      this.transform.x += dx * ratio;
-      this.transform.y += dy * ratio;
+    if (this.pointer.down && this.pointer.panning) {
+      const totalMovement = Math.hypot(
+        event.clientX - this.pointer.startX,
+        event.clientY - this.pointer.startY,
+      );
+      if (totalMovement > 4) this.pointer.moved = true;
+      const rect = this.canvas.getBoundingClientRect();
+      const ratio = this.canvas.width / Math.max(1, rect.width);
+      this.transform.x += (event.clientX - this.pointer.x) * ratio;
+      this.transform.y += (event.clientY - this.pointer.y) * ratio;
       this.pointer.x = event.clientX;
       this.pointer.y = event.clientY;
-      this.draw();
-      return;
-    }
-    if (this.pointer.dragging && this.selectedKey) {
-      const world = this.screenToWorld(event.clientX, event.clientY);
-      const position = this.positions.get(this.selectedKey);
-      const draggable = this.draggableDimensions();
-      if (position) {
-        if (draggable.x) position.x = world.x;
-        if (draggable.y) position.y = world.y;
-        position.vx = 0;
-        position.vy = 0;
-      }
-      this.pointer.x = event.clientX;
-      this.pointer.y = event.clientY;
-      this.canvas.style.cursor = "grabbing";
       this.draw();
       return;
     }
     const world = this.screenToWorld(event.clientX, event.clientY);
-    const hit = this.hitTest(world.x, world.y);
-    const next = hit?.key ?? null;
-    if (next !== this.hoverKey) {
-      this.hoverKey = next;
-      const draggable = this.draggableDimensions();
-      this.canvas.style.cursor = next
-        ? draggable.x || draggable.y
-          ? "grab"
-          : "pointer"
-        : "grab";
-      this.canvas.title = hit ? this.tooltipForNode(hit) : "";
+    const node = this.hitTest(world.x, world.y);
+    const key = node?.key ?? null;
+    if (key !== this.hoverKey) {
+      this.hoverKey = key;
+      this.canvas.style.cursor = node ? "pointer" : "grab";
+      this.canvas.title = node ? this.tooltipForNode(node) : "";
       this.draw();
     }
   };
 
   private onPointerUp = (event: PointerEvent): void => {
-    const wasDragging = this.pointer.dragging;
-    try {
-      this.canvas.releasePointerCapture?.(event.pointerId);
-    } catch {
-      // Pointer may already be released.
-    }
-    if (!this.movedDuringPointer && this.selectedKey) {
-      const now = Date.now();
-      if (
-        this.lastClickedKey === this.selectedKey &&
-        now - this.lastClickAt < 400
-      ) {
-        const node = this.model.nodes.find(
-          (candidate) => candidate.key === this.selectedKey,
-        );
-        if (node) this.onOpenNode(node);
-      }
-      this.lastClickedKey = this.selectedKey;
-      this.lastClickAt = now;
-    }
-    this.pointer.dragging = false;
+    this.canvas.releasePointerCapture?.(event.pointerId);
+    const wasBackgroundClick =
+      this.pointer.down && this.pointer.panning && !this.pointer.moved;
+    this.pointer.down = false;
     this.pointer.panning = false;
-    const draggable = this.draggableDimensions();
-    this.canvas.style.cursor = this.hoverKey
-      ? draggable.x || draggable.y
-        ? "grab"
-        : "pointer"
-      : "grab";
-    if (this.movedDuringPointer && wasDragging) this.restartSimulation(120);
+    if (wasBackgroundClick) {
+      const world = this.screenToWorld(event.clientX, event.clientY);
+      if (!this.hitTest(world.x, world.y)) {
+        this.clearSelection();
+        this.onBackgroundInteraction();
+      }
+    }
+  };
+
+  private onPointerLeave = (): void => {
+    if (!this.pointer.down) {
+      this.hoverKey = null;
+      this.canvas.title = "";
+      this.draw();
+    }
+  };
+
+  private onDoubleClick = (event: MouseEvent): void => {
+    const world = this.screenToWorld(event.clientX, event.clientY);
+    const node = this.hitTest(world.x, world.y);
+    if (node) this.onOpenNode(node);
   };
 
   private onWheel = (event: WheelEvent): void => {
+    this.markViewAdjusted();
     event.preventDefault();
     const rect = this.canvas.getBoundingClientRect();
     const ratio = this.canvas.width / Math.max(1, rect.width);
@@ -525,288 +594,20 @@ export class CitationGraphRenderer {
     this.draw();
   };
 
-  private onMouseLeave = (): void => {
-    if (!this.pointer.dragging && !this.pointer.panning) {
-      this.hoverKey = null;
-      this.draw();
-    }
-  };
-
   private onKeyDown = (event: KeyboardEvent): void => {
     if (event.key.toLocaleLowerCase() === "f") this.fitView();
-    if (event.key === "Escape" && this.selectedKey) {
-      this.selectedKey = null;
-      this.onSelectionChange(null);
-      this.draw();
+    if (event.key === "Escape") {
+      this.clearSelection();
+      this.onBackgroundInteraction();
     }
   };
 
-  private stopSimulation(): void {
-    if (this.animationFrame !== null) {
-      this.canvas.ownerDocument.defaultView?.cancelAnimationFrame(
-        this.animationFrame,
-      );
-    }
-    this.animationFrame = null;
-    this.simulationStepsRemaining = 0;
-  }
+  private readonly onColorSchemeChange = (): void => {
+    this.draw();
+  };
 
-  private stopMotion(): void {
-    for (const position of this.positions.values()) {
-      position.vx = 0;
-      position.vy = 0;
-    }
-  }
-
-  private restartSimulation(maxSteps = 180): void {
-    this.stopSimulation();
-    const freeX = this.layout.xMetric === "free";
-    const freeY = this.layout.yMetric === "free";
-
-    // A metric-by-metric plot is deterministic. Running the force simulation
-    // in this mode only makes nodes oscillate around their metric coordinates.
-    if (!freeX && !freeY) {
-      this.stopMotion();
-      this.draw();
-      return;
-    }
-
-    const view = this.canvas.ownerDocument.defaultView;
-    if (!view) {
-      for (let index = 0; index < Math.min(maxSteps, 120); index += 1) {
-        if (this.simulate() < 0.002) break;
-      }
-      this.stopMotion();
-      this.draw();
-      return;
-    }
-
-    this.simulationStepsRemaining = maxSteps;
-    const step = (): void => {
-      this.animationFrame = null;
-      if (this.destroyed) return;
-
-      const motion = this.simulate();
-      this.draw();
-      this.simulationStepsRemaining -= 1;
-
-      if (this.simulationStepsRemaining > 0 && motion >= 0.002) {
-        this.animationFrame = view.requestAnimationFrame(step);
-        return;
-      }
-
-      this.stopMotion();
-      this.draw();
-    };
-
-    this.animationFrame = view.requestAnimationFrame(step);
-  }
-
-  private visibleNodes(): CitationGraphNode[] {
-    return this.model.nodes.filter((node) => this.visibleKeys.has(node.key));
-  }
-
-  private visibleEdges() {
-    return this.model.edges.filter(
-      (edge) =>
-        this.visibleKeys.has(edge.source) && this.visibleKeys.has(edge.target),
-    );
-  }
-
-  private simulate(): number {
-    const nodes = this.visibleNodes();
-    if (!nodes.length) return 0;
-
-    const freeX = this.layout.xMetric === "free";
-    const freeY = this.layout.yMetric === "free";
-    if (!freeX && !freeY) return 0;
-
-    const xDomain = metricDomain(
-      nodes,
-      this.layout.xMetric,
-      this.layout.xScale,
-    );
-    const yDomain = metricDomain(
-      nodes,
-      this.layout.yMetric,
-      this.layout.yScale,
-    );
-
-    // Edge attraction only acts along unconstrained dimensions.
-    for (const edge of this.visibleEdges()) {
-      const source = this.positions.get(edge.source);
-      const target = this.positions.get(edge.target);
-      if (!source || !target) continue;
-      const dx = target.x - source.x;
-      const dy = target.y - source.y;
-      const distance = Math.max(1, Math.hypot(dx, dy));
-      const force = (distance - 85) * 0.0009;
-      if (freeX) {
-        source.vx += dx * force;
-        target.vx -= dx * force;
-      }
-      if (freeY) {
-        source.vy += dy * force;
-        target.vy -= dy * force;
-      }
-    }
-
-    // Repulsion also acts only along unconstrained dimensions.
-    const maximumComparisons = 250000;
-    const stride = Math.max(
-      1,
-      Math.ceil((nodes.length * nodes.length) / maximumComparisons),
-    );
-    for (let left = 0; left < nodes.length; left += 1) {
-      const a = this.positions.get(nodes[left].key);
-      if (!a) continue;
-      for (let right = left + 1; right < nodes.length; right += stride) {
-        const b = this.positions.get(nodes[right].key);
-        if (!b) continue;
-        let dx = a.x - b.x;
-        let dy = a.y - b.y;
-        let distanceSquared = dx * dx + dy * dy;
-        if (distanceSquared < 1) {
-          dx = (hash(nodes[left].key) % 7) - 3;
-          dy = (hash(nodes[right].key) % 7) - 3;
-          distanceSquared = dx * dx + dy * dy + 1;
-        }
-        const force = 95 / distanceSquared;
-        if (freeX) {
-          a.vx += dx * force;
-          b.vx -= dx * force;
-        }
-        if (freeY) {
-          a.vy += dy * force;
-          b.vy -= dy * force;
-        }
-      }
-    }
-
-    let motion = 0;
-    for (const node of nodes) {
-      const position = this.positions.get(node.key);
-      if (!position) continue;
-
-      if (node.key === this.selectedKey && this.pointer.dragging) continue;
-
-      if (freeX) {
-        position.vx += (WORLD_WIDTH / 2 - position.x) * 0.0009;
-        position.vx *= 0.82;
-        position.x = clamp(position.x + position.vx, 25, WORLD_WIDTH - 25);
-        motion += Math.abs(position.vx);
-      } else if (xDomain) {
-        const value = metricNumber(node, this.layout.xMetric);
-        position.x =
-          value === null
-            ? PLOT_LEFT - 35
-            : PLOT_LEFT +
-              clamp(
-                scaleValue(value, xDomain[0], xDomain[1], this.layout.xScale),
-                0,
-                1,
-              ) *
-                (PLOT_RIGHT - PLOT_LEFT);
-        position.vx = 0;
-      }
-
-      if (freeY) {
-        position.vy += (WORLD_HEIGHT / 2 - position.y) * 0.0009;
-        position.vy *= 0.82;
-        position.y = clamp(position.y + position.vy, 25, WORLD_HEIGHT - 25);
-        motion += Math.abs(position.vy);
-      } else if (yDomain) {
-        const value = metricNumber(node, this.layout.yMetric);
-        position.y =
-          value === null
-            ? PLOT_BOTTOM + 35
-            : PLOT_BOTTOM -
-              clamp(
-                scaleValue(value, yDomain[0], yDomain[1], this.layout.yScale),
-                0,
-                1,
-              ) *
-                (PLOT_BOTTOM - PLOT_TOP);
-        position.vy = 0;
-      }
-    }
-
-    return motion / Math.max(1, nodes.length);
-  }
-
-  private projectPositionsToLayout(): void {
-    const nodes = this.visibleNodes();
-    const xDomain = metricDomain(
-      nodes,
-      this.layout.xMetric,
-      this.layout.xScale,
-    );
-    const yDomain = metricDomain(
-      nodes,
-      this.layout.yMetric,
-      this.layout.yScale,
-    );
-
-    for (const node of nodes) {
-      const position = this.positions.get(node.key);
-      if (!position) continue;
-
-      if (this.layout.xMetric !== "free" && xDomain) {
-        const value = metricNumber(node, this.layout.xMetric);
-        position.x =
-          value === null
-            ? PLOT_LEFT - 35
-            : PLOT_LEFT +
-              clamp(
-                scaleValue(value, xDomain[0], xDomain[1], this.layout.xScale),
-                0,
-                1,
-              ) *
-                (PLOT_RIGHT - PLOT_LEFT);
-      }
-
-      if (this.layout.yMetric !== "free" && yDomain) {
-        const value = metricNumber(node, this.layout.yMetric);
-        position.y =
-          value === null
-            ? PLOT_BOTTOM + 35
-            : PLOT_BOTTOM -
-              clamp(
-                scaleValue(value, yDomain[0], yDomain[1], this.layout.yScale),
-                0,
-                1,
-              ) *
-                (PLOT_BOTTOM - PLOT_TOP);
-      }
-
-      position.vx = 0;
-      position.vy = 0;
-    }
-  }
-
-  private nodeRadius(
-    node: CitationGraphNode,
-    domains?: Map<string, [number, number] | null>,
-  ): number {
-    if (this.layout.nodeSizeMetric === "uniform") return 7;
-    const value = metricNumber(node, this.layout.nodeSizeMetric);
-    if (value === null) return MIN_NODE_RADIUS;
-    const key = this.layout.nodeSizeMetric;
-    const domain =
-      domains?.get(key) ?? metricDomain(this.visibleNodes(), key, "linear");
-    if (!domain) return 7;
-    const normalized = clamp(
-      scaleValue(value, domain[0], domain[1], "linear"),
-      0,
-      1,
-    );
-    // Area, rather than radius, represents the value.
-    return Math.sqrt(
-      MIN_NODE_RADIUS * MIN_NODE_RADIUS +
-        normalized *
-          (MAX_NODE_RADIUS * MAX_NODE_RADIUS -
-            MIN_NODE_RADIUS * MIN_NODE_RADIUS),
-    );
+  private isDarkMode(): boolean {
+    return this.colorSchemeQuery?.matches ?? false;
   }
 
   private nodeColors(
@@ -816,19 +617,15 @@ export class CitationGraphRenderer {
     const metric = this.layout.nodeColorMetric;
     if (metric === "collection") {
       const colors = this.collectionColorsByNodeKey.get(node.key) ?? [];
-      if (colors.length <= 4)
-        return colors.length ? colors : ["hsl(220 7% 58%)"];
-      return [...colors.slice(0, 3), "hsl(220 7% 58%)"];
+      return colors.length ? colors.slice(0, 4) : ["hsl(220 7% 58%)"];
     }
     if (metric === "publication-type")
       return [categoricalColor(node.publicationType)];
     if (metric === "provider") return [categoricalColor(node.provider)];
-    if (metric === "open-access") {
+    if (metric === "open-access")
       return [node.isOpenAccess ? "hsl(145 62% 42%)" : "hsl(220 7% 58%)"];
-    }
-    if (metric === "retraction") {
+    if (metric === "retraction")
       return [node.isRetracted ? "hsl(0 72% 51%)" : "hsl(145 35% 48%)"];
-    }
     const value = metricNumber(node, metric);
     if (value === null || !colorDomain) return ["hsl(220 7% 58%)"];
     return [
@@ -837,12 +634,12 @@ export class CitationGraphRenderer {
   }
 
   private drawNode(
-    context: CanvasRenderingContext2D,
     node: CitationGraphNode,
     position: Position,
     radius: number,
     colors: string[],
   ): void {
+    const context = this.context;
     const slice = (Math.PI * 2) / Math.max(1, colors.length);
     colors.forEach((color, index) => {
       context.beginPath();
@@ -858,15 +655,15 @@ export class CitationGraphRenderer {
       context.fillStyle = color;
       context.fill();
     });
-
     context.beginPath();
     context.arc(position.x, position.y, radius, 0, Math.PI * 2);
     context.lineWidth = node.isRetracted ? 3 : 1.1;
     context.strokeStyle = node.isRetracted
       ? "rgb(220 38 38)"
-      : "rgba(15, 23, 42, 0.78)";
+      : this.isDarkMode()
+        ? "rgba(226, 232, 240, .75)"
+        : "rgba(15, 23, 42, .78)";
     context.stroke();
-
     if (this.searchMatches?.has(node.key)) {
       context.beginPath();
       context.arc(position.x, position.y, radius + 4, 0, Math.PI * 2);
@@ -890,14 +687,13 @@ export class CitationGraphRenderer {
   }
 
   private drawArrow(
-    context: CanvasRenderingContext2D,
     source: Position,
     target: Position,
     targetRadius: number,
-    manual: boolean,
-    highlighted: boolean,
+    connection: "citation" | "reference" | null,
     dimmed: boolean,
   ): void {
+    const context = this.context;
     const dx = target.x - source.x;
     const dy = target.y - source.y;
     const length = Math.max(1, Math.hypot(dx, dy));
@@ -906,37 +702,30 @@ export class CitationGraphRenderer {
     const endX = target.x - ux * (targetRadius + 2);
     const endY = target.y - uy * (targetRadius + 2);
     const dark = this.isDarkMode();
-    const normalColor = dark
-      ? "rgba(148, 163, 184, .28)"
-      : "rgba(71, 85, 105, .32)";
-    // Dashed purple edges are local manual relations; provider edges are solid.
-    const manualColor = "rgba(124, 58, 237, .68)";
-    const highlightedColor = manual
-      ? "rgba(196, 181, 253, .98)"
-      : "rgba(96, 165, 250, .98)";
-
+    const normal = dark ? "rgba(148, 163, 184, .28)" : "rgba(71, 85, 105, .32)";
+    const connected =
+      connection === "citation"
+        ? "rgba(249, 115, 22, .92)"
+        : "rgba(59, 130, 246, .92)";
     context.save();
     context.beginPath();
     context.moveTo(source.x, source.y);
     context.lineTo(endX, endY);
-    context.strokeStyle = highlighted
-      ? highlightedColor
-      : manual
-        ? manualColor
-        : dimmed
-          ? dark
-            ? "rgba(148, 163, 184, .08)"
-            : "rgba(71, 85, 105, .08)"
-          : normalColor;
-    context.lineWidth = highlighted ? 2.7 : manual ? 1.7 : 1;
-    context.setLineDash(manual ? [4, 3] : []);
-    if (highlighted) {
-      context.shadowColor = highlightedColor;
-      context.shadowBlur = 9;
+    context.strokeStyle = connection
+      ? connected
+      : dimmed
+        ? dark
+          ? "rgba(148, 163, 184, .07)"
+          : "rgba(71, 85, 105, .07)"
+        : normal;
+    context.lineWidth = connection ? 2.15 : 1;
+    context.setLineDash([]);
+    if (connection) {
+      context.shadowColor = connected;
+      context.shadowBlur = 3;
     }
     context.stroke();
-
-    const size = highlighted ? 6.5 : 5;
+    const size = connection ? 6.25 : 5;
     context.beginPath();
     context.moveTo(endX, endY);
     context.lineTo(
@@ -953,10 +742,8 @@ export class CitationGraphRenderer {
     context.restore();
   }
 
-  private drawAxes(
-    context: CanvasRenderingContext2D,
-    nodes: CitationGraphNode[],
-  ): void {
+  private drawAxes(nodes: CitationGraphNode[]): void {
+    const context = this.context;
     const ratio =
       this.canvas.width /
       Math.max(1, this.canvas.getBoundingClientRect().width);
@@ -964,65 +751,26 @@ export class CitationGraphRenderer {
     const axisRight = this.canvas.width - 14 * ratio;
     const axisTop = 14 * ratio;
     const axisBottom = this.canvas.height - 42 * ratio;
-    const dark = this.isDarkMode();
-    const foreground = dark
+    const foreground = this.isDarkMode()
       ? "rgba(226, 232, 240, .72)"
       : "rgba(51, 65, 85, .72)";
-    const backdrop = dark
-      ? "rgba(15, 23, 42, .58)"
-      : "rgba(255, 255, 255, .62)";
-
     context.save();
     context.setTransform(1, 0, 0, 1, 0, 0);
-    context.lineWidth = Math.max(1, ratio);
     context.strokeStyle = foreground;
     context.fillStyle = foreground;
+    context.lineWidth = Math.max(1, ratio);
     context.font = `${Math.round(11 * ratio)}px sans-serif`;
-
     if (this.layout.xMetric !== "free") {
-      context.fillStyle = backdrop;
-      context.fillRect(
-        0,
-        axisBottom - 2 * ratio,
-        this.canvas.width,
-        this.canvas.height,
-      );
-      context.strokeStyle = foreground;
-      context.fillStyle = foreground;
       context.beginPath();
       context.moveTo(axisLeft, axisBottom);
       context.lineTo(axisRight, axisBottom);
       context.stroke();
-
-      const domain = metricDomain(
-        nodes,
-        this.layout.xMetric,
-        this.layout.xScale,
-      );
+      const domain = axisDomain(nodes, this.layout.xMetric, this.layout.xScale);
       if (domain) {
-        const visibleWorldLeft =
-          (axisLeft - this.transform.x) / this.transform.scale;
-        const visibleWorldRight =
-          (axisRight - this.transform.x) / this.transform.scale;
-        const visibleValues = [visibleWorldLeft, visibleWorldRight].map(
-          (worldX) =>
-            unscaleValue(
-              (worldX - PLOT_LEFT) / (PLOT_RIGHT - PLOT_LEFT),
-              domain[0],
-              domain[1],
-              this.layout.xScale,
-            ),
-        );
-        const definition = getMetricDefinition(this.layout.xMetric);
-        const rawMinimum = Math.min(...visibleValues);
-        const rawMaximum = Math.max(...visibleValues);
-        const visibleMinimum = definition.allowsNegative
-          ? rawMinimum
-          : Math.max(0, rawMinimum);
-        const visibleMaximum = Math.max(visibleMinimum, rawMaximum);
-        for (const tick of axisTickValues(
-          visibleMinimum,
-          visibleMaximum,
+        for (const tick of tickValues(
+          domain[0],
+          domain[1],
+          this.layout.xMetric,
           this.layout.xScale,
         )) {
           const worldX =
@@ -1030,7 +778,7 @@ export class CitationGraphRenderer {
             scaleValue(tick, domain[0], domain[1], this.layout.xScale) *
               (PLOT_RIGHT - PLOT_LEFT);
           const x = this.transform.x + worldX * this.transform.scale;
-          if (x < axisLeft + 8 * ratio || x > axisRight - 8 * ratio) continue;
+          if (x < axisLeft || x > axisRight) continue;
           context.beginPath();
           context.moveTo(x, axisBottom);
           context.lineTo(x, axisBottom + 5 * ratio);
@@ -1043,6 +791,14 @@ export class CitationGraphRenderer {
             axisBottom + 7 * ratio,
           );
         }
+      } else {
+        context.textAlign = "center";
+        context.textBaseline = "bottom";
+        context.fillText(
+          "No visible data",
+          (axisLeft + axisRight) / 2,
+          axisBottom - 7 * ratio,
+        );
       }
       context.font = `600 ${Math.round(12 * ratio)}px sans-serif`;
       context.textAlign = "center";
@@ -1053,46 +809,17 @@ export class CitationGraphRenderer {
         this.canvas.height - 3 * ratio,
       );
     }
-
     if (this.layout.yMetric !== "free") {
-      context.fillStyle = backdrop;
-      context.fillRect(0, 0, axisLeft + 2 * ratio, this.canvas.height);
-      context.strokeStyle = foreground;
-      context.fillStyle = foreground;
       context.beginPath();
       context.moveTo(axisLeft, axisTop);
       context.lineTo(axisLeft, axisBottom);
       context.stroke();
-
-      const domain = metricDomain(
-        nodes,
-        this.layout.yMetric,
-        this.layout.yScale,
-      );
+      const domain = axisDomain(nodes, this.layout.yMetric, this.layout.yScale);
       if (domain) {
-        const visibleWorldTop =
-          (axisTop - this.transform.y) / this.transform.scale;
-        const visibleWorldBottom =
-          (axisBottom - this.transform.y) / this.transform.scale;
-        const visibleValues = [visibleWorldTop, visibleWorldBottom].map(
-          (worldY) =>
-            unscaleValue(
-              (PLOT_BOTTOM - worldY) / (PLOT_BOTTOM - PLOT_TOP),
-              domain[0],
-              domain[1],
-              this.layout.yScale,
-            ),
-        );
-        const definition = getMetricDefinition(this.layout.yMetric);
-        const rawMinimum = Math.min(...visibleValues);
-        const rawMaximum = Math.max(...visibleValues);
-        const visibleMinimum = definition.allowsNegative
-          ? rawMinimum
-          : Math.max(0, rawMinimum);
-        const visibleMaximum = Math.max(visibleMinimum, rawMaximum);
-        for (const tick of axisTickValues(
-          visibleMinimum,
-          visibleMaximum,
+        for (const tick of tickValues(
+          domain[0],
+          domain[1],
+          this.layout.yMetric,
           this.layout.yScale,
         )) {
           const worldY =
@@ -1100,7 +827,7 @@ export class CitationGraphRenderer {
             scaleValue(tick, domain[0], domain[1], this.layout.yScale) *
               (PLOT_BOTTOM - PLOT_TOP);
           const y = this.transform.y + worldY * this.transform.scale;
-          if (y < axisTop + 8 * ratio || y > axisBottom - 8 * ratio) continue;
+          if (y < axisTop || y > axisBottom) continue;
           context.beginPath();
           context.moveTo(axisLeft - 5 * ratio, y);
           context.lineTo(axisLeft, y);
@@ -1113,6 +840,10 @@ export class CitationGraphRenderer {
             y,
           );
         }
+      } else {
+        context.textAlign = "left";
+        context.textBaseline = "top";
+        context.fillText("No visible data", axisLeft + 8 * ratio, axisTop);
       }
       context.save();
       context.translate(13 * ratio, (axisTop + axisBottom) / 2);
@@ -1127,11 +858,11 @@ export class CitationGraphRenderer {
   }
 
   private drawLabels(
-    context: CanvasRenderingContext2D,
     nodes: CitationGraphNode[],
     radii: Map<string, number>,
   ): void {
     if (this.layout.nodeLabelMode === "none") return;
+    const context = this.context;
     context.font = "11px sans-serif";
     context.textAlign = "left";
     context.textBaseline = "middle";
@@ -1143,16 +874,15 @@ export class CitationGraphRenderer {
         nodes.length > 220 &&
         node.key !== this.selectedKey &&
         node.key !== this.hoverKey
-      ) {
+      )
         continue;
-      }
       const position = this.positions.get(node.key);
       if (!position) continue;
-      const text =
+      const label =
         this.layout.nodeLabelMode === "author-year"
           ? `${node.authors[0]?.split(/\s+/).at(-1) ?? "Unknown"}${node.year ? ` (${node.year})` : ""}`
           : node.title;
-      const shortened = text.length > 42 ? `${text.slice(0, 39)}…` : text;
+      const shortened = label.length > 42 ? `${label.slice(0, 39)}…` : label;
       context.fillText(
         shortened,
         position.x + (radii.get(node.key) ?? 7) + 5,
@@ -1161,28 +891,20 @@ export class CitationGraphRenderer {
     }
   }
 
-  private drawLegend(
-    context: CanvasRenderingContext2D,
-    colorDomain: [number, number] | null,
-  ): void {
+  private drawLegend(colorDomain: [number, number] | null): void {
     if (!isMetricID(this.layout.nodeColorMetric) || !colorDomain) return;
+    const context = this.context;
     const x = WORLD_WIDTH - 250;
     const y = 24;
     const width = 190;
-    const height = 10;
     const gradient = context.createLinearGradient(x, y, x + width, y);
-    for (const [stop, rgb] of GRADIENT_STOPS) {
+    for (const [stop, rgb] of GRADIENT_STOPS)
       gradient.addColorStop(stop, `rgb(${rgb.r} ${rgb.g} ${rgb.b})`);
-    }
     context.fillStyle = gradient;
-    context.fillRect(x, y, width, height);
-    context.strokeStyle = this.isDarkMode()
-      ? "rgba(226, 232, 240, .48)"
-      : "rgba(30, 41, 59, .4)";
-    context.strokeRect(x, y, width, height);
+    context.fillRect(x, y, width, 10);
     context.fillStyle = this.isDarkMode()
-      ? "rgba(248, 250, 252, .94)"
-      : "rgba(30, 41, 59, .9)";
+      ? "rgba(248,250,252,.94)"
+      : "rgba(30,41,59,.9)";
     context.font = "11px sans-serif";
     context.textBaseline = "top";
     context.textAlign = "left";
@@ -1206,7 +928,7 @@ export class CitationGraphRenderer {
     );
   }
 
-  private drawGhost(context: CanvasRenderingContext2D): void {
+  private drawGhost(): void {
     if (!this.ghostPreview) return;
     const sources = this.ghostPreview.sourceKeys
       .map((key) => this.positions.get(key))
@@ -1216,6 +938,7 @@ export class CitationGraphRenderer {
       sources.reduce((sum, source) => sum + source.x, 0) / sources.length;
     const y =
       sources.reduce((sum, source) => sum + source.y, 0) / sources.length + 75;
+    const context = this.context;
     context.save();
     context.setLineDash([6, 5]);
     for (const source of sources) {
@@ -1229,110 +952,82 @@ export class CitationGraphRenderer {
     context.arc(x, y, 12, 0, Math.PI * 2);
     context.fillStyle = "rgba(148, 163, 184, .45)";
     context.fill();
-    context.strokeStyle = this.isDarkMode()
-      ? "rgba(226, 232, 240, .8)"
-      : "rgba(71, 85, 105, .8)";
-    context.stroke();
     context.setLineDash([]);
     context.fillStyle = this.isDarkMode()
-      ? "rgba(248, 250, 252, .94)"
-      : "rgba(30, 41, 59, .9)";
+      ? "rgba(248,250,252,.94)"
+      : "rgba(30,41,59,.9)";
     context.font = "11px sans-serif";
     context.textAlign = "center";
-    const title = this.ghostPreview.title;
-    context.fillText(
-      title.length > 50 ? `${title.slice(0, 47)}…` : title,
-      x,
-      y + 25,
-    );
+    context.fillText(this.ghostPreview.title.slice(0, 50), x, y + 25);
     context.restore();
   }
 
   private draw(): void {
     if (this.destroyed) return;
-    const ratio = this.canvas.width / Math.max(1, this.canvas.clientWidth);
     const context = this.context;
     context.save();
     context.setTransform(1, 0, 0, 1, 0, 0);
     context.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    context.fillStyle = "rgba(255, 255, 255, 0.001)";
+    context.fillStyle = "rgba(255,255,255,.001)";
     context.fillRect(0, 0, this.canvas.width, this.canvas.height);
     context.translate(this.transform.x, this.transform.y);
     context.scale(this.transform.scale, this.transform.scale);
-
     const nodes = this.visibleNodes();
-    const sizeDomains = new Map<string, [number, number] | null>();
-    if (this.layout.nodeSizeMetric !== "uniform") {
-      sizeDomains.set(
-        this.layout.nodeSizeMetric,
-        metricDomain(nodes, this.layout.nodeSizeMetric, "linear"),
-      );
-    }
+    const sizeDomain =
+      this.layout.nodeSizeMetric === "uniform"
+        ? null
+        : metricExtent(nodes, this.layout.nodeSizeMetric);
     const colorDomain = isMetricID(this.layout.nodeColorMetric)
-      ? metricDomain(nodes, this.layout.nodeColorMetric, "linear")
+      ? metricExtent(nodes, this.layout.nodeColorMetric)
       : null;
     const radii = new Map(
-      nodes.map((node) => [node.key, this.nodeRadius(node, sizeDomains)]),
+      nodes.map((node) => [node.key, this.nodeRadius(node, sizeDomain)]),
     );
-
     const selectedKey = this.selectedKey;
-    const edges = this.visibleEdges();
-    edges.sort((left, right) => {
-      const leftConnected =
+    const edges = [...this.visibleEdges()].sort((left, right) => {
+      const a =
         selectedKey !== null &&
         (left.source === selectedKey || left.target === selectedKey);
-      const rightConnected =
+      const b =
         selectedKey !== null &&
         (right.source === selectedKey || right.target === selectedKey);
-      return Number(leftConnected) - Number(rightConnected);
+      return Number(a) - Number(b);
     });
     for (const edge of edges) {
       const source = this.positions.get(edge.source);
       const target = this.positions.get(edge.target);
       if (!source || !target) continue;
-      const highlighted =
-        selectedKey !== null &&
-        (edge.source === selectedKey || edge.target === selectedKey);
+      const connection =
+        selectedKey === null
+          ? null
+          : edge.target === selectedKey
+            ? "citation"
+            : edge.source === selectedKey
+              ? "reference"
+              : null;
       this.drawArrow(
-        context,
         source,
         target,
         radii.get(edge.target) ?? 7,
-        edge.manual,
-        highlighted,
-        selectedKey !== null && !highlighted,
+        connection,
+        selectedKey !== null && connection === null,
       );
     }
     for (const node of nodes) {
       const position = this.positions.get(node.key);
       if (!position) continue;
       this.drawNode(
-        context,
         node,
         position,
         radii.get(node.key) ?? 7,
         this.nodeColors(node, colorDomain),
       );
     }
-    this.drawLabels(context, nodes, radii);
-    this.drawLegend(context, colorDomain);
-    this.drawGhost(context);
+    this.drawLabels(nodes, radii);
+    this.drawLegend(colorDomain);
+    this.drawGhost();
     context.restore();
-    this.drawAxes(context, nodes);
-    // Keep text and geometry crisp on high-DPI canvases.
-    if (ratio < 0) Zotero.debug(String(ratio));
-  }
-
-  private hitTest(x: number, y: number): CitationGraphNode | null {
-    const nodes = this.visibleNodes();
-    for (let index = nodes.length - 1; index >= 0; index -= 1) {
-      const node = nodes[index];
-      const position = this.positions.get(node.key);
-      if (!position) continue;
-      const radius = this.nodeRadius(node) + 5;
-      if (Math.hypot(position.x - x, position.y - y) <= radius) return node;
-    }
-    return null;
+    this.drawAxes(nodes);
   }
 
   private tooltipForNode(node: CitationGraphNode): string {
@@ -1356,12 +1051,18 @@ export class CitationGraphRenderer {
       this.onSelectionChange(null);
     }
     this.projectPositionsToLayout();
-    this.restartSimulation();
     this.draw();
   }
 
   public setSearchMatches(keys: Set<string> | null): void {
     this.searchMatches = keys ? new Set(keys) : null;
+    this.draw();
+  }
+
+  public clearSelection(): void {
+    if (this.selectedKey === null) return;
+    this.selectedKey = null;
+    this.onSelectionChange(null);
     this.draw();
   }
 
@@ -1387,13 +1088,6 @@ export class CitationGraphRenderer {
   public setLayout(layout: GraphLayoutOptions): void {
     this.layout = { ...layout };
     this.projectPositionsToLayout();
-    this.restartSimulation();
-    const draggable = this.draggableDimensions();
-    this.canvas.style.cursor = this.hoverKey
-      ? draggable.x || draggable.y
-        ? "grab"
-        : "pointer"
-      : "grab";
     this.draw();
   }
 
@@ -1410,12 +1104,20 @@ export class CitationGraphRenderer {
     return this.visibleEdges().length;
   }
 
-  public resizeViewport(): void {
-    this.onResize();
-  }
+  public resizeViewport = (): void => {
+    const rect = this.canvas.getBoundingClientRect();
+    const ratio = this.canvas.ownerDocument.defaultView?.devicePixelRatio ?? 1;
+    const width = Math.max(1, Math.round(rect.width * ratio));
+    const height = Math.max(1, Math.round(rect.height * ratio));
+    if (this.canvas.width !== width || this.canvas.height !== height) {
+      this.canvas.width = width;
+      this.canvas.height = height;
+      this.draw();
+    }
+  };
 
   public zoomBy(factor: number): void {
-    this.initialFitComplete = true;
+    this.markViewAdjusted();
     const centerX = this.canvas.width / 2;
     const centerY = this.canvas.height / 2;
     const next = clamp(this.transform.scale * factor, 0.15, 8);
@@ -1428,55 +1130,42 @@ export class CitationGraphRenderer {
   }
 
   public fitView(): void {
-    this.initialFitComplete = true;
-    this.resizeCanvas();
-
-    const rect = this.canvas.getBoundingClientRect();
-    const ratio = this.canvas.width / Math.max(1, rect.width);
-    const viewportLeft = 72 * ratio;
-    const viewportRight = this.canvas.width - 24 * ratio;
-    const viewportTop = 24 * ratio;
-    const viewportBottom = this.canvas.height - 54 * ratio;
-    const availableWidth = Math.max(1, viewportRight - viewportLeft);
-    const availableHeight = Math.max(1, viewportBottom - viewportTop);
-
-    const positions = this.visibleNodes()
+    this.markViewAdjusted();
+    this.resizeViewport();
+    const nodes = this.visibleNodes();
+    const positions = nodes
       .map((node) => this.positions.get(node.key))
       .filter((position): position is Position => Boolean(position));
-    if (positions.length === 0) {
-      this.transform.scale = 1;
-      this.transform.x = this.canvas.width / 2 - WORLD_WIDTH / 2;
-      this.transform.y = this.canvas.height / 2 - WORLD_HEIGHT / 2;
+    if (!positions.length) {
+      this.transform = { x: 0, y: 0, scale: 1 };
       this.draw();
       return;
     }
-
-    const worldPadding = 34;
-    const minimumX =
-      Math.min(...positions.map((position) => position.x)) - worldPadding;
-    const maximumX =
-      Math.max(...positions.map((position) => position.x)) + worldPadding;
-    const minimumY =
-      Math.min(...positions.map((position) => position.y)) - worldPadding;
-    const maximumY =
-      Math.max(...positions.map((position) => position.y)) + worldPadding;
-    const boundsWidth = Math.max(80, maximumX - minimumX);
-    const boundsHeight = Math.max(80, maximumY - minimumY);
+    const xCoordinates = positions.map((position) => position.x);
+    const yCoordinates = positions.map((position) => position.y);
+    if (this.layout.xMetric !== "free") {
+      xCoordinates.push(PLOT_LEFT, PLOT_RIGHT);
+    }
+    if (this.layout.yMetric !== "free") {
+      yCoordinates.push(PLOT_TOP, PLOT_BOTTOM);
+    }
+    const minX = Math.min(...xCoordinates) - MAX_NODE_RADIUS - 45;
+    const maxX = Math.max(...xCoordinates) + MAX_NODE_RADIUS + 140;
+    const minY = Math.min(...yCoordinates) - MAX_NODE_RADIUS - 35;
+    const maxY = Math.max(...yCoordinates) + MAX_NODE_RADIUS + 45;
+    const width = Math.max(1, maxX - minX);
+    const height = Math.max(1, maxY - minY);
     const scale = clamp(
-      Math.min(availableWidth / boundsWidth, availableHeight / boundsHeight),
+      Math.min(
+        (this.canvas.width - 110) / width,
+        (this.canvas.height - 90) / height,
+      ),
       0.15,
-      8,
+      5,
     );
-
     this.transform.scale = scale;
-    this.transform.x =
-      viewportLeft +
-      (availableWidth - boundsWidth * scale) / 2 -
-      minimumX * scale;
-    this.transform.y =
-      viewportTop +
-      (availableHeight - boundsHeight * scale) / 2 -
-      minimumY * scale;
+    this.transform.x = (this.canvas.width - (minX + maxX) * scale) / 2;
+    this.transform.y = (this.canvas.height - (minY + maxY) * scale) / 2;
     this.draw();
   }
 
@@ -1487,23 +1176,27 @@ export class CitationGraphRenderer {
   public destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.stopSimulation();
     if (this.initialFitFrame !== null) {
       this.canvas.ownerDocument.defaultView?.cancelAnimationFrame(
         this.initialFitFrame,
       );
+      this.initialFitFrame = null;
     }
     this.resizeObserver?.disconnect();
-    this.canvas.ownerDocument.defaultView?.removeEventListener(
-      "resize",
-      this.onResize,
+    this.colorSchemeQuery?.removeEventListener?.(
+      "change",
+      this.onColorSchemeChange,
     );
+    this.colorSchemeQuery = null;
+    const view = this.canvas.ownerDocument.defaultView;
+    view?.removeEventListener("resize", this.resizeViewport);
     this.canvas.removeEventListener("pointerdown", this.onPointerDown);
     this.canvas.removeEventListener("pointermove", this.onPointerMove);
     this.canvas.removeEventListener("pointerup", this.onPointerUp);
     this.canvas.removeEventListener("pointercancel", this.onPointerUp);
+    this.canvas.removeEventListener("pointerleave", this.onPointerLeave);
+    this.canvas.removeEventListener("dblclick", this.onDoubleClick);
     this.canvas.removeEventListener("wheel", this.onWheel);
-    this.canvas.removeEventListener("mouseleave", this.onMouseLeave);
-    this.canvas.ownerDocument.removeEventListener("keydown", this.onKeyDown);
+    this.canvas.removeEventListener("keydown", this.onKeyDown);
   }
 }

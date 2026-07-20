@@ -10,3 +10,4 @@ pref("extensions.zotero.citationmap.debugLogging", false);
 pref("extensions.zotero.citationmap.detailPanelWidth", 360);
 pref("extensions.zotero.citationmap.detailPanelCollapsed", false);
 pref("extensions.zotero.citationmap.graphAppearance", "");
+pref("extensions.zotero.citationmap.graphAppearanceVersion", 0);

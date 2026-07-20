@@ -106,9 +106,9 @@ export function setDetailPanelCollapsed(collapsed: boolean): void {
   Zotero.Prefs.set(key("detailPanelCollapsed"), collapsed, true);
 }
 
-const GRAPH_APPEARANCE_SCHEMA_VERSION = 3;
+const GRAPH_APPEARANCE_SCHEMA_VERSION = 4;
 
-const DEFAULT_GRAPH_LAYOUT: GraphLayoutOptions = {
+const PREVIOUS_DEFAULT_GRAPH_LAYOUT: GraphLayoutOptions = {
   xMetric: "year",
   xScale: "linear",
   yMetric: "citations",
@@ -118,22 +118,45 @@ const DEFAULT_GRAPH_LAYOUT: GraphLayoutOptions = {
   nodeLabelMode: "title",
 };
 
+const DEFAULT_GRAPH_LAYOUT: GraphLayoutOptions = {
+  ...PREVIOUS_DEFAULT_GRAPH_LAYOUT,
+  nodeLabelMode: "author-year",
+};
+
+function sameGraphLayout(
+  left: GraphLayoutOptions,
+  right: GraphLayoutOptions,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
 export function getGraphAppearance(): GraphLayoutOptions {
   const storedVersion = Number(
     Zotero.Prefs.get(key("graphAppearanceVersion"), true),
   );
+  const raw = String(Zotero.Prefs.get(key("graphAppearance"), true) ?? "");
+  let parsed: Partial<GraphLayoutOptions> = {};
+  try {
+    parsed = JSON.parse(raw) as Partial<GraphLayoutOptions>;
+  } catch {
+    // Invalid or absent preferences fall back to the current defaults.
+  }
+
+  if (storedVersion === 3) {
+    const previous = { ...PREVIOUS_DEFAULT_GRAPH_LAYOUT, ...parsed };
+    const migrated = sameGraphLayout(previous, PREVIOUS_DEFAULT_GRAPH_LAYOUT)
+      ? { ...DEFAULT_GRAPH_LAYOUT }
+      : { ...DEFAULT_GRAPH_LAYOUT, ...parsed };
+    setGraphAppearance(migrated);
+    return migrated;
+  }
+
   if (storedVersion !== GRAPH_APPEARANCE_SCHEMA_VERSION) {
     setGraphAppearance(DEFAULT_GRAPH_LAYOUT);
     return { ...DEFAULT_GRAPH_LAYOUT };
   }
 
-  const raw = String(Zotero.Prefs.get(key("graphAppearance"), true) ?? "");
-  try {
-    const parsed = JSON.parse(raw) as Partial<GraphLayoutOptions>;
-    return { ...DEFAULT_GRAPH_LAYOUT, ...parsed };
-  } catch {
-    return { ...DEFAULT_GRAPH_LAYOUT };
-  }
+  return { ...DEFAULT_GRAPH_LAYOUT, ...parsed };
 }
 export function setGraphAppearance(options: GraphLayoutOptions): void {
   Zotero.Prefs.set(key("graphAppearance"), JSON.stringify(options), true);

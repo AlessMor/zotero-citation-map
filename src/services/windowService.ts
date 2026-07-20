@@ -11,6 +11,18 @@ const NETWORK_ICON_TYPE = "citation-map-network";
 const CONTEXT_HANDLER_MARKER = "__citationMapContextHandlerInstalled";
 let pendingSelectionItemID: number | null = null;
 
+interface TabState {
+  type: string;
+}
+
+interface TabHookRuntime {
+  originalGetState: () => TabState[];
+  filteredGetState: () => TabState[];
+  restoreState: () => Promise<{ itemID: null }>;
+  getTitle: () => Promise<string>;
+  focus: (tab: { id: string }) => Promise<void>;
+}
+
 function defaultMainWindow(): _ZoteroTypes.MainWindow {
   const win = Zotero.getMainWindows().find(
     (candidate: any) => candidate?.ZoteroPane,
@@ -27,24 +39,56 @@ function tabs(win: _ZoteroTypes.MainWindow): any {
 
 function installTabHooks(win: _ZoteroTypes.MainWindow): void {
   const manager = tabs(win);
-  if (!manager[TAB_STATE_FILTER_MARKER]) {
-    const originalGetState = manager.getState.bind(manager);
-    manager.getState = (): any[] =>
-      originalGetState().filter((tab: any) => tab.type !== TAB_TYPE);
-    manager[TAB_STATE_FILTER_MARKER] = true;
-  }
+  if (manager[TAB_STATE_FILTER_MARKER]) return;
   manager.tabHooks.restoreState ??= {};
   manager.tabHooks.getTitle ??= {};
   manager.tabHooks.focusFirst ??= {};
   manager.tabHooks.refocus ??= {};
-  manager.tabHooks.restoreState[TAB_TYPE] = async () => ({ itemID: null });
-  manager.tabHooks.getTitle[TAB_TYPE] = async () => "Citation Map";
-  const focus = async (tab: any): Promise<void> => {
+  const originalGetState = manager.getState.bind(manager) as () => TabState[];
+  const filteredGetState = (): TabState[] =>
+    originalGetState().filter((tab) => tab.type !== TAB_TYPE);
+  const restoreState = async (): Promise<{ itemID: null }> => ({
+    itemID: null,
+  });
+  const getTitle = async (): Promise<string> => "Citation Map";
+  const focus = async (tab: { id: string }): Promise<void> => {
     const container = manager.getTabContent(tab.id);
     (container?.querySelector(".cm-search") as HTMLElement | null)?.focus();
   };
+  const runtime: TabHookRuntime = {
+    originalGetState,
+    filteredGetState,
+    restoreState,
+    getTitle,
+    focus,
+  };
+  manager.getState = filteredGetState;
+  manager.tabHooks.restoreState[TAB_TYPE] = restoreState;
+  manager.tabHooks.getTitle[TAB_TYPE] = getTitle;
   manager.tabHooks.focusFirst[TAB_TYPE] = focus;
   manager.tabHooks.refocus[TAB_TYPE] = focus;
+  manager[TAB_STATE_FILTER_MARKER] = runtime;
+}
+
+function uninstallTabHooks(win: _ZoteroTypes.MainWindow): void {
+  const manager = tabs(win);
+  const runtime = manager[TAB_STATE_FILTER_MARKER] as
+    TabHookRuntime | undefined;
+  if (!runtime) return;
+  if (manager.getState === runtime.filteredGetState) {
+    manager.getState = runtime.originalGetState;
+  }
+  for (const [hookName, callback] of [
+    ["restoreState", runtime.restoreState],
+    ["getTitle", runtime.getTitle],
+    ["focusFirst", runtime.focus],
+    ["refocus", runtime.focus],
+  ] as const) {
+    if (manager.tabHooks[hookName]?.[TAB_TYPE] === callback) {
+      delete manager.tabHooks[hookName][TAB_TYPE];
+    }
+  }
+  delete manager[TAB_STATE_FILTER_MARKER];
 }
 
 async function selectPaper(
@@ -173,6 +217,7 @@ export async function openCitationMapWindow(
     select: true,
     onClose: () => {
       destroyCitationMapView(result.container);
+      uninstallTabHooks(win);
       if (addon.data.graphTabID === result.id) addon.data.graphTabID = null;
     },
   });
@@ -205,12 +250,13 @@ export async function refreshOpenCitationMapViews(): Promise<void> {
 
 export function closeCitationMapWindow(closeTab = true): void {
   const tabID = addon.data.graphTabID;
-  if (!tabID) return;
-  if (!closeTab) {
+  pendingSelectionItemID = null;
+  if (tabID && !closeTab) {
     for (const win of Zotero.getMainWindows()) {
       try {
         const container = tabs(win).getTabContent(tabID);
         if (container) destroyCitationMapView(container);
+        uninstallTabHooks(win);
       } catch {
         // Window may be unloading.
       }
@@ -218,15 +264,24 @@ export function closeCitationMapWindow(closeTab = true): void {
     addon.data.graphTabID = null;
     return;
   }
+  if (tabID) {
+    for (const win of Zotero.getMainWindows()) {
+      try {
+        const manager = tabs(win);
+        if (manager.getTabInfo(tabID)) manager.close(tabID);
+      } catch {
+        // Tab may already be closed.
+      }
+    }
+    addon.data.graphTabID = null;
+  }
   for (const win of Zotero.getMainWindows()) {
     try {
-      const manager = tabs(win);
-      if (manager.getTabInfo(tabID)) manager.close(tabID);
+      uninstallTabHooks(win);
     } catch {
-      // Tab may already be closed.
+      // Window may be unloading.
     }
   }
-  addon.data.graphTabID = null;
 }
 
 export function getDefaultHostWindow(): _ZoteroTypes.MainWindow {

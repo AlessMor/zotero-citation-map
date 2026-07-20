@@ -10,11 +10,7 @@ export type MetricGroup =
   | "Data quality";
 
 export type MetricValueType =
-  | "integer"
-  | "decimal"
-  | "percentage"
-  | "boolean"
-  | "days";
+  "integer" | "decimal" | "percentage" | "boolean" | "days";
 
 export interface MetricDefinition {
   id: MetricID;
@@ -432,15 +428,18 @@ export function formatMetricValue(
   if (definition.valueType === "percentage") {
     return new Intl.NumberFormat(undefined, {
       style: "percent",
+      useGrouping: false,
       maximumFractionDigits: definition.decimals ?? 1,
     }).format(value);
   }
   if (definition.valueType === "days") {
     return `${new Intl.NumberFormat(undefined, {
+      useGrouping: false,
       maximumFractionDigits: 0,
     }).format(value)} d`;
   }
   return new Intl.NumberFormat(undefined, {
+    useGrouping: false,
     maximumFractionDigits:
       definition.valueType === "integer" ? 0 : (definition.decimals ?? 2),
   }).format(value);

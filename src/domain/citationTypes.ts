@@ -1,11 +1,7 @@
 export type CitationProviderPreference = "auto" | CitationProviderID;
 
 export type CitationProviderID =
-  | "crossref"
-  | "semantic-scholar"
-  | "opencitations"
-  | "inspire"
-  | "openalex";
+  "crossref" | "semantic-scholar" | "opencitations" | "inspire" | "openalex";
 
 export type IdentifierKind = "doi" | "pmid" | "arxiv" | "isbn" | "title";
 
@@ -106,8 +102,7 @@ export interface ProviderLookupFailure {
 }
 
 export type ProviderLookupResult =
-  | ProviderLookupSuccess
-  | ProviderLookupFailure;
+  ProviderLookupSuccess | ProviderLookupFailure;
 
 export interface CitationMetricRecord {
   libraryID: number;

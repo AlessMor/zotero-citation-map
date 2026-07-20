@@ -168,6 +168,11 @@ async function sourceMetrics(
     i10Index: numberOrNull(resolved?.summary_stats?.i10_index),
     updatedAt: new Date().toISOString(),
   };
+  const hasMetric =
+    metrics.twoYearMeanCitedness !== null ||
+    metrics.hIndex !== null ||
+    metrics.i10Index !== null;
+  if (!hasMetric) return null;
   sourceMetricsCache.set(id, metrics);
   return metrics;
 }

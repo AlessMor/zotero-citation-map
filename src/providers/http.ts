@@ -7,10 +7,21 @@ export interface HTTPResult<T> {
   message: string;
 }
 
+export interface JSONRequestOptions {
+  method?: "GET" | "POST";
+  body?: unknown;
+  headers?: Record<string, string>;
+}
+
 interface ZoteroHTTPResponse {
   status: number;
   responseText?: string;
   getResponseHeader?: (name: string) => string | null;
+}
+
+interface ProviderQueueState {
+  tail: Promise<void>;
+  nextStartAt: number;
 }
 
 const MIN_DELAY_MS: Record<CitationProviderID, number> = {
@@ -20,7 +31,7 @@ const MIN_DELAY_MS: Record<CitationProviderID, number> = {
   inspire: 500,
   openalex: 1100,
 };
-const lastRequestAt = new Map<CitationProviderID, number>();
+const providerQueues = new Map<CitationProviderID, ProviderQueueState>();
 const RETRY_DELAYS_MS = [1200, 3500];
 const REQUEST_TIMEOUT_MS = 30000;
 const activeRequestCancellers = new Set<() => void>();
@@ -53,11 +64,50 @@ function delay(milliseconds: number): Promise<void> {
   });
 }
 
-async function waitForProvider(provider: CitationProviderID): Promise<void> {
-  const previous = lastRequestAt.get(provider) ?? 0;
-  const remaining = MIN_DELAY_MS[provider] - (Date.now() - previous);
-  if (remaining > 0) await delay(remaining);
-  if (!cancellationRequested) lastRequestAt.set(provider, Date.now());
+function queueState(provider: CitationProviderID): ProviderQueueState {
+  const existing = providerQueues.get(provider);
+  if (existing) return existing;
+  const created: ProviderQueueState = {
+    tail: Promise.resolve(),
+    nextStartAt: 0,
+  };
+  providerQueues.set(provider, created);
+  return created;
+}
+
+function postponeProvider(
+  provider: CitationProviderID,
+  milliseconds: number,
+): void {
+  const state = queueState(provider);
+  state.nextStartAt = Math.max(
+    state.nextStartAt,
+    Date.now() + Math.max(0, milliseconds),
+  );
+}
+
+async function runInProviderQueue<T>(
+  provider: CitationProviderID,
+  task: () => Promise<T>,
+): Promise<T | null> {
+  const state = queueState(provider);
+  const previous = state.tail.catch(() => undefined);
+  let release = (): void => undefined;
+  const ticket = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  state.tail = previous.then(() => ticket);
+
+  await previous;
+  try {
+    const remaining = state.nextStartAt - Date.now();
+    if (remaining > 0) await delay(remaining);
+    if (cancellationRequested) return null;
+    state.nextStartAt = Date.now() + MIN_DELAY_MS[provider];
+    return await task();
+  } finally {
+    release();
+  }
 }
 
 function parseRetryAfter(response: ZoteroHTTPResponse): number | null {
@@ -102,12 +152,13 @@ function parseJSON<T>(
 
 export function resetCitationRequestCancellation(): void {
   cancellationRequested = false;
-  lastRequestAt.clear();
+  providerQueues.clear();
 }
 
 export function isCitationRequestCancellationRequested(): boolean {
   return cancellationRequested;
 }
+
 export function cancelPendingCitationRequests(): void {
   cancellationRequested = true;
 
@@ -115,7 +166,7 @@ export function cancelPendingCitationRequests(): void {
     try {
       cancel();
     } catch {
-      // Best-effort cancellation; the operation may already have completed.
+      // Best-effort cancellation; the delay may already have completed.
     }
   }
   activeDelayCancellers.clear();
@@ -124,7 +175,7 @@ export function cancelPendingCitationRequests(): void {
     try {
       cancel();
     } catch {
-      // Best-effort cancellation; the operation may already have completed.
+      // Best-effort cancellation; the request may already have completed.
     }
   }
   activeRequestCancellers.clear();
@@ -133,42 +184,65 @@ export function cancelPendingCitationRequests(): void {
 export async function requestJSON<T>(
   provider: CitationProviderID,
   url: string,
+  options: JSONRequestOptions = {},
 ): Promise<HTTPResult<T>> {
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
     if (cancellationRequested) return cancelledResult<T>();
-    await waitForProvider(provider);
-    if (cancellationRequested) return cancelledResult<T>();
-    let requestCanceller: (() => void) | null = null;
     try {
-      const response = (await Zotero.HTTP.request("GET", url, {
-        headers: {
-          Accept: "application/json",
-          "User-Agent":
-            "Zotero-Citation-Map/0.2 (mailto omitted; public API pool)",
+      const response = await runInProviderQueue(
+        provider,
+        async (): Promise<ZoteroHTTPResponse> => {
+          let requestCanceller: (() => void) | null = null;
+          try {
+            const headers = {
+              Accept: "application/json",
+              "User-Agent":
+                "Zotero-Citation-Map/0.2 (mailto omitted; public API pool)",
+              ...options.headers,
+            };
+            const body =
+              options.body === undefined
+                ? undefined
+                : typeof options.body === "string"
+                  ? options.body
+                  : JSON.stringify(options.body);
+            return (await Zotero.HTTP.request(options.method ?? "GET", url, {
+              headers,
+              body,
+              responseType: "text",
+              timeout: REQUEST_TIMEOUT_MS,
+              successCodes: false,
+              cancellerReceiver: (cancel: () => void) => {
+                requestCanceller = cancel;
+                activeRequestCancellers.add(cancel);
+                if (cancellationRequested) cancel();
+              },
+            } as any)) as unknown as ZoteroHTTPResponse;
+          } finally {
+            if (requestCanceller) {
+              activeRequestCancellers.delete(requestCanceller);
+            }
+          }
         },
-        responseType: "text",
-        timeout: REQUEST_TIMEOUT_MS,
-        successCodes: false,
-        cancellerReceiver: (cancel: () => void) => {
-          requestCanceller = cancel;
-          activeRequestCancellers.add(cancel);
-          if (cancellationRequested) cancel();
-        },
-      } as any)) as unknown as ZoteroHTTPResponse;
-      if (cancellationRequested) return cancelledResult<T>();
+      );
+      if (!response || cancellationRequested) return cancelledResult<T>();
+
       const retryable =
         response.status === 0 ||
         response.status === 429 ||
         response.status >= 500;
       if (retryable && attempt < RETRY_DELAYS_MS.length) {
-        await delay(parseRetryAfter(response) ?? RETRY_DELAYS_MS[attempt]);
+        postponeProvider(
+          provider,
+          parseRetryAfter(response) ?? RETRY_DELAYS_MS[attempt],
+        );
         continue;
       }
       return parseJSON<T>(provider, response);
     } catch (error) {
       if (cancellationRequested) return cancelledResult<T>();
       if (attempt < RETRY_DELAYS_MS.length) {
-        await delay(RETRY_DELAYS_MS[attempt]);
+        postponeProvider(provider, RETRY_DELAYS_MS[attempt]);
         continue;
       }
       return {
@@ -177,8 +251,6 @@ export async function requestJSON<T>(
         data: null,
         message: error instanceof Error ? error.message : String(error),
       };
-    } finally {
-      if (requestCanceller) activeRequestCancellers.delete(requestCanceller);
     }
   }
   return cancelledResult<T>();

@@ -6,6 +6,8 @@ coverage/
 logs/
 package-lock.json
 *.xpi
+*.tsbuildinfo
+FILE_MANIFEST.sha256
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

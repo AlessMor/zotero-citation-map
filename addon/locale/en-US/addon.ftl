@@ -1,1 +1,2 @@
-# General Citation Map strings used directly by the plugin can be added here.
+citation-map-item-pane-header = Citation Map
+citation-map-item-pane-sidenav = Citation Map

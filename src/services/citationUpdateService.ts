@@ -36,6 +36,11 @@ interface UpdateOptions {
   provider?: CitationProviderPreference;
 }
 
+type UpdateOutcome = "updated" | "cached" | "failed" | "skipped";
+
+const ITEM_UPDATE_CONCURRENCY = 3;
+const SHUTDOWN_WAIT_TIMEOUT_MS = 5000;
+
 let operationTail: Promise<void> = Promise.resolve();
 let notifierID: string | null = null;
 let startupTimer: ReturnType<typeof setTimeout> | null = null;
@@ -50,6 +55,21 @@ interface ProgressCard {
   timer: ReturnType<typeof setTimeout> | null;
 }
 const progressCards = new Set<ProgressCard>();
+
+function backgroundError(context: string, error: unknown): Error {
+  if (error instanceof Error) return error;
+  const detail = error === undefined ? "undefined rejection" : String(error);
+  return new Error(`Citation Map: ${context} failed (${detail})`);
+}
+
+function runBackgroundUpdate(
+  context: string,
+  operation: Promise<unknown>,
+): void {
+  void operation.catch((error: unknown) => {
+    Zotero.logError(backgroundError(context, error));
+  });
+}
 
 function runSerialized<T>(task: () => Promise<T>): Promise<T> {
   const previous = operationTail.catch(() => undefined);
@@ -72,6 +92,18 @@ async function wholeLibraryItems(): Promise<Zotero.Item[]> {
     (await Zotero.Items.getAll(
       Zotero.Libraries.userLibraryID,
     )) as Zotero.Item[],
+  );
+}
+
+function itemNeedsRefresh(
+  item: Zotero.Item,
+  provider: CitationProviderPreference,
+): boolean {
+  return shouldRefreshCitationMetrics(
+    Number(item.libraryID),
+    String(item.key),
+    provider,
+    getCacheDays(),
   );
 }
 
@@ -126,7 +158,7 @@ function updateProgress(
   total: number,
   title: string,
 ): void {
-  if (!card) return;
+  if (!card || shuttingDown) return;
   card.label.textContent = `Updating ${current}/${total}: ${title}`;
   card.bar.style.width = `${Math.round((current / Math.max(1, total)) * 100)}%`;
 }
@@ -135,7 +167,7 @@ function finishProgress(
   card: ProgressCard | null,
   result: CitationUpdateBatchResult,
 ): void {
-  if (!card) return;
+  if (!card || shuttingDown) return;
   card.label.textContent = `${result.updated} updated · ${result.cached} current · ${result.failed} failed · ${result.skipped} skipped`;
   card.bar.style.width = "100%";
   card.timer = setTimeout(() => {
@@ -174,22 +206,14 @@ async function updateOneItem(
   item: Zotero.Item,
   preference: CitationProviderPreference,
   force: boolean,
-): Promise<"updated" | "cached" | "failed" | "skipped"> {
-  if (shuttingDown || isCitationRequestCancellationRequested())
+): Promise<UpdateOutcome> {
+  if (shuttingDown || isCitationRequestCancellationRequested()) {
     return "skipped";
+  }
   const libraryID = Number(item.libraryID);
   const itemKey = String(item.key);
-  if (
-    !force &&
-    !shouldRefreshCitationMetrics(
-      libraryID,
-      itemKey,
-      preference,
-      getCacheDays(),
-    )
-  ) {
-    return "cached";
-  }
+  if (!force && !itemNeedsRefresh(item, preference)) return "cached";
+
   const previous = getCitationMetricRecord(libraryID, itemKey);
   const extracted = extractWorkIdentifiers(item);
   // A user-confirmed fallback match may supply a DOI that is intentionally
@@ -205,6 +229,9 @@ async function updateOneItem(
     getExactTitleFallbackEnabled(),
     force,
   );
+  if (shuttingDown || isCitationRequestCancellationRequested()) {
+    return "skipped";
+  }
   if (result.status !== "success") {
     await saveCitationMetricFailure(
       libraryID,
@@ -284,6 +311,7 @@ async function runUpdate(
 ): Promise<CitationUpdateBatchResult> {
   const selected = regularItems(items);
   const provider = options.provider ?? getProviderPreference();
+  const force = Boolean(options.force);
   const result: CitationUpdateBatchResult = {
     total: selected.length,
     updated: 0,
@@ -291,25 +319,66 @@ async function runUpdate(
     failed: 0,
     skipped: 0,
   };
+
+  if (shuttingDown || isCitationRequestCancellationRequested()) {
+    result.skipped = selected.length;
+    return result;
+  }
+
+  const pending = force
+    ? selected
+    : selected.filter((item) => itemNeedsRefresh(item, provider));
+  result.cached = selected.length - pending.length;
   const progress = options.silent
     ? null
-    : createProgress(selected.length, provider);
-  for (let index = 0; index < selected.length; index += 1) {
-    const item = selected[index];
-    updateProgress(
-      progress,
-      index + 1,
-      selected.length,
-      String(item.getField("title") ?? "Untitled"),
-    );
-    const outcome = await updateOneItem(item, provider, Boolean(options.force));
-    result[outcome] += 1;
-    if (shuttingDown) break;
+    : createProgress(pending.length, provider);
+
+  let nextIndex = 0;
+  let completed = 0;
+  const worker = async (): Promise<void> => {
+    while (!shuttingDown && !isCitationRequestCancellationRequested()) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= pending.length) return;
+      const item = pending[index];
+      let outcome: UpdateOutcome;
+      try {
+        outcome = await updateOneItem(item, provider, force);
+      } catch (error) {
+        Zotero.logError(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        outcome = shuttingDown ? "skipped" : "failed";
+      }
+      result[outcome] += 1;
+      completed += 1;
+      updateProgress(
+        progress,
+        completed,
+        pending.length,
+        String(item.getField("title") ?? "Untitled"),
+      );
+    }
+  };
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(ITEM_UPDATE_CONCURRENCY, pending.length) },
+      () => worker(),
+    ),
+  );
+
+  const accounted =
+    result.updated + result.cached + result.failed + result.skipped;
+  if (accounted < selected.length)
+    result.skipped += selected.length - accounted;
+
+  if (!shuttingDown && !isCitationRequestCancellationRequested()) {
+    refreshCitationColumns();
+    refreshCitationItemPanes();
+    await refreshOpenCitationMapViews();
+    finishProgress(progress, result);
   }
-  refreshCitationColumns();
-  refreshCitationItemPanes();
-  refreshOpenCitationMapViews();
-  finishProgress(progress, result);
   return result;
 }
 
@@ -323,6 +392,15 @@ export function updateCitationDataForItems(
 export async function updateWholeLibraryCitationData(
   options: UpdateOptions = {},
 ): Promise<CitationUpdateBatchResult> {
+  if (shuttingDown) {
+    return {
+      total: 0,
+      updated: 0,
+      cached: 0,
+      failed: 0,
+      skipped: 0,
+    };
+  }
   return updateCitationDataForItems(await wholeLibraryItems(), options);
 }
 
@@ -335,7 +413,12 @@ function schedulePendingItems(): void {
     const items = ids
       .map((id) => Zotero.Items.get(id))
       .filter((item): item is Zotero.Item => Boolean(item));
-    if (items.length) void updateCitationDataForItems(items, { silent: true });
+    if (items.length) {
+      runBackgroundUpdate(
+        "automatic update for modified items",
+        updateCitationDataForItems(items, { silent: true }),
+      );
+    }
   }, 1200);
 }
 
@@ -369,7 +452,10 @@ export function registerAutomaticCitationUpdates(): void {
   if (getAutomaticUpdatesEnabled()) {
     startupTimer = setTimeout(() => {
       startupTimer = null;
-      void updateWholeLibraryCitationData({ silent: true });
+      runBackgroundUpdate(
+        "startup stale-item refresh",
+        updateWholeLibraryCitationData({ silent: true }),
+      );
     }, 4500);
   }
 }
@@ -393,6 +479,18 @@ export function unregisterAutomaticCitationUpdates(): void {
   progressCards.clear();
 }
 
-export async function waitForCitationUpdates(): Promise<void> {
-  await operationTail.catch(() => undefined);
+export async function waitForCitationUpdates(
+  timeoutMs = SHUTDOWN_WAIT_TIMEOUT_MS,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timedOut = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+  });
+  const completed = operationTail.then(
+    () => true as const,
+    () => true as const,
+  );
+  const result = await Promise.race([completed, timedOut]);
+  if (timer) clearTimeout(timer);
+  return result;
 }

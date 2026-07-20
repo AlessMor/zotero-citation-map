@@ -19,6 +19,7 @@ declare namespace _ZoteroTypes {
       "detailPanelWidth": number;
       "detailPanelCollapsed": boolean;
       "graphAppearance": string;
+      "graphAppearanceVersion": number;
     };
   }
 }

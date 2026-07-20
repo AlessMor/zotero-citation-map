@@ -46,6 +46,7 @@ interface S2RelationResponse {
 
 const BACKGROUND_REFERENCE_LIMIT = 200;
 const MAX_RELATION_PAGE_SIZE = 200;
+export const SEMANTIC_SCHOLAR_BATCH_LIMIT = 500;
 
 const BASIC_FIELDS = [
   "paperId",
@@ -92,6 +93,35 @@ function toRelated(paper: S2Paper): RelatedWorkMetadata | null {
     openAccessStatus: paper.isOpenAccess ? "open" : null,
     isRetracted: null,
   };
+}
+
+export async function fetchSemanticScholarPapersBatch(
+  identifiers: string[],
+): Promise<Array<RelatedWorkMetadata | null>> {
+  if (!identifiers.length) return [];
+  if (identifiers.length > SEMANTIC_SCHOLAR_BATCH_LIMIT) {
+    throw new Error(
+      `Semantic Scholar batch exceeds ${SEMANTIC_SCHOLAR_BATCH_LIMIT} papers.`,
+    );
+  }
+  const response = await requestJSON<Array<S2Paper | null>>(
+    "semantic-scholar",
+    `https://api.semanticscholar.org/graph/v1/paper/batch?fields=${encodeURIComponent(BASIC_FIELDS)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: { ids: identifiers },
+    },
+  );
+  if (!response.ok || !Array.isArray(response.data)) {
+    throw new Error(
+      response.message || "Semantic Scholar batch metadata lookup failed.",
+    );
+  }
+  return identifiers.map((_, index) => {
+    const paper = response.data?.[index];
+    return paper ? toRelated(paper) : null;
+  });
 }
 
 async function fetchRelations(
