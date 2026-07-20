@@ -1,4 +1,3 @@
-import { config } from "../../package.json";
 import type {
   CitationMetricRecord,
   CitationProviderPreference,
@@ -26,35 +25,47 @@ import {
   getProviderPreference,
   getUpdateNewItemsEnabled,
 } from "./citationPreferences";
+import {
+  refreshExternalRelationships,
+  storeExternalRelationshipSnapshot,
+} from "./externalDiscoveryService";
 import { refreshCitationColumns } from "./itemTreeColumnService";
+import { mergeRelatedWorkLists } from "./relationshipStoreService";
+import { createMetricNodeForItem } from "./itemMetricContext";
 import { refreshCitationItemPanes } from "./itemPaneService";
 import { refreshOpenCitationMapViews } from "./windowService";
+import {
+  closeAllUpdateProgress,
+  createUpdateProgress,
+  type UpdateProgressHandle,
+} from "./updateProgressService";
 
 interface UpdateOptions {
   force?: boolean;
   silent?: boolean;
   provider?: CitationProviderPreference;
+  /** Fetch complete cited-by/reference lists. Defaults to true for a single
+   * item and false for multi-item batches. */
+  includeRelationships?: boolean;
+  /** Document in which the modeless progress window should be shown. */
+  progressDocument?: Document;
 }
 
 type UpdateOutcome = "updated" | "cached" | "failed" | "skipped";
 
-const ITEM_UPDATE_CONCURRENCY = 3;
+const ITEM_UPDATE_CONCURRENCY = 2;
+const BATCH_ITEM_DEADLINE_MS = 45000;
+const SINGLE_ITEM_DEADLINE_MS = 120000;
+const VIEW_REFRESH_DEADLINE_MS = 5000;
 const SHUTDOWN_WAIT_TIMEOUT_MS = 5000;
 
 let operationTail: Promise<void> = Promise.resolve();
+let operationBusy = false;
 let notifierID: string | null = null;
 let startupTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingTimer: ReturnType<typeof setTimeout> | null = null;
 let shuttingDown = false;
 const pendingItemIDs = new Set<number>();
-
-interface ProgressCard {
-  root: HTMLElement;
-  label: HTMLElement;
-  bar: HTMLElement;
-  timer: ReturnType<typeof setTimeout> | null;
-}
-const progressCards = new Set<ProgressCard>();
 
 function backgroundError(context: string, error: unknown): Error {
   if (error instanceof Error) return error;
@@ -78,7 +89,69 @@ function runSerialized<T>(task: () => Promise<T>): Promise<T> {
     release = resolve;
   });
   operationTail = previous.then(() => ticket);
-  return previous.then(task).finally(release);
+  return previous
+    .then(async () => {
+      operationBusy = true;
+      return task();
+    })
+    .finally(() => {
+      operationBusy = false;
+      release();
+    });
+}
+
+function withDeadline<T>(
+  operation: Promise<T>,
+  milliseconds: number,
+  label: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(
+        new Error(
+          `${label} timed out after ${Math.round(milliseconds / 1000)} seconds`,
+        ),
+      );
+    }, milliseconds);
+    operation.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function refreshViewsAfterUpdate(refreshGraph: boolean): void {
+  try {
+    refreshCitationColumns();
+  } catch (error) {
+    Zotero.debug(`Citation Map: column refresh failed: ${String(error)}`);
+  }
+  try {
+    refreshCitationItemPanes();
+  } catch (error) {
+    Zotero.debug(`Citation Map: item-pane refresh failed: ${String(error)}`);
+  }
+  if (!refreshGraph) return;
+  void withDeadline(
+    refreshOpenCitationMapViews(),
+    VIEW_REFRESH_DEADLINE_MS,
+    "Graph view refresh",
+  ).catch((error: unknown) => {
+    Zotero.debug(`Citation Map: graph view refresh deferred: ${String(error)}`);
+  });
 }
 
 function regularItems(items: Zotero.Item[]): Zotero.Item[] {
@@ -107,73 +180,43 @@ function itemNeedsRefresh(
   );
 }
 
-function createElement<K extends keyof HTMLElementTagNameMap>(
-  document: Document,
-  tag: K,
-): HTMLElementTagNameMap[K] {
-  return document.createElementNS(
-    "http://www.w3.org/1999/xhtml",
-    tag,
-  ) as HTMLElementTagNameMap[K];
-}
-
 function createProgress(
   total: number,
   provider: CitationProviderPreference,
-): ProgressCard | null {
-  const win = Zotero.getMainWindow() as Window | null;
-  if (!win || win.closed) return null;
-  try {
-    const document = win.document;
-    const mount =
-      document.getElementById("zotero-pane") ??
-      document.getElementById("main-window") ??
-      document.documentElement;
-    const root = createElement(document, "div");
-    root.className = "citation-map-progress";
-    root.setAttribute("role", "status");
-    root.setAttribute("aria-live", "polite");
-    const heading = createElement(document, "strong");
-    heading.textContent = config.addonName;
-    const label = createElement(document, "div");
-    label.textContent = `Updating with ${getProviderLabel(provider)} (0/${total})`;
-    const track = createElement(document, "div");
-    track.className = "citation-map-progress-track";
-    const bar = createElement(document, "div");
-    bar.className = "citation-map-progress-bar";
-    track.appendChild(bar);
-    root.append(heading, label, track);
-    mount.appendChild(root);
-    const card = { root, label, bar, timer: null };
-    progressCards.add(card);
-    return card;
-  } catch {
-    return null;
-  }
+  document?: Document,
+): UpdateProgressHandle {
+  return createUpdateProgress({
+    document,
+    title: "Updating citation data",
+    message: `Preparing ${total} paper${total === 1 ? "" : "s"} with ${getProviderLabel(provider)}`,
+    total,
+  });
 }
 
 function updateProgress(
-  card: ProgressCard | null,
-  current: number,
+  progress: UpdateProgressHandle | null,
+  completed: number,
+  started: number,
   total: number,
   title: string,
 ): void {
-  if (!card || shuttingDown) return;
-  card.label.textContent = `Updating ${current}/${total}: ${title}`;
-  card.bar.style.width = `${Math.round((current / Math.max(1, total)) * 100)}%`;
+  if (!progress || shuttingDown) return;
+  const active = Math.max(0, started - completed);
+  progress.setProgress(
+    completed,
+    total,
+    `Updating ${completed}/${total} complete${active ? ` · ${active} active` : ""}: ${title}`,
+  );
 }
 
 function finishProgress(
-  card: ProgressCard | null,
+  progress: UpdateProgressHandle | null,
   result: CitationUpdateBatchResult,
 ): void {
-  if (!card || shuttingDown) return;
-  card.label.textContent = `${result.updated} updated · ${result.cached} current · ${result.failed} failed · ${result.skipped} skipped`;
-  card.bar.style.width = "100%";
-  card.timer = setTimeout(() => {
-    card.root.remove();
-    progressCards.delete(card);
-  }, 3500);
+  if (!progress || shuttingDown) return;
+  progress.finish(
+    `${result.updated} updated · ${result.cached} current · ${result.failed} failed · ${result.skipped} skipped`,
+  );
 }
 
 function nextRetryAt(
@@ -206,6 +249,8 @@ async function updateOneItem(
   item: Zotero.Item,
   preference: CitationProviderPreference,
   force: boolean,
+  includeRelationships: boolean,
+  includeOptionalEnrichment: boolean,
 ): Promise<UpdateOutcome> {
   if (shuttingDown || isCitationRequestCancellationRequested()) {
     return "skipped";
@@ -227,7 +272,7 @@ async function updateOneItem(
     preference,
     identifiers,
     getExactTitleFallbackEnabled(),
-    force,
+    includeOptionalEnrichment,
   );
   if (shuttingDown || isCitationRequestCancellationRequested()) {
     return "skipped";
@@ -258,6 +303,10 @@ async function updateOneItem(
     result.matchedBy === "doi" ||
     result.matchedBy === "title" ||
     sameConfirmedIdentity;
+  const mergedReferences = mergeRelatedWorkLists(
+    previous?.references ?? [],
+    result.references,
+  );
   const record: CitationMetricRecord = {
     libraryID,
     itemKey,
@@ -277,8 +326,12 @@ async function updateOneItem(
     citationCountProvider: result.citationCountProvider,
     referenceCount: result.referenceCount,
     referenceCountProvider: result.referenceCountProvider,
-    resolvedReferenceCount: result.resolvedReferenceCount,
-    references: result.references,
+    resolvedReferenceCount: Math.max(
+      previous?.resolvedReferenceCount ?? 0,
+      result.resolvedReferenceCount,
+      mergedReferences.length,
+    ),
+    references: mergedReferences,
     matchCandidates: [],
     fwci: result.fwci ?? null,
     citationPercentile: result.citationPercentile ?? null,
@@ -302,6 +355,32 @@ async function updateOneItem(
     nextRetryAt: null,
   };
   await saveCitationMetricRecord(record);
+
+  // The references embedded in the metric response are cheap to persist and
+  // are merged immediately. Complete paginated relationship hydration is
+  // optional so a multi-item count update cannot remain at 0/N while waiting
+  // for hundreds of relationship requests.
+  try {
+    const node = createMetricNodeForItem(item);
+    await storeExternalRelationshipSnapshot(
+      node,
+      "references",
+      record.references,
+    );
+    if (includeRelationships) {
+      await refreshExternalRelationships(node, [node], "references");
+      if ((record.citationCount ?? 0) > 0) {
+        await refreshExternalRelationships(node, [node], "cited-by");
+      } else {
+        await storeExternalRelationshipSnapshot(node, "cited-by", []);
+      }
+    }
+  } catch (error) {
+    Zotero.debug(
+      "Citation Map: relationship refresh failed for " +
+        `${itemKey}: ${String(error)}`,
+    );
+  }
   return "updated";
 }
 
@@ -312,6 +391,11 @@ async function runUpdate(
   const selected = regularItems(items);
   const provider = options.provider ?? getProviderPreference();
   const force = Boolean(options.force);
+  const includeRelationships =
+    options.includeRelationships ?? selected.length === 1;
+  // Optional provider enrichment is valuable for direct single-paper refreshes
+  // but makes Ctrl+A batches substantially slower and less predictable.
+  const includeOptionalEnrichment = force && selected.length <= 3;
   const result: CitationUpdateBatchResult = {
     total: selected.length,
     updated: 0,
@@ -331,9 +415,10 @@ async function runUpdate(
   result.cached = selected.length - pending.length;
   const progress = options.silent
     ? null
-    : createProgress(pending.length, provider);
+    : createProgress(pending.length, provider, options.progressDocument);
 
   let nextIndex = 0;
+  let started = 0;
   let completed = 0;
   const worker = async (): Promise<void> => {
     while (!shuttingDown && !isCitationRequestCancellationRequested()) {
@@ -341,9 +426,33 @@ async function runUpdate(
       nextIndex += 1;
       if (index >= pending.length) return;
       const item = pending[index];
+      started += 1;
+      updateProgress(
+        progress,
+        completed,
+        started,
+        pending.length,
+        String(item.getField("title") ?? "Untitled"),
+      );
+      // Let Zotero paint the modeless progress window before provider work starts.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
       let outcome: UpdateOutcome;
       try {
-        outcome = await updateOneItem(item, provider, force);
+        const deadline =
+          pending.length === 1
+            ? SINGLE_ITEM_DEADLINE_MS
+            : BATCH_ITEM_DEADLINE_MS;
+        outcome = await withDeadline(
+          updateOneItem(
+            item,
+            provider,
+            force,
+            includeRelationships,
+            includeOptionalEnrichment,
+          ),
+          deadline,
+          `Citation update for ${String(item.getField("title") ?? item.key)}`,
+        );
       } catch (error) {
         Zotero.logError(
           error instanceof Error ? error : new Error(String(error)),
@@ -355,29 +464,35 @@ async function runUpdate(
       updateProgress(
         progress,
         completed,
+        started,
         pending.length,
         String(item.getField("title") ?? "Untitled"),
       );
     }
   };
 
-  await Promise.all(
-    Array.from(
-      { length: Math.min(ITEM_UPDATE_CONCURRENCY, pending.length) },
-      () => worker(),
-    ),
-  );
+  try {
+    await Promise.all(
+      Array.from(
+        { length: Math.min(ITEM_UPDATE_CONCURRENCY, pending.length) },
+        () => worker(),
+      ),
+    );
+  } finally {
+    const accounted =
+      result.updated + result.cached + result.failed + result.skipped;
+    if (accounted < selected.length) {
+      result.skipped += selected.length - accounted;
+    }
 
-  const accounted =
-    result.updated + result.cached + result.failed + result.skipped;
-  if (accounted < selected.length)
-    result.skipped += selected.length - accounted;
-
-  if (!shuttingDown && !isCitationRequestCancellationRequested()) {
-    refreshCitationColumns();
-    refreshCitationItemPanes();
-    await refreshOpenCitationMapViews();
-    finishProgress(progress, result);
+    if (!shuttingDown && !isCitationRequestCancellationRequested()) {
+      // Finish the user-visible operation before refreshing secondary views. A
+      // graph-tab lifecycle problem must never leave citation progress stuck.
+      finishProgress(progress, result);
+      refreshViewsAfterUpdate(selected.length <= 3);
+    } else {
+      progress?.dismiss();
+    }
   }
   return result;
 }
@@ -386,7 +501,19 @@ export function updateCitationDataForItems(
   items: Zotero.Item[],
   options: UpdateOptions = {},
 ): Promise<CitationUpdateBatchResult> {
-  return runSerialized(() => runUpdate(items, options));
+  const waitingProgress =
+    !options.silent && operationBusy
+      ? createUpdateProgress({
+          document: options.progressDocument,
+          title: "Updating citation data",
+          message: "Waiting for the current citation update to finish…",
+          total: Math.max(1, regularItems(items).length),
+        })
+      : null;
+  return runSerialized(async () => {
+    waitingProgress?.dismiss();
+    return runUpdate(items, options);
+  });
 }
 
 export async function updateWholeLibraryCitationData(
@@ -456,8 +583,12 @@ export function registerAutomaticCitationUpdates(): void {
         "startup stale-item refresh",
         updateWholeLibraryCitationData({ silent: true }),
       );
-    }, 4500);
+    }, 30000);
   }
+}
+
+export function unloadCitationUpdateUI(): void {
+  closeAllUpdateProgress();
 }
 
 export function unregisterAutomaticCitationUpdates(): void {
@@ -472,11 +603,7 @@ export function unregisterAutomaticCitationUpdates(): void {
   startupTimer = null;
   pendingTimer = null;
   pendingItemIDs.clear();
-  for (const card of progressCards) {
-    if (card.timer) clearTimeout(card.timer);
-    card.root.remove();
-  }
-  progressCards.clear();
+  unloadCitationUpdateUI();
 }
 
 export async function waitForCitationUpdates(

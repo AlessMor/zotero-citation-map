@@ -32,20 +32,22 @@ async function runPreferenceAction(
 
 function exposePreferenceActions(): void {
   Object.assign(addon.api, {
-    refreshAll: (): Promise<void> =>
-      runPreferenceAction("refreshing stale items", async () => {
+    refreshAll: (): void => {
+      void runPreferenceAction("refreshing stale items", async () => {
         await updateWholeLibraryCitationData({
           force: false,
           silent: false,
         });
-      }),
-    clearCache: (): Promise<void> =>
-      runPreferenceAction("clearing the citation cache", async () => {
+      });
+    },
+    clearCache: (): void => {
+      void runPreferenceAction("clearing the citation cache", async () => {
         await Promise.all([clearCitationMetrics(), clearExternalWorkCache()]);
         refreshCitationColumns();
         refreshCitationItemPanes();
         await refreshOpenCitationMapViews();
-      }),
+      });
+    },
     cacheStatus: (): ReturnType<typeof getCitationCacheStatus> =>
       getCitationCacheStatus(),
   });

@@ -32,8 +32,11 @@ const MIN_DELAY_MS: Record<CitationProviderID, number> = {
   openalex: 1100,
 };
 const providerQueues = new Map<CitationProviderID, ProviderQueueState>();
-const RETRY_DELAYS_MS = [1200, 3500];
-const REQUEST_TIMEOUT_MS = 30000;
+// One bounded retry is enough for interactive updates. Multiple 30-second
+// retries used to block every request queued behind one unavailable provider.
+const RETRY_DELAYS_MS = [1500];
+const REQUEST_TIMEOUT_MS = 15000;
+const MAX_RETRY_AFTER_MS = 15000;
 const activeRequestCancellers = new Set<() => void>();
 const activeDelayCancellers = new Set<() => void>();
 let cancellationRequested = false;
@@ -80,10 +83,8 @@ function postponeProvider(
   milliseconds: number,
 ): void {
   const state = queueState(provider);
-  state.nextStartAt = Math.max(
-    state.nextStartAt,
-    Date.now() + Math.max(0, milliseconds),
-  );
+  const bounded = Math.min(MAX_RETRY_AFTER_MS, Math.max(0, milliseconds));
+  state.nextStartAt = Math.max(state.nextStartAt, Date.now() + bounded);
 }
 
 async function runInProviderQueue<T>(
@@ -232,10 +233,14 @@ export async function requestJSON<T>(
         response.status === 429 ||
         response.status >= 500;
       if (retryable && attempt < RETRY_DELAYS_MS.length) {
-        postponeProvider(
-          provider,
-          parseRetryAfter(response) ?? RETRY_DELAYS_MS[attempt],
-        );
+        const retryAfter = parseRetryAfter(response);
+        // A long Retry-After should fail this interactive update promptly
+        // instead of freezing every request queued for the provider. The next
+        // user-initiated refresh can try again later.
+        if (retryAfter !== null && retryAfter > MAX_RETRY_AFTER_MS) {
+          return parseJSON<T>(provider, response);
+        }
+        postponeProvider(provider, retryAfter ?? RETRY_DELAYS_MS[attempt]);
         continue;
       }
       return parseJSON<T>(provider, response);

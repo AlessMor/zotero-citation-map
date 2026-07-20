@@ -150,12 +150,14 @@ async function successFromPaper(
   paper: S2Paper,
   matchedBy: "doi" | "pmid" | "arxiv" | "isbn" | "title",
   confidence: number,
+  includeReferences = true,
 ): Promise<ProviderLookupSuccess> {
   const related = toRelated(paper);
   const paperID = String(paper.paperId ?? "");
-  const references = paperID
-    ? await fetchRelations(paperID, "references", BACKGROUND_REFERENCE_LIMIT)
-    : [];
+  const references =
+    includeReferences && paperID
+      ? await fetchRelations(paperID, "references", BACKGROUND_REFERENCE_LIMIT)
+      : [];
   return {
     status: "success",
     provider: "semantic-scholar",
@@ -206,8 +208,9 @@ function identifier(identifiers: WorkIdentifiers): {
   return null;
 }
 
-async function lookup(
+async function lookupPaper(
   identifiers: WorkIdentifiers,
+  includeReferences: boolean,
 ): Promise<ProviderLookupResult> {
   const selected = identifier(identifiers);
   if (!selected) {
@@ -233,7 +236,20 @@ async function lookup(
     response.data,
     selected.kind,
     selected.kind === "doi" ? 1 : 0.98,
+    includeReferences,
   );
+}
+
+async function lookup(
+  identifiers: WorkIdentifiers,
+): Promise<ProviderLookupResult> {
+  return lookupPaper(identifiers, true);
+}
+
+async function lookupForRelations(
+  identifiers: WorkIdentifiers,
+): Promise<ProviderLookupResult> {
+  return lookupPaper(identifiers, false);
 }
 
 async function searchExactTitle(
@@ -305,6 +321,7 @@ export const semanticScholarProvider: CitationProvider = {
   },
   supports: (identifiers) => Boolean(identifier(identifiers)),
   lookup,
+  lookupForRelations,
   searchExactTitle,
   fetchCitingWorks: (paperID, maximum, offset) =>
     fetchRelations(paperID, "citations", maximum, offset),

@@ -30,6 +30,9 @@ export interface CitationProvider {
   readonly capabilities: ProviderCapabilities;
   supports(identifiers: WorkIdentifiers): boolean;
   lookup(identifiers: WorkIdentifiers): Promise<ProviderLookupResult>;
+  lookupForRelations?(
+    identifiers: WorkIdentifiers,
+  ): Promise<ProviderLookupResult>;
   searchExactTitle?(
     identifiers: WorkIdentifiers,
   ): Promise<ProviderLookupResult>;

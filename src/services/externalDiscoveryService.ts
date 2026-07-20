@@ -13,13 +13,17 @@ import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
 import { getCitationMetricRecord } from "./citationMetricsStore";
 import {
   cachedExternalWorkMetadata,
-  getExternalRelationshipCacheEntry,
-  saveExternalRelationshipCache,
   saveExternalWorkCacheNotFound,
   saveExternalWorkCacheSuccess,
+  saveExternalWorkCacheSuccesses,
   shouldResolveExternalWork,
-  type ExternalRelationshipCacheEntry,
 } from "./externalWorkCacheService";
+import {
+  getStoredRelationshipEntry,
+  getStoredRelationshipWorks,
+  mergeRelatedWorkLists,
+  mergeStoredRelationships,
+} from "./relationshipStoreService";
 
 function nodeLibraryID(node: CitationGraphNode): number {
   const item = Zotero.Items.get(node.itemID) as Zotero.Item | null;
@@ -36,55 +40,20 @@ export interface ExternalWork extends RelatedWorkMetadata {
 }
 
 const RELATIONSHIP_MAX_AGE_MS = 30 * 86400000;
-
-function relationshipCacheKey(
-  node: CitationGraphNode,
-  direction: "references" | "cited-by",
-): string {
-  const doi = normalizeDOI(node.doi);
-  if (doi) return `${direction}:doi:${doi}`;
-  if (node.provider && node.providerWorkID) {
-    return `${direction}:provider:${node.provider}:${node.providerWorkID.toLocaleLowerCase()}`;
-  }
-  const title = normalizeExactTitle(node.title);
-  if (title)
-    return `${direction}:title:${title}:year:${node.year ?? "unknown"}`;
-  return `${direction}:library:${nodeLibraryID(node)}:item:${node.itemKey}`;
-}
-
-function legacyRelationshipCacheKey(
-  node: CitationGraphNode,
-  direction: "references" | "cited-by",
-): string {
-  return `${direction}:library:${nodeLibraryID(node)}:item:${node.itemKey}`;
-}
-
-function cachedRelationshipEntry(
-  node: CitationGraphNode,
-  direction: "references" | "cited-by",
-): ExternalRelationshipCacheEntry | null {
-  const key = relationshipCacheKey(node, direction);
-  return (
-    getExternalRelationshipCacheEntry(key) ??
-    getExternalRelationshipCacheEntry(
-      legacyRelationshipCacheKey(node, direction),
-    )
-  );
-}
+const RELATIONSHIP_FETCH_PAGE_SIZE = 200;
+const RELATIONSHIP_MAX_PAGES = 20;
 
 function cachedRelationshipResults(
   node: CitationGraphNode,
   direction: "references" | "cited-by",
 ): ExternalWork[] {
-  return (
-    cachedRelationshipEntry(node, direction)?.works.map((work) => ({
-      ...work,
-    })) ?? []
-  );
+  return getStoredRelationshipWorks(node, direction).map((work) => ({
+    ...work,
+  }));
 }
 
 function relationshipCacheIsFresh(
-  entry: ExternalRelationshipCacheEntry | null,
+  entry: ReturnType<typeof getStoredRelationshipEntry>,
 ): boolean {
   if (!entry) return false;
   const fetchedAt = Date.parse(entry.fetchedAt);
@@ -94,15 +63,62 @@ function relationshipCacheIsFresh(
   );
 }
 
+function compactRelationshipWork(work: ExternalWork): ExternalWork {
+  return {
+    provider: work.provider,
+    providerWorkID: work.providerWorkID,
+    doi: work.doi,
+    pmid: work.pmid ?? null,
+    arxiv: work.arxiv ?? null,
+    isbn: work.isbn ?? null,
+    title: externalWorkDisplayTitle(work) ?? work.title,
+    year: work.year,
+    authors: work.authors.slice(0, 5),
+    sourceTitle: work.sourceTitle ?? null,
+    citationCount: work.citationCount ?? null,
+    referenceCount: work.referenceCount ?? null,
+    isOpenAccess: work.isOpenAccess ?? null,
+    openAccessStatus: work.openAccessStatus ?? null,
+    isRetracted: work.isRetracted ?? null,
+    zoteroItemKey: work.zoteroItemKey ?? null,
+    inLibraryItemKey: work.inLibraryItemKey ?? null,
+  };
+}
+
 async function cacheRelationshipResults(
   node: CitationGraphNode,
   direction: "references" | "cited-by",
   works: ExternalWork[],
 ): Promise<void> {
-  if (!works.length) return;
-  const relationshipKey = relationshipCacheKey(node, direction);
-  const snapshot = works.map((work) => ({ ...work }));
-  await saveExternalRelationshipCache(relationshipKey, snapshot);
+  const snapshot = works.map(compactRelationshipWork);
+  const cacheEntries: Array<{
+    identityKey: string;
+    metadata: RelatedWorkMetadata;
+  }> = [];
+  for (const work of snapshot) {
+    const key = identityKey(work);
+    if (key) cacheEntries.push({ identityKey: key, metadata: work });
+  }
+  await saveExternalWorkCacheSuccesses(cacheEntries);
+  await mergeStoredRelationships(node, direction, snapshot);
+}
+
+export async function storeExternalRelationshipSnapshot(
+  node: CitationGraphNode,
+  direction: "references" | "cited-by",
+  works: RelatedWorkMetadata[],
+): Promise<void> {
+  // Relationship refreshes persist the provider payload immediately. Metadata
+  // enrichment remains an explicit, lazy operation so large bibliographies do
+  // not block Zotero's main thread.
+  await cacheRelationshipResults(
+    node,
+    direction,
+    works.map((work) => ({
+      ...work,
+      inLibraryItemKey: work.zoteroItemKey ?? null,
+    })),
+  );
 }
 
 interface ResolutionCandidate {
@@ -132,14 +148,18 @@ function toExternal(
   localByDOI: Map<string, string>,
   localByTitle: Map<string, string>,
 ): ExternalWork {
-  const doi = normalizeDOI(work.doi);
-  const title = normalizeExactTitle(work.title);
+  const key = identityKey(work);
+  const resolved = key
+    ? mergeMetadata(work, cachedExternalWorkMetadata(key))
+    : work;
+  const doi = normalizeDOI(resolved.doi);
+  const title = normalizeExactTitle(resolved.title);
   return {
-    ...work,
+    ...resolved,
     inLibraryItemKey:
       (doi ? localByDOI.get(doi) : null) ??
       (title ? localByTitle.get(title) : null) ??
-      work.zoteroItemKey ??
+      resolved.zoteroItemKey ??
       null,
   };
 }
@@ -169,9 +189,38 @@ function identityKey(work: RelatedWorkMetadata): string | null {
   return title ? `title:${title}` : null;
 }
 
+function usableExternalTitle(
+  title: string | null | undefined,
+  doi: string | null | undefined,
+): string | null {
+  const value = String(title ?? "").trim();
+  if (!value) return null;
+  const normalizedValue = value
+    .replace(/^doi:\s*/i, "")
+    .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "")
+    .trim()
+    .toLocaleLowerCase();
+  const normalizedDOI = normalizeDOI(doi);
+  if (normalizedDOI && normalizedValue === normalizedDOI) return null;
+  if (/^https?:\/\//i.test(value)) return null;
+  return value;
+}
+
+export function externalWorkDisplayTitle(
+  work: RelatedWorkMetadata,
+): string | null {
+  const direct = usableExternalTitle(work.title, work.doi);
+  if (direct) return direct;
+  const key = identityKey(work);
+  const cached = key ? cachedExternalWorkMetadata(key) : null;
+  return cached
+    ? usableExternalTitle(cached.title, cached.doi ?? work.doi)
+    : null;
+}
+
 function needsExternalMetadata(work: RelatedWorkMetadata): boolean {
   return (
-    !work.title?.trim() ||
+    !externalWorkDisplayTitle(work) ||
     work.year === null ||
     work.authors.length === 0 ||
     !work.sourceTitle?.trim() ||
@@ -206,7 +255,11 @@ function mergeMetadata<T extends RelatedWorkMetadata>(
     pmid: work.pmid ?? metadata.pmid,
     arxiv: work.arxiv ?? metadata.arxiv,
     isbn: work.isbn ?? metadata.isbn,
-    title: work.title?.trim() ? work.title : metadata.title,
+    title:
+      usableExternalTitle(work.title, work.doi) ??
+      usableExternalTitle(metadata.title, metadata.doi) ??
+      work.title ??
+      metadata.title,
     year: work.year ?? metadata.year,
     authors: work.authors.length ? work.authors : metadata.authors,
     sourceTitle: work.sourceTitle ?? metadata.sourceTitle,
@@ -402,9 +455,8 @@ async function lookupProviderRecord(
   identifiers: WorkIdentifiers,
 ) {
   const provider = getCitationProvider(providerID);
-  let match = provider.supports(identifiers)
-    ? await provider.lookup(identifiers)
-    : null;
+  const lookup = provider.lookupForRelations ?? provider.lookup;
+  let match = provider.supports(identifiers) ? await lookup(identifiers) : null;
   if (
     (!match || match.status !== "success") &&
     provider.searchExactTitle &&
@@ -420,104 +472,164 @@ async function lookupProviderRecord(
   return null;
 }
 
+const RELATIONSHIP_PROVIDER_TIMEOUT_MS = 15000;
+const RELATIONSHIP_FALLBACK_PROVIDER_LIMIT = 3;
+
+async function relationshipProviderResult(
+  providerID: CitationProviderID,
+  node: CitationGraphNode,
+  direction: "references" | "cited-by",
+  maximum: number,
+  offset: number,
+  identifiers: WorkIdentifiers,
+): Promise<RelatedWorkMetadata[]> {
+  try {
+    const provider = getCitationProvider(providerID);
+    const fetcher =
+      direction === "references"
+        ? provider.fetchReferencedWorks
+        : provider.fetchCitingWorks;
+
+    if (direction === "cited-by" && !fetcher) return [];
+
+    const match = await lookupProviderRecord(providerID, node, identifiers);
+    let works: RelatedWorkMetadata[] = [];
+    if (
+      direction === "references" &&
+      offset === 0 &&
+      match?.references?.length
+    ) {
+      works = mergeRelatedWorkLists(works, match.references);
+    }
+    if (!fetcher) return works.slice(0, maximum);
+
+    const providerWorkID =
+      match?.providerWorkID ??
+      (providerID === node.provider ? node.providerWorkID : null) ??
+      (providerID === "opencitations" ? normalizeDOI(node.doi) : null);
+    if (!providerWorkID) return works.slice(0, maximum);
+
+    const fetched = await fetcher(providerWorkID, maximum, offset);
+    return mergeRelatedWorkLists(works, fetched).slice(0, maximum);
+  } catch (error) {
+    Zotero.debug(
+      `Citation Map: ${providerID} ${direction} lookup failed: ${String(error)}`,
+    );
+    return [];
+  }
+}
+
+async function relationshipProviderResultWithTimeout(
+  providerID: CitationProviderID,
+  node: CitationGraphNode,
+  direction: "references" | "cited-by",
+  maximum: number,
+  offset: number,
+  identifiers: WorkIdentifiers,
+): Promise<RelatedWorkMetadata[]> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      relationshipProviderResult(
+        providerID,
+        node,
+        direction,
+        maximum,
+        offset,
+        identifiers,
+      ),
+      new Promise<RelatedWorkMetadata[]>((resolve) => {
+        timer = setTimeout(() => {
+          Zotero.debug(
+            `Citation Map: ${providerID} ${direction} lookup timed out`,
+          );
+          resolve([]);
+        }, RELATIONSHIP_PROVIDER_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
 async function fetchFromProviders(
   node: CitationGraphNode,
   direction: "references" | "cited-by",
   maximum: number,
   offset: number,
+  expandCoverage: boolean,
 ): Promise<RelatedWorkMetadata[]> {
-  const providerIDs: CitationProviderID[] = [
+  const orderedProviders: CitationProviderID[] = [
     node.provider ?? "crossref",
-    "crossref",
+    direction === "references" ? "crossref" : "semantic-scholar",
     "semantic-scholar",
     "openalex",
     "opencitations",
     "inspire",
   ];
-  const identifiers = identifiersForNode(node);
-  let works: RelatedWorkMetadata[] = [];
-
-  for (const providerID of [...new Set(providerIDs)]) {
-    try {
-      const provider = getCitationProvider(providerID);
-      const match = await lookupProviderRecord(providerID, node, identifiers);
-
-      // Crossref and INSPIRE expose their structured bibliography directly in
-      // the lookup result and do not necessarily implement a separate relation
-      // endpoint. Preserve those records before trying endpoint-based providers.
-      if (direction === "references" && match?.references?.length) {
-        works = mergeWorkLists(works, match.references);
-      }
-
-      const fetcher =
-        direction === "references"
-          ? provider.fetchReferencedWorks
-          : provider.fetchCitingWorks;
-      if (!fetcher) continue;
-
-      const providerWorkID =
-        match?.providerWorkID ??
-        (providerID === node.provider ? node.providerWorkID : null) ??
-        (providerID === "opencitations" ? normalizeDOI(node.doi) : null);
-      if (!providerWorkID) continue;
-
-      const fetched = await fetcher(providerWorkID, maximum, offset);
-      if (fetched.length) works = mergeWorkLists(works, fetched);
-    } catch (error) {
-      Zotero.debug(
-        `Citation Map: ${providerID} ${direction} lookup failed: ${String(error)}`,
-      );
+  const providerIDs = [...new Set(orderedProviders)].filter((providerID) => {
+    const provider = getCitationProvider(providerID);
+    if (direction === "references") {
+      // Embedded reference lists are useful for the first page only. Later
+      // pages must come from providers exposing a real paginated endpoint.
+      return offset === 0 || Boolean(provider.fetchReferencedWorks);
     }
-  }
+    return Boolean(provider.fetchCitingWorks);
+  });
+  const identifiers = identifiersForNode(node);
+  const record = getCitationMetricRecord(nodeLibraryID(node), node.itemKey);
+  const reported =
+    direction === "references"
+      ? (record?.referenceCount ?? node.referenceCount)
+      : (record?.citationCount ?? node.citationCount);
+  const target =
+    reported === null
+      ? maximum
+      : Math.min(maximum, Math.max(0, reported - offset));
+  const selectedProviders = expandCoverage
+    ? providerIDs.slice(0, 1 + RELATIONSHIP_FALLBACK_PROVIDER_LIMIT)
+    : providerIDs.slice(0, 1);
+  if (!selectedProviders.length || target === 0) return [];
 
+  // Explicit relationship refreshes query a small provider set concurrently.
+  // Results are consumed as they arrive and the operation returns as soon as
+  // the provider-reported target has been reached. Each provider has its own
+  // deadline, so a slow fallback cannot leave the UI in an updating state.
+  const pending = selectedProviders.map((providerID, index) => ({
+    index,
+    promise: relationshipProviderResultWithTimeout(
+      providerID,
+      node,
+      direction,
+      maximum,
+      offset,
+      identifiers,
+    ).then((result) => ({ index, result })),
+  }));
+  let works: RelatedWorkMetadata[] = [];
+  while (pending.length) {
+    const settled = await Promise.race(pending.map((entry) => entry.promise));
+    const pendingIndex = pending.findIndex(
+      (entry) => entry.index === settled.index,
+    );
+    if (pendingIndex >= 0) pending.splice(pendingIndex, 1);
+    works = mergeRelatedWorkLists(works, settled.result);
+    if (works.length >= target) break;
+  }
   return works.slice(0, maximum);
 }
 
-function mergeWorkLists(
-  existing: RelatedWorkMetadata[],
-  fetched: RelatedWorkMetadata[],
-): RelatedWorkMetadata[] {
-  const output = [...existing];
-  const indexByIdentity = new Map<string, number>();
-  output.forEach((work, index) => {
-    const key = identityKey(work);
-    if (key) indexByIdentity.set(key, index);
-  });
-  for (const work of fetched) {
-    const key = identityKey(work);
-    const existingIndex = key ? indexByIdentity.get(key) : undefined;
-    if (existingIndex === undefined) {
-      if (key) indexByIdentity.set(key, output.length);
-      output.push(work);
-    } else {
-      output[existingIndex] = mergeMetadata(output[existingIndex], work);
-    }
-  }
-  return output;
-}
-
-function cachedReferenceWorks(
-  node: CitationGraphNode,
-  maximum: number,
-  offset: number,
-): RelatedWorkMetadata[] {
+function cachedReferenceWorks(node: CitationGraphNode): RelatedWorkMetadata[] {
   const record = getCitationMetricRecord(nodeLibraryID(node), node.itemKey);
-  const persisted = (
-    record?.references.slice(offset, offset + maximum) ?? []
-  ).map((work) => {
+  const persisted = (record?.references ?? []).map((work) => {
     const key = identityKey(work);
     return key ? mergeMetadata(work, cachedExternalWorkMetadata(key)) : work;
   });
-  const nodeReferences = node.references.slice(offset, offset + maximum);
-  const shared = cachedRelationshipResults(node, "references").slice(
-    offset,
-    offset + maximum,
+  return mergeRelatedWorkLists(
+    getStoredRelationshipWorks(node, "references"),
+    persisted,
+    node.references,
   );
-  const cached = mergeWorkLists(
-    mergeWorkLists(persisted, nodeReferences),
-    shared,
-  );
-  return cached.slice(0, maximum);
 }
 
 function toExternalWorks(
@@ -535,7 +647,7 @@ export function getCachedExternalReferences(
   offset: number,
 ): ExternalWork[] {
   return toExternalWorks(
-    cachedReferenceWorks(node, maximum, offset),
+    cachedReferenceWorks(node).slice(offset, offset + maximum),
     libraryNodes,
   );
 }
@@ -552,51 +664,124 @@ export function getCachedExternalCitedBy(
   );
 }
 
+export async function refreshExternalRelationships(
+  node: CitationGraphNode,
+  libraryNodes: CitationGraphNode[],
+  direction: "references" | "cited-by",
+  maximum = 2500,
+): Promise<ExternalWork[]> {
+  const record = getCitationMetricRecord(nodeLibraryID(node), node.itemKey);
+  const reported =
+    direction === "references"
+      ? (record?.referenceCount ?? node.referenceCount)
+      : (record?.citationCount ?? node.citationCount);
+  const target = Math.min(maximum, Math.max(0, reported ?? maximum));
+  let merged =
+    direction === "references"
+      ? cachedReferenceWorks(node)
+      : getStoredRelationshipWorks(node, "cited-by");
+  let offset = 0;
+  let pages = 0;
+  let previousPageSignature: string | null = null;
+
+  // Explicit refreshes walk the provider endpoint from its first page. This
+  // fills gaps left by earlier partial refreshes and also discovers new citing
+  // works returned at the head of newest-first endpoints. Stored records are
+  // merged and are never removed by a shorter provider response.
+  while (offset < target && pages < RELATIONSHIP_MAX_PAGES) {
+    const requested = Math.min(
+      RELATIONSHIP_FETCH_PAGE_SIZE,
+      Math.max(1, target - offset),
+    );
+    const page = await fetchFromProviders(
+      node,
+      direction,
+      requested,
+      offset,
+      true,
+    );
+    pages += 1;
+    if (!page.length) break;
+
+    const pageSignature = page
+      .map((work) => identityKey(work) ?? JSON.stringify(work))
+      .join("|");
+    if (pageSignature === previousPageSignature) break;
+    previousPageSignature = pageSignature;
+    merged = mergeRelatedWorkLists(merged, page);
+    await cacheRelationshipResults(
+      node,
+      direction,
+      toExternalWorks(page, libraryNodes),
+    );
+
+    // Pagination offsets refer to provider rows, not the deduplicated local
+    // list. Advance by the number returned, but stop when a provider repeats
+    // a page or exposes fewer rows than requested.
+    offset += page.length;
+    if (page.length < requested) break;
+  }
+
+  const stored = getStoredRelationshipWorks(node, direction);
+  const all = mergeRelatedWorkLists(merged, stored).slice(0, maximum);
+  return toExternalWorks(all, libraryNodes);
+}
+
 export async function getExternalReferences(
   node: CitationGraphNode,
   libraryNodes: CitationGraphNode[],
   maximum = 100,
   offset = 0,
+  forceRefresh = false,
+  expandCoverage = forceRefresh,
 ): Promise<ExternalWork[]> {
-  const relationshipEntry = cachedRelationshipEntry(node, "references");
-  const relationshipKeyChanged =
-    relationshipEntry !== null &&
-    relationshipEntry.relationshipKey !==
-      relationshipCacheKey(node, "references");
-  const cached = cachedReferenceWorks(node, maximum, offset);
-  let works: RelatedWorkMetadata[] = cached;
+  const relationshipEntry = getStoredRelationshipEntry(node, "references");
+  const cached = cachedReferenceWorks(node);
+  const refreshOffset =
+    forceRefresh && offset === 0 ? cached.length : Math.max(0, offset);
   const expectedCount =
     node.referenceCount === null
       ? cached.length
-      : Math.min(maximum, Math.max(0, node.referenceCount - offset));
+      : Math.min(maximum, Math.max(0, node.referenceCount - refreshOffset));
+  let fetched: RelatedWorkMetadata[] = [];
   if (
-    !relationshipCacheIsFresh(relationshipEntry) &&
-    (cached.length === 0 || cached.length < expectedCount)
+    (forceRefresh || !relationshipCacheIsFresh(relationshipEntry)) &&
+    (forceRefresh || cached.length < offset + expectedCount)
   ) {
-    const fetched = await fetchFromProviders(
+    fetched = await fetchFromProviders(
       node,
       "references",
       maximum,
-      offset,
+      refreshOffset,
+      expandCoverage,
     );
-    if (fetched.length > 0) {
-      works = mergeWorkLists(cached, fetched).slice(0, maximum);
-      await Promise.all(
-        fetched.map(async (work) => {
-          const key = identityKey(work);
-          if (key) await saveExternalWorkCacheSuccess(key, work);
-        }),
+
+    // Some providers only expose an embedded first page and do not support
+    // pagination. If the next-page request returned nothing, refresh the head
+    // page once so newly corrected provider records can still be merged.
+    if (forceRefresh && refreshOffset > 0 && fetched.length === 0) {
+      fetched = await fetchFromProviders(
+        node,
+        "references",
+        maximum,
+        0,
+        expandCoverage,
       );
     }
   }
-  const external = toExternalWorks(works, libraryNodes);
-  if (
-    external.length > 0 &&
-    (!relationshipCacheIsFresh(relationshipEntry) || relationshipKeyChanged)
-  ) {
-    await cacheRelationshipResults(node, "references", external);
+  if (fetched.length > 0 || !relationshipEntry) {
+    await cacheRelationshipResults(
+      node,
+      "references",
+      toExternalWorks(fetched, libraryNodes),
+    );
   }
-  return external;
+  const merged = mergeRelatedWorkLists(
+    cached,
+    getStoredRelationshipWorks(node, "references"),
+    fetched,
+  );
+  return toExternalWorks(merged.slice(offset, offset + maximum), libraryNodes);
 }
 
 export async function getExternalCitedBy(
@@ -604,31 +789,45 @@ export async function getExternalCitedBy(
   libraryNodes: CitationGraphNode[],
   maximum = 100,
   offset = 0,
+  forceRefresh = false,
+  expandCoverage = forceRefresh,
 ): Promise<ExternalWork[]> {
-  const relationshipEntry = cachedRelationshipEntry(node, "cited-by");
-  const relationshipKeyChanged =
-    relationshipEntry !== null &&
-    relationshipEntry.relationshipKey !==
-      relationshipCacheKey(node, "cited-by");
-  const shared = cachedRelationshipResults(node, "cited-by").slice(
-    offset,
-    offset + maximum,
+  const relationshipEntry = getStoredRelationshipEntry(node, "cited-by");
+  const cached = getStoredRelationshipWorks(node, "cited-by");
+  const refreshOffset =
+    forceRefresh && offset === 0 ? cached.length : Math.max(0, offset);
+  let fetched: RelatedWorkMetadata[] = [];
+  if (forceRefresh || !relationshipCacheIsFresh(relationshipEntry)) {
+    const nextPage = await fetchFromProviders(
+      node,
+      "cited-by",
+      maximum,
+      refreshOffset,
+      expandCoverage,
+    );
+
+    // Citing-paper endpoints commonly return newest records first. Re-read the
+    // first page during an explicit refresh so citations added since the last
+    // update are not skipped merely because a later-page cursor is used.
+    const headPage =
+      forceRefresh && refreshOffset > 0
+        ? await fetchFromProviders(node, "cited-by", maximum, 0, false)
+        : [];
+    fetched = mergeRelatedWorkLists(headPage, nextPage);
+  }
+  if (fetched.length > 0 || !relationshipEntry) {
+    await cacheRelationshipResults(
+      node,
+      "cited-by",
+      toExternalWorks(fetched, libraryNodes),
+    );
+  }
+  const merged = mergeRelatedWorkLists(
+    cached,
+    getStoredRelationshipWorks(node, "cited-by"),
+    fetched,
   );
-  let works: RelatedWorkMetadata[] = shared;
-  let fetchedWorks = false;
-  if (!relationshipCacheIsFresh(relationshipEntry)) {
-    const fetched = await fetchFromProviders(node, "cited-by", maximum, offset);
-    works = mergeWorkLists(shared, fetched).slice(0, maximum);
-    fetchedWorks = fetched.length > 0;
-  }
-  const external = toExternalWorks(works, libraryNodes);
-  if (
-    external.length > 0 &&
-    (fetchedWorks || !relationshipEntry || relationshipKeyChanged)
-  ) {
-    await cacheRelationshipResults(node, "cited-by", external);
-  }
-  return external;
+  return toExternalWorks(merged.slice(offset, offset + maximum), libraryNodes);
 }
 
 export async function getMissingPaperRecommendations(

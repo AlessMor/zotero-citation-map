@@ -1,4 +1,5 @@
 import type { RelatedWorkMetadata } from "../domain/citationTypes";
+import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
 
 export interface ExternalWorkCacheEntry {
   identityKey: string;
@@ -92,6 +93,57 @@ function parseRelationshipWorks(
     );
   }
   return parsed as RelatedWorkMetadata[];
+}
+
+function relationshipWorkIdentity(work: RelatedWorkMetadata): string {
+  const localKey = work.zoteroItemKey?.trim();
+  if (localKey) return `zotero:${localKey.toLocaleUpperCase()}`;
+  const doi = normalizeDOI(work.doi);
+  if (doi) return `doi:${doi}`;
+  if (work.providerWorkID?.trim()) {
+    return `${work.provider}:${work.providerWorkID.trim().toLocaleLowerCase()}`;
+  }
+  const title = normalizeExactTitle(work.title);
+  if (title) return `title:${title}:year:${work.year ?? "unknown"}`;
+  return `${work.provider}:unknown:${JSON.stringify([work.authors.slice(0, 2), work.year])}`;
+}
+
+function mergeRelationshipWorks(
+  existing: RelatedWorkMetadata[],
+  incoming: RelatedWorkMetadata[],
+): RelatedWorkMetadata[] {
+  const merged = new Map<string, RelatedWorkMetadata>();
+  for (const work of [...existing, ...incoming]) {
+    const key = relationshipWorkIdentity(work);
+    const previous = merged.get(key);
+    if (!previous) {
+      merged.set(key, { ...work });
+      continue;
+    }
+    merged.set(key, {
+      ...previous,
+      ...work,
+      providerWorkID: work.providerWorkID ?? previous.providerWorkID,
+      doi: work.doi ?? previous.doi,
+      pmid: work.pmid ?? previous.pmid,
+      arxiv: work.arxiv ?? previous.arxiv,
+      isbn: work.isbn ?? previous.isbn,
+      title: work.title?.trim() ? work.title : previous.title,
+      year: work.year ?? previous.year,
+      authors: work.authors.length ? work.authors : previous.authors,
+      sourceTitle: work.sourceTitle?.trim()
+        ? work.sourceTitle
+        : previous.sourceTitle,
+      abstract: work.abstract?.trim() ? work.abstract : previous.abstract,
+      citationCount: work.citationCount ?? previous.citationCount,
+      referenceCount: work.referenceCount ?? previous.referenceCount,
+      isOpenAccess: work.isOpenAccess ?? previous.isOpenAccess,
+      openAccessStatus: work.openAccessStatus ?? previous.openAccessStatus,
+      isRetracted: work.isRetracted ?? previous.isRetracted,
+      zoteroItemKey: work.zoteroItemKey ?? previous.zoteroItemKey,
+    });
+  }
+  return [...merged.values()];
 }
 
 function rowToRelationshipEntry(
@@ -198,7 +250,8 @@ export async function saveExternalRelationshipCache(
 ): Promise<void> {
   if (closing) return;
   const fetchedAt = new Date().toISOString();
-  const storedWorks = works.map((work) => ({ ...work }));
+  const existing = relationshipMirror.get(relationshipKey)?.works ?? [];
+  const storedWorks = mergeRelationshipWorks(existing, works);
   relationshipMirror.set(relationshipKey, {
     relationshipKey,
     works: storedWorks,
@@ -246,23 +299,40 @@ export async function saveExternalWorkCacheSuccess(
   identityKey: string,
   metadata: RelatedWorkMetadata,
 ): Promise<void> {
-  if (closing) return;
+  await saveExternalWorkCacheSuccesses([{ identityKey, metadata }]);
+}
+
+export async function saveExternalWorkCacheSuccesses(
+  entries: Array<{
+    identityKey: string;
+    metadata: RelatedWorkMetadata;
+  }>,
+): Promise<void> {
+  if (closing || entries.length === 0) return;
   const fetchedAt = new Date().toISOString();
-  const entry: ExternalWorkCacheEntry = {
-    identityKey,
-    status: "success",
-    metadata,
-    fetchedAt,
-    nextRetryAt: null,
-  };
-  mirror.set(identityKey, entry);
+  const unique = new Map<string, RelatedWorkMetadata>();
+  for (const entry of entries) unique.set(entry.identityKey, entry.metadata);
+  for (const [key, value] of unique) {
+    mirror.set(key, {
+      identityKey: key,
+      status: "success",
+      metadata: value,
+      fetchedAt,
+      nextRetryAt: null,
+    });
+  }
   await queueWrite(async () => {
-    await requireDB().queryAsync(
-      `INSERT OR REPLACE INTO external_works
-       (identity_key, status, metadata_json, fetched_at, next_retry_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      [identityKey, "success", JSON.stringify(metadata), fetchedAt, null],
-    );
+    const connection = requireDB();
+    await connection.executeTransaction(async () => {
+      for (const [key, value] of unique) {
+        await connection.queryAsync(
+          `INSERT OR REPLACE INTO external_works
+           (identity_key, status, metadata_json, fetched_at, next_retry_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [key, "success", JSON.stringify(value), fetchedAt, null],
+        );
+      }
+    });
   });
 }
 
