@@ -4,6 +4,7 @@ import {
   getCitationCacheStatus,
 } from "./citationMetricsStore";
 import { getAutomaticUpdatesEnabled } from "./citationPreferences";
+import { clearExternalWorkCache } from "./externalWorkCacheService";
 import { refreshCitationColumns } from "./itemTreeColumnService";
 import { refreshCitationItemPanes } from "./itemPaneService";
 import { updateWholeLibraryCitationData } from "./citationUpdateService";
@@ -12,16 +13,40 @@ import { refreshOpenCitationMapViews } from "./windowService";
 let registered = false;
 const observerIDs: Array<string | symbol> = [];
 
+function preferenceError(context: string, error: unknown): Error {
+  if (error instanceof Error) return error;
+  const detail = error === undefined ? "undefined rejection" : String(error);
+  return new Error(`Citation Map: ${context} failed (${detail})`);
+}
+
+async function runPreferenceAction(
+  context: string,
+  action: () => Promise<void>,
+): Promise<void> {
+  try {
+    await action();
+  } catch (error) {
+    Zotero.logError(preferenceError(context, error));
+  }
+}
+
 function exposePreferenceActions(): void {
   Object.assign(addon.api, {
-    refreshAll: async (): Promise<void> => {
-      await updateWholeLibraryCitationData({ force: true, silent: false });
+    refreshAll: (): void => {
+      void runPreferenceAction("refreshing stale items", async () => {
+        await updateWholeLibraryCitationData({
+          force: false,
+          silent: false,
+        });
+      });
     },
-    clearCache: async (): Promise<void> => {
-      await clearCitationMetrics();
-      refreshCitationColumns();
-      refreshCitationItemPanes();
-      await refreshOpenCitationMapViews();
+    clearCache: (): void => {
+      void runPreferenceAction("clearing the citation cache", async () => {
+        await Promise.all([clearCitationMetrics(), clearExternalWorkCache()]);
+        refreshCitationColumns();
+        refreshCitationItemPanes();
+        await refreshOpenCitationMapViews();
+      });
     },
     cacheStatus: (): ReturnType<typeof getCitationCacheStatus> =>
       getCitationCacheStatus(),
@@ -34,24 +59,25 @@ export async function registerCitationMapPreferencePane(): Promise<void> {
   await Zotero.PreferencePanes.register({
     pluginID: config.addonID,
     src: rootURI + "content/preferences.xhtml",
-    label: config.addonName,
+    label: "Citation Map",
     image: `chrome://${config.addonRef}/content/icons/network.svg`,
   });
-  for (const name of ["automaticUpdates", "provider", "cacheDays"]) {
-    observerIDs.push(
-      Zotero.Prefs.registerObserver(
-        `${config.prefsPrefix}.${name}`,
-        () => {
-          if (getAutomaticUpdatesEnabled()) {
-            // The normal serialized update path and cache checks prevent an
-            // observer change from starting competing requests.
-            void updateWholeLibraryCitationData({ silent: true });
-          }
-        },
-        true,
-      ),
-    );
-  }
+  observerIDs.push(
+    Zotero.Prefs.registerObserver(
+      `${config.prefsPrefix}.automaticUpdates`,
+      () => {
+        if (getAutomaticUpdatesEnabled()) {
+          void runPreferenceAction(
+            "refresh after enabling automatic updates",
+            async () => {
+              await updateWholeLibraryCitationData({ silent: true });
+            },
+          );
+        }
+      },
+      true,
+    ),
+  );
   registered = true;
 }
 

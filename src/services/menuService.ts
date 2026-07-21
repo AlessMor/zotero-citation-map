@@ -56,7 +56,7 @@ export function registerMenus(): void {
             icon: ICON,
             onCommand: () =>
               void updateWholeLibraryCitationData({
-                force: true,
+                force: false,
                 silent: false,
               }).catch(report),
           },

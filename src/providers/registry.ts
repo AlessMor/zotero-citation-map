@@ -222,19 +222,25 @@ export async function lookupCitationMetrics(
 ): Promise<ProviderLookupResult> {
   if (preference !== "auto") {
     const provider = getCitationProvider(preference);
-    if (provider.supports(identifiers)) return provider.lookup(identifiers);
-    if (
+    let result: ProviderLookupResult;
+    if (provider.supports(identifiers)) {
+      result = await provider.lookup(identifiers);
+    } else if (
       allowTitleFallback &&
       provider.searchExactTitle &&
       identifiers.normalizedTitle
     ) {
-      return provider.searchExactTitle(identifiers);
+      result = await provider.searchExactTitle(identifiers);
+    } else {
+      return {
+        status: "no-identifier",
+        provider: provider.id,
+        message: `${provider.label} cannot resolve the identifiers available on this Zotero item.`,
+      };
     }
-    return {
-      status: "no-identifier",
-      provider: provider.id,
-      message: `${provider.label} cannot resolve the identifiers available on this Zotero item.`,
-    };
+    return includeOptionalEnrichment && result.status === "success"
+      ? enrichAutomaticResult(result, identifiers)
+      : result;
   }
 
   const failures: ProviderLookupFailure[] = [];

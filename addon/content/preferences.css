@@ -2,47 +2,38 @@
   margin: 0 0 18px;
   padding: 0;
 }
-
 .citation-map-preferences h2 {
   margin: 0 0 8px;
   font-size: 1.15rem;
 }
-
 .citation-map-pref-row {
   gap: 12px;
   margin-block: 9px;
 }
-
 .citation-map-pref-row html|label {
   min-width: 170px;
 }
-
 .citation-map-pref-row html|input[type="number"] {
   width: 90px;
 }
-
 .citation-map-pref-help {
   max-width: 640px;
   margin: 4px 0 9px 26px;
   opacity: 0.75;
   line-height: 1.35;
 }
-
 .citation-map-pref-actions {
   gap: 8px;
   margin-top: 12px;
 }
-
 .citation-map-pref-actions html|button {
   min-height: 30px;
   padding: 4px 12px;
 }
-
 .citation-map-advanced {
   margin-top: 6px;
   max-width: 680px;
 }
-
 .citation-map-advanced > summary {
   cursor: pointer;
   font-weight: 600;

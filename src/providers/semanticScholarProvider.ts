@@ -46,6 +46,7 @@ interface S2RelationResponse {
 
 const BACKGROUND_REFERENCE_LIMIT = 200;
 const MAX_RELATION_PAGE_SIZE = 200;
+export const SEMANTIC_SCHOLAR_BATCH_LIMIT = 500;
 
 const BASIC_FIELDS = [
   "paperId",
@@ -94,6 +95,35 @@ function toRelated(paper: S2Paper): RelatedWorkMetadata | null {
   };
 }
 
+export async function fetchSemanticScholarPapersBatch(
+  identifiers: string[],
+): Promise<Array<RelatedWorkMetadata | null>> {
+  if (!identifiers.length) return [];
+  if (identifiers.length > SEMANTIC_SCHOLAR_BATCH_LIMIT) {
+    throw new Error(
+      `Semantic Scholar batch exceeds ${SEMANTIC_SCHOLAR_BATCH_LIMIT} papers.`,
+    );
+  }
+  const response = await requestJSON<Array<S2Paper | null>>(
+    "semantic-scholar",
+    `https://api.semanticscholar.org/graph/v1/paper/batch?fields=${encodeURIComponent(BASIC_FIELDS)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: { ids: identifiers },
+    },
+  );
+  if (!response.ok || !Array.isArray(response.data)) {
+    throw new Error(
+      response.message || "Semantic Scholar batch metadata lookup failed.",
+    );
+  }
+  return identifiers.map((_, index) => {
+    const paper = response.data?.[index];
+    return paper ? toRelated(paper) : null;
+  });
+}
+
 async function fetchRelations(
   paperID: string,
   kind: "references" | "citations",
@@ -120,12 +150,14 @@ async function successFromPaper(
   paper: S2Paper,
   matchedBy: "doi" | "pmid" | "arxiv" | "isbn" | "title",
   confidence: number,
+  includeReferences = true,
 ): Promise<ProviderLookupSuccess> {
   const related = toRelated(paper);
   const paperID = String(paper.paperId ?? "");
-  const references = paperID
-    ? await fetchRelations(paperID, "references", BACKGROUND_REFERENCE_LIMIT)
-    : [];
+  const references =
+    includeReferences && paperID
+      ? await fetchRelations(paperID, "references", BACKGROUND_REFERENCE_LIMIT)
+      : [];
   return {
     status: "success",
     provider: "semantic-scholar",
@@ -176,8 +208,9 @@ function identifier(identifiers: WorkIdentifiers): {
   return null;
 }
 
-async function lookup(
+async function lookupPaper(
   identifiers: WorkIdentifiers,
+  includeReferences: boolean,
 ): Promise<ProviderLookupResult> {
   const selected = identifier(identifiers);
   if (!selected) {
@@ -203,7 +236,20 @@ async function lookup(
     response.data,
     selected.kind,
     selected.kind === "doi" ? 1 : 0.98,
+    includeReferences,
   );
+}
+
+async function lookup(
+  identifiers: WorkIdentifiers,
+): Promise<ProviderLookupResult> {
+  return lookupPaper(identifiers, true);
+}
+
+async function lookupForRelations(
+  identifiers: WorkIdentifiers,
+): Promise<ProviderLookupResult> {
+  return lookupPaper(identifiers, false);
 }
 
 async function searchExactTitle(
@@ -275,6 +321,7 @@ export const semanticScholarProvider: CitationProvider = {
   },
   supports: (identifiers) => Boolean(identifier(identifiers)),
   lookup,
+  lookupForRelations,
   searchExactTitle,
   fetchCitingWorks: (paperID, maximum, offset) =>
     fetchRelations(paperID, "citations", maximum, offset),

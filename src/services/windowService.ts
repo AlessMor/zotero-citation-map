@@ -7,6 +7,7 @@ import { loadWholeLibrary } from "./zoteroLibraryService";
 
 const TAB_TYPE = "citationmap";
 const TAB_STATE_FILTER_MARKER = "__citationMapStateFilterInstalled";
+const TAB_HOOK_MARKER = "__citationMapTabHooksInstalled";
 const NETWORK_ICON_TYPE = "citation-map-network";
 const CONTEXT_HANDLER_MARKER = "__citationMapContextHandlerInstalled";
 let pendingSelectionItemID: number | null = null;
@@ -25,14 +26,25 @@ function tabs(win: _ZoteroTypes.MainWindow): any {
   return value;
 }
 
-function installTabHooks(win: _ZoteroTypes.MainWindow): void {
+/**
+ * Register custom-tab hooks as soon as the Zotero main window is available.
+ * Zotero restores saved tabs during window startup, so delaying this until the
+ * user first opens Citation Map can leave a stale citationmap tab without a
+ * restoreState hook.
+ */
+export function installCitationMapTabHooks(win: _ZoteroTypes.MainWindow): void {
   const manager = tabs(win);
   if (!manager[TAB_STATE_FILTER_MARKER]) {
     const originalGetState = manager.getState.bind(manager);
     manager.getState = (): any[] =>
-      originalGetState().filter((tab: any) => tab.type !== TAB_TYPE);
+      originalGetState().filter((tab: any) => {
+        const type = String(tab?.type ?? "").replace(/-unloaded$/, "");
+        return type !== TAB_TYPE;
+      });
     manager[TAB_STATE_FILTER_MARKER] = true;
   }
+  if (manager[TAB_HOOK_MARKER]) return;
+  manager.tabHooks ??= {};
   manager.tabHooks.restoreState ??= {};
   manager.tabHooks.getTitle ??= {};
   manager.tabHooks.focusFirst ??= {};
@@ -45,6 +57,7 @@ function installTabHooks(win: _ZoteroTypes.MainWindow): void {
   };
   manager.tabHooks.focusFirst[TAB_TYPE] = focus;
   manager.tabHooks.refocus[TAB_TYPE] = focus;
+  manager[TAB_HOOK_MARKER] = true;
 }
 
 async function selectPaper(
@@ -140,7 +153,9 @@ function existingGraphTab(manager: any): any | null {
       addon.data.graphTabID = null;
     }
   }
-  const existing = manager._tabs?.find((tab: any) => tab.type === TAB_TYPE);
+  const existing = manager._tabs?.find(
+    (tab: any) => String(tab.type).replace(/-unloaded$/, "") === TAB_TYPE,
+  );
   if (existing) addon.data.graphTabID = existing.id;
   return existing ?? null;
 }
@@ -149,7 +164,7 @@ export async function openCitationMapWindow(
   hostWindow?: _ZoteroTypes.MainWindow,
 ): Promise<void> {
   const win = hostWindow ?? defaultMainWindow();
-  installTabHooks(win);
+  installCitationMapTabHooks(win);
   const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
   if (!snapshot.papers.length) {
     throw new Error("Citation Map requires at least one regular Zotero item.");

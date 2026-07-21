@@ -1,10 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M7.2 7.2 11 10.1M16.8 7.2 13 10.1M7.2 16.8 11 13.9M16.8 16.8 13 13.9"/>
-    <circle cx="5" cy="5" r="2.4"/>
-    <circle cx="19" cy="5" r="2.4"/>
-    <circle cx="5" cy="19" r="2.4"/>
-    <circle cx="19" cy="19" r="2.4"/>
-    <circle cx="12" cy="12" r="3"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <style>
+    :root { color-scheme: light dark; --citation-map-icon: #3f4650; }
+    @media (prefers-color-scheme: dark) {
+      :root { --citation-map-icon: #f2f2f2; }
+    }
+  </style>
+  <g fill="none" stroke="var(--citation-map-icon)" stroke-width="5" stroke-linecap="round">
+    <path d="M17 18l28 10M17 18l11 29M45 28L28 47"/>
+  </g>
+  <g fill="var(--citation-map-icon)">
+    <circle cx="17" cy="18" r="9"/>
+    <circle cx="45" cy="28" r="9"/>
+    <circle cx="28" cy="47" r="9"/>
   </g>
 </svg>

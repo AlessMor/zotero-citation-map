@@ -1,7 +1,9 @@
 .citation-map-progress {
-  position: absolute;
-  right: 18px;
-  bottom: 18px;
+  position: fixed !important;
+  top: auto !important;
+  right: 18px !important;
+  bottom: 18px !important;
+  left: auto !important;
   z-index: 2147483647;
   display: grid;
   gap: 5px;
@@ -15,14 +17,12 @@
   font: menu;
   pointer-events: none;
 }
-
 .citation-map-progress-track {
   height: 4px;
   overflow: hidden;
   border-radius: 999px;
   background: color-mix(in srgb, CanvasText 14%, transparent);
 }
-
 .citation-map-progress-bar {
   width: 0;
   height: 100%;
@@ -30,37 +30,34 @@
   background: var(--accent-blue, #2563eb);
   transition: width 120ms ease-out;
 }
-
 .citation-map-column-warning {
   color: #dc2626;
   font-weight: 700;
 }
-
 .citation-map-item-pane {
   --cmp-border: color-mix(in srgb, CanvasText 14%, transparent);
   --cmp-muted: color-mix(in srgb, CanvasText 66%, transparent);
   --cmp-accent: var(--accent-blue, #2563eb);
+  --cmp-manual-title: light-dark(#7c3aed, #c4b5fd);
   display: grid;
   gap: 9px;
   padding: 8px 4px 14px;
   color: CanvasText;
   font: menu;
 }
-
 .citation-map-item-pane *,
 .citation-map-item-pane *::before,
 .citation-map-item-pane *::after {
   box-sizing: border-box;
 }
-
 .citation-map-pane-tabs {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 4px;
 }
-
 .citation-map-item-pane button,
-.citation-map-item-pane input {
+.citation-map-item-pane input,
+.citation-map-item-pane select {
   min-height: 28px;
   padding: 4px 8px;
   border: 1px solid var(--cmp-border);
@@ -69,53 +66,43 @@
   color: CanvasText;
   font: inherit;
 }
-
 .citation-map-item-pane button {
   cursor: pointer;
 }
-
 .citation-map-item-pane button:hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--cmp-accent) 50%, var(--cmp-border));
   background: color-mix(in srgb, var(--cmp-accent) 8%, Canvas);
 }
-
 .citation-map-pane-tabs button[data-selected="true"] {
   border-color: var(--cmp-accent);
   background: color-mix(in srgb, var(--cmp-accent) 13%, Canvas);
   font-weight: 650;
 }
-
 .citation-map-primary-button {
   background: var(--cmp-accent) !important;
   border-color: var(--cmp-accent) !important;
   color: white !important;
 }
-
 .citation-map-pane-metrics {
   display: grid;
   grid-template-columns: minmax(125px, 1fr) auto;
-  gap: 0;
   margin: 0;
 }
-
 .citation-map-pane-metrics dt,
 .citation-map-pane-metrics dd {
   margin: 0;
   padding: 5px 0;
   border-bottom: 1px solid var(--cmp-border);
 }
-
 .citation-map-pane-metrics dt {
   color: var(--cmp-muted);
 }
-
 .citation-map-pane-metrics dd {
   padding-left: 10px;
   text-align: right;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
-
 .citation-map-pane-badges,
 .citation-map-pane-actions {
   display: flex;
@@ -124,7 +111,6 @@
   align-items: center;
   margin: 7px 0;
 }
-
 .citation-map-pane-badges span {
   padding: 2px 7px;
   border-radius: 999px;
@@ -132,12 +118,10 @@
   font-size: 10px;
   font-weight: 650;
 }
-
 .citation-map-danger-badge {
   background: color-mix(in srgb, #dc2626 16%, Canvas) !important;
   color: #dc2626;
 }
-
 .citation-map-retraction-warning,
 .citation-map-match-warning {
   padding: 9px;
@@ -146,18 +130,15 @@
   background: color-mix(in srgb, #dc2626 7%, Canvas);
   line-height: 1.4;
 }
-
 .citation-map-match-warning {
   border-color: color-mix(in srgb, #b45309 60%, var(--cmp-border));
   background: color-mix(in srgb, #f59e0b 9%, Canvas);
 }
-
 .citation-map-match-warning p,
 .citation-map-candidate,
 .citation-map-secondary-text {
   margin: 5px 0;
 }
-
 .citation-map-candidate {
   display: grid;
   gap: 4px;
@@ -166,61 +147,44 @@
   border-radius: 6px;
   background: Canvas;
 }
-
 .citation-map-candidate-title {
   font-weight: 650;
 }
-
 .citation-map-secondary-text {
   color: var(--cmp-muted);
   line-height: 1.35;
   font-size: 11px;
 }
-
 .citation-map-data-details {
   margin-top: 8px;
 }
-
 .citation-map-data-details > summary {
   cursor: pointer;
   font-weight: 650;
 }
-
-.citation-map-relation-adder {
-  display: grid;
-  gap: 7px;
-  margin: 7px 0;
-}
-
-.citation-map-relation-adder > div {
-  display: grid;
-  gap: 6px;
-}
-
 .citation-map-local-results,
 .citation-map-relation-list {
   display: grid;
   gap: 7px;
 }
-
 .citation-map-local-result {
   width: 100%;
   text-align: left;
 }
-
 .citation-map-relation-card {
   padding: 8px;
   border: 1px solid var(--cmp-border);
   border-radius: 7px;
   background: Canvas;
 }
-
 .citation-map-relation-card h4 {
   margin: 0;
   font-size: 12px;
   line-height: 1.35;
 }
-
+.citation-map-manual-relation-title {
+  color: var(--cmp-manual-title);
+}
 .citation-map-ignored-relation {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -229,7 +193,6 @@
   padding: 5px 0;
   border-bottom: 1px solid var(--cmp-border);
 }
-
 .citation-map-relation-controls {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(120px, auto) 30px;
@@ -237,7 +200,6 @@
   align-items: center;
   margin: 7px 0 2px;
 }
-
 .citation-map-add-relation-button {
   width: 30px;
   min-width: 30px;
@@ -247,7 +209,6 @@
   font-weight: 700;
   line-height: 1;
 }
-
 .citation-map-relation-dialog-overlay {
   position: fixed;
   inset: 0;
@@ -257,59 +218,29 @@
   padding: 20px;
   background: rgba(0, 0, 0, 0.34);
 }
-
 .citation-map-relation-dialog-overlay[hidden] {
   display: none;
 }
-
 .citation-map-relation-dialog {
   display: grid;
   gap: 9px;
-  width: min(560px, calc(100vw - 40px));
-  max-height: min(680px, calc(100vh - 40px));
+  width: min(600px, calc(100vw - 40px));
+  max-height: min(700px, calc(100vh - 40px));
   overflow: auto;
   padding: 14px;
   border: 1px solid var(--cmp-border);
   border-radius: 10px;
   background: Canvas;
-  color: CanvasText;
-  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.34);
+  box-shadow: 0 16px 55px rgba(0, 0, 0, 0.35);
 }
-
 .citation-map-relation-dialog-header {
   display: flex;
-  gap: 10px;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
 }
-
 .citation-map-dialog-close {
-  width: 30px;
   min-width: 30px;
-  min-height: 30px !important;
   padding: 0 !important;
-  font-size: 20px !important;
-  line-height: 1;
-}
-
-.citation-map-item-pane select {
-  min-height: 28px;
-  max-width: 100%;
-  padding: 4px 7px;
-  border: 1px solid var(--cmp-border);
-  border-radius: 6px;
-  background: Canvas;
-  color: CanvasText;
-  font: inherit;
-}
-
-.citation-map-relation-load-more {
-  justify-self: center;
-  margin-top: 7px;
-}
-
-@media (max-width: 420px) {
-  .citation-map-relation-controls {
-    grid-template-columns: 1fr;
-  }
+  font-size: 18px !important;
 }

@@ -4,4 +4,6 @@ build/
 dist/
 .env
 *.xpi
+*.tsbuildinfo
+FILE_MANIFEST.sha256
 .DS_Store

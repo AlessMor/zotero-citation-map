@@ -28,9 +28,9 @@ async function onMainWindowUnload({ window }, reason) {
 }
 
 async function shutdown({ id, version, resourceURI, rootURI }, reason) {
-  if (reason === APP_SHUTDOWN) return;
-  await Zotero.__addonInstance__?.hooks.onShutdown();
-  if (chromeHandle) {
+  const appShutdown = reason === APP_SHUTDOWN;
+  await Zotero.__addonInstance__?.hooks.onShutdown(appShutdown);
+  if (!appShutdown && chromeHandle) {
     chromeHandle.destruct();
     chromeHandle = null;
   }

@@ -5,7 +5,7 @@ open-command =
     .label = Open Citation Map
 
 update-library-command =
-    .label = Update citation and reference counts for whole library
+    .label = Refresh stale citation data for whole library
 
 update-items-command =
     .label = Update citation and reference counts
@@ -33,3 +33,6 @@ provider-opencitations-command =
 
 provider-inspire-command =
     .label = { $marker }INSPIRE-HEP
+
+show-items-command =
+    .label = Show in Citation Map

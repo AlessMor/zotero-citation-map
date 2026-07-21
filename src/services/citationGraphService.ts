@@ -22,6 +22,14 @@ import {
 } from "./citationPreferences";
 import { normalizeDOI } from "./citationIdentifiers";
 
+const graphCacheByLibrary = new Map<number, CitationGraphModel>();
+
+export function getCachedCitationGraph(
+  libraryID: number,
+): CitationGraphModel | null {
+  return graphCacheByLibrary.get(libraryID) ?? null;
+}
+
 function relationItemKey(value: unknown): string | null {
   const text = String(value ?? "").trim();
   if (!text) return null;
@@ -225,7 +233,7 @@ export function buildCitationGraph(
       references: record?.references ?? [],
     };
   });
-  return {
+  const model: CitationGraphModel = {
     nodes,
     edges,
     statistics: {
@@ -236,4 +244,6 @@ export function buildCitationGraph(
       isolatedNodes: nodes.filter((node) => node.isIsolated).length,
     },
   };
+  graphCacheByLibrary.set(snapshot.libraryID, model);
+  return model;
 }

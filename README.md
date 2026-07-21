@@ -1,98 +1,54 @@
-# Zotero Citation Map
+# Zotero Citation Map:
 
-Zotero Citation Map adds citation and reference metrics to Zotero, provides a
-paper-level citation inspector, and visualizes relationships between papers in
-an interactive graph.
+Zotero Citation Map is a plugin for visualizing the citation and reference relationships between papers in your Zotero library.
 
-This repository snapshot contains the `0.2.0-dev` implementation of the
-redesigned interface documented in [`DESIGN_CHOICES.md`](DESIGN_CHOICES.md).
+The project began as a weekend experiment. I wanted to test how far I could take ChatGPT 5.6 SOL while solving a minor annoyance in my own research workflow.
 
-## Requirements
+Whenever I wanted to explore the connections between a set of papers, I had to move repeatedly between Zotero and external tools such as ResearchRabbit or Litmaps. I wanted a simple way to inspect those relationships directly inside Zotero.
 
-- Zotero 9
-- Windows, macOS, or Linux supported by Zotero
-- Node.js 24 and npm 11.18 or later for the standard scaffold build
+So I decided to see if something along those lines could be integrated directly inside Zotero... and this plugin is the result!
 
-## Main features
+![zotero-citation-map overview](docs/assets/citationmapoverview.gif)
 
-### Zotero library
+## Installation:
 
-- Primary sortable columns for **Citations** and **References**.
-- Optional primary **Citation rate** column.
-- Additional impact, status, source, network, bibliography and data-quality
-  columns under Zotero's More Columns submenu.
-- Metric definitions on column-header hover.
-- Plugin-owned SQLite cache; Zotero's `Extra` field is not modified.
+1. Open the repository’s [Releases](https://github.com/AlessMor/zotero-citation-map/releases/latest) page.
 
-### Citation Map item pane
+2. Under **Assets**, download the latest `.xpi` file.
 
-- Overview, Cited by and References views in the normal library and PDF reader.
-- Provider provenance, data freshness and match confirmation.
-- Manual citation/reference relations restricted to existing Zotero items.
-- Local correction rules for incorrect provider relations.
+   > Do not download the automatically generated **Source code** `.zip` or `.tar.gz` archives.
 
-### Citation graph
+3. Open Zotero.
 
-- Whole-library, collection, tag, status and missing-data filters.
-- Free force graph or independently constrained X/Y metric axes.
-- Linear and logarithmic scales where valid.
-- Node size by numeric metrics.
-- Node color by collection/category or a blue-to-red numeric gradient.
-- Hierarchical collection colors and sliced multi-collection nodes.
-- Resizable/collapsible detail panel.
-- Missing-paper discovery and multi-collection Zotero importing.
-- PNG, JSON and CSV export.
+4. Go to **Tools → Plugins**.
 
-### Providers
+5. Drag the downloaded `.xpi` file into the Plugins window.
 
-Automatic mode is **Crossref preferred**. Background refreshes use a
-conservative base lookup; explicit refreshes and on-demand citation browsing
-may enrich records using other free, documented public services:
+6. Confirm the installation when prompted.
 
-- Crossref
-- Semantic Scholar
-- OpenCitations
-- INSPIRE-HEP
-- OpenAlex, opportunistically when anonymous public access is available
+7. Restart Zotero if required.
 
-No API key or email address is requested.
+The plugin should now be available in Zotero.
 
-## Matching
+### Updating
 
-Citation Map tries identifiers in this fixed order:
+Download the newest `.xpi` file from the [Releases](https://github.com/AlessMor/zotero-citation-map/releases/latest) page and repeat the installation procedure. Zotero will replace the existing version.
 
-1. DOI
-2. PMID
-3. arXiv ID
-4. ISBN
-5. exact normalized full title
+# Main Features:
 
-Unique, non-contradictory exact-title matches are accepted automatically.
-Fallback-identifier and ambiguous matches are confirmed in the item pane.
+## Main Features
 
-## Development setup
+- **See how papers in your library are connected**
+  Visualize which papers cite each other and which references they share.
 
-1. Create a separate Zotero profile and data directory for testing.
-2. Copy `.env.example` to `.env` and set the local Zotero paths.
-3. Install dependencies with `npm install` (or `npm ci` when a lockfile is
-   available).
-4. Run `npm run check`.
-5. Run `npm start` for the development watcher, or `npm run build` for an XPI.
+- **Explore citations and references directly in Zotero**
+  Start from a selected paper and move through the surrounding literature without opening a separate website.
 
-The production XPI and update manifests are written under `.scaffold/build/` by
-`zotero-plugin-scaffold`.
+- **Keep the map linked to your library**
+  Papers already present in Zotero are matched to their library items, so you can quickly return to their metadata, notes and PDFs.
 
-## Validation in this snapshot
+- **Find missing papers**
+  Citation providers may report papers that are not yet in your library, helping you identify relevant references or later citing work.
 
-The source was validated with strict TypeScript 5.8 using
-`tsconfig.validation.json`. The normal scaffold build still requires the npm
-dependencies listed in `package.json`.
-
-## Design documentation
-
-All agreed interaction and data decisions are recorded by Zotero surface in
-[`DESIGN_CHOICES.md`](DESIGN_CHOICES.md).
-
-## License
-
-AGPL-3.0-or-later.
+- **Update citation data**
+  Refresh the citation and reference relationships when provider data changes or when new papers are added to your library. You can also do it manually if you want to create custom maps.
