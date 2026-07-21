@@ -348,6 +348,7 @@ function createMetricSelect(
   includeFree = false,
 ): HTMLSelectElement {
   const select = element(document, "select", "cm-select");
+
   if (includeFree) {
     const option = element(document, "option");
     option.value = "free";
@@ -357,8 +358,10 @@ function createMetricSelect(
     option.dataset.metricDescription = option.title;
     select.appendChild(option);
   }
+
   for (const definition of definitions) {
     if (!metricHasData(nodes, definition.id)) continue;
+
     const option = element(document, "option");
     option.value = definition.id;
     option.textContent = definition.label;
@@ -366,13 +369,16 @@ function createMetricSelect(
     option.dataset.metricDescription = option.title;
     select.appendChild(option);
   }
-  const selectedOption = Array.from(select.options).find(
+
+  const options = Array.from(select.options) as HTMLOptionElement[];
+  const selectedOption = options.find(
     (option) => option.value === selected && !option.disabled,
   );
-  select.value = selectedOption?.value ?? select.options[0]?.value ?? "";
+
+  select.value = selectedOption?.value ?? options[0]?.value ?? "";
+
   return select;
 }
-
 function appendMetricOption(
   document: Document,
   select: HTMLSelectElement,
@@ -392,12 +398,11 @@ function selectAvailableValue(
   select: HTMLSelectElement,
   requested: string,
 ): void {
-  const requestedOption = Array.from(select.options).find(
+  const options = Array.from(select.options) as HTMLOptionElement[];
+  const requestedOption = options.find(
     (option) => option.value === requested && !option.disabled,
   );
-  const fallback = Array.from(select.options).find(
-    (option) => !option.disabled,
-  );
+  const fallback = options.find((option) => !option.disabled);
   select.value = requestedOption?.value ?? fallback?.value ?? "";
 }
 
