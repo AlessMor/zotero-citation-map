@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "packageManager": "npm@11.18.0",
-  "version": "0.2.20",
+  "version": "0.5.0",
   "description": "Citation and reference metrics with an interactive citation-network graph for Zotero 9.",
   "keywords": [
     "zotero",

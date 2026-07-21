@@ -8,7 +8,7 @@ Whenever I wanted to explore the connections between a set of papers, I had to m
 
 So I decided to see if something along those lines could be integrated directly inside Zotero... and this plugin is the result!
 
-![zotero-citation-map overview](docs/assets/)
+![zotero-citation-map overview](docs/assets/citationmapoverview.gif)
 
 ## Installation:
 
@@ -34,23 +34,21 @@ The plugin should now be available in Zotero.
 
 Download the newest `.xpi` file from the [Releases](https://github.com/AlessMor/zotero-citation-map/releases/latest) page and repeat the installation procedure. Zotero will replace the existing version.
 
-
 # Main Features:
 
 ## Main Features
 
-* **See how papers in your library are connected**
+- **See how papers in your library are connected**
   Visualize which papers cite each other and which references they share.
 
-* **Explore citations and references directly in Zotero**
+- **Explore citations and references directly in Zotero**
   Start from a selected paper and move through the surrounding literature without opening a separate website.
 
-* **Keep the map linked to your library**
+- **Keep the map linked to your library**
   Papers already present in Zotero are matched to their library items, so you can quickly return to their metadata, notes and PDFs.
 
-* **Find missing papers**
+- **Find missing papers**
   Citation providers may report papers that are not yet in your library, helping you identify relevant references or later citing work.
 
-* **Update citation data**
+- **Update citation data**
   Refresh the citation and reference relationships when provider data changes or when new papers are added to your library. You can also do it manually if you want to create custom maps.
-
