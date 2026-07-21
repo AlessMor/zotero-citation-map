@@ -1613,13 +1613,22 @@ export function renderCitationMapView(
             referenceCount: work.referenceCount ?? null,
             sourceKeys: previewSourceKeys,
           };
+          const showPreview = (): void => renderer?.setGhostPreview(preview);
           card.style.cursor = "pointer";
-          card.addEventListener("mouseenter", () =>
-            renderer?.setGhostPreview(preview),
-          );
-          card.addEventListener("mouseleave", () =>
-            renderer?.setGhostPreview(null),
-          );
+          card.tabIndex = 0;
+          card.setAttribute("role", "button");
+          card.title = "Click to preview this paper on the graph";
+          card.addEventListener("click", (event) => {
+            const targetElement = event.target as Element | null;
+            if (targetElement?.closest("a, button, input, select, summary"))
+              return;
+            showPreview();
+          });
+          card.addEventListener("keydown", (event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            showPreview();
+          });
         }
       }
       list.appendChild(card);
@@ -1654,7 +1663,7 @@ export function renderCitationMapView(
         seedNodes,
         model.nodes,
         50,
-        2,
+        seedNodes.length <= 1 ? 1 : 2,
       );
       if (
         cleaned ||
@@ -1731,7 +1740,7 @@ export function renderCitationMapView(
         seedNodes,
         model.nodes,
         50,
-        2,
+        seedNodes.length <= 1 ? 1 : 2,
       );
       if (
         cleaned ||
@@ -2161,12 +2170,20 @@ export function renderCitationMapView(
     ) as HTMLButtonElement | null;
     if (!target || !renderer) return;
     exportMenu.hidden = true;
-    if (target.dataset.format === "png")
-      exportGraphPNG(document, renderer.getCanvas(), snapshot);
-    else if (target.dataset.format === "json")
-      exportGraphJSON(document, snapshot, model, visibleKeys);
-    else if (target.dataset.format === "csv")
-      exportGraphCSV(document, snapshot, model, visibleKeys);
+    exportButton.setAttribute("aria-expanded", "false");
+    let task: Promise<void> | null = null;
+    if (target.dataset.format === "png") {
+      task = exportGraphPNG(document, renderer.getCanvas(), snapshot);
+    } else if (target.dataset.format === "json") {
+      task = exportGraphJSON(document, snapshot, model, visibleKeys);
+    } else if (target.dataset.format === "csv") {
+      task = exportGraphCSV(document, snapshot, model, visibleKeys);
+    }
+    void task?.catch((error: unknown) => {
+      Zotero.logError(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    });
   });
   refreshButton.addEventListener("click", () => {
     if (refreshButton.disabled) return;

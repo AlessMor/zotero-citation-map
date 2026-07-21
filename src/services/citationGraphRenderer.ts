@@ -137,6 +137,21 @@ function metricNumber(
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function ghostMetricNumber(
+  preview: GhostPreview,
+  metric: GraphAxisMetric,
+): number | null {
+  const value =
+    metric === "year"
+      ? preview.year
+      : metric === "citations"
+        ? preview.citationCount
+        : metric === "references"
+          ? preview.referenceCount
+          : null;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 function metricExtent(
   nodes: CitationGraphNode[],
   metric: GraphAxisMetric | MetricID,
@@ -1106,10 +1121,59 @@ export class CitationGraphRenderer {
       .map((key) => this.positions.get(key))
       .filter((position): position is Position => Boolean(position));
     if (!sources.length) return;
-    const x =
+
+    const centroidX =
       sources.reduce((sum, source) => sum + source.x, 0) / sources.length;
-    const y =
-      sources.reduce((sum, source) => sum + source.y, 0) / sources.length + 75;
+    const centroidY =
+      sources.reduce((sum, source) => sum + source.y, 0) / sources.length;
+    const seed = hash(this.ghostPreview.key);
+    const angle = ((seed % 360) * Math.PI) / 180;
+    const radius = 70 + (seed % 31);
+    let x = clamp(centroidX + Math.cos(angle) * radius, PLOT_LEFT, PLOT_RIGHT);
+    let y = clamp(centroidY + Math.sin(angle) * radius, PLOT_TOP, PLOT_BOTTOM);
+
+    const nodes = this.visibleNodes();
+    const xScale = this.axisScale(nodes, "x");
+    const yScale = this.axisScale(nodes, "y");
+    const xValue = ghostMetricNumber(this.ghostPreview, this.layout.xMetric);
+    const yValue = ghostMetricNumber(this.ghostPreview, this.layout.yMetric);
+    if (xScale && this.layout.xMetric !== "free") {
+      const positionedValue = xValue ?? 0;
+      x =
+        this.layout.xScale === "log" && positionedValue <= 0
+          ? PLOT_LEFT
+          : PLOT_LEFT +
+            clamp(
+              scaleValue(
+                positionedValue,
+                xScale.domain[0],
+                xScale.domain[1],
+                this.layout.xScale,
+              ),
+              0,
+              1,
+            ) *
+              (PLOT_RIGHT - PLOT_LEFT);
+    }
+    if (yScale && this.layout.yMetric !== "free") {
+      const positionedValue = yValue ?? 0;
+      y =
+        this.layout.yScale === "log" && positionedValue <= 0
+          ? PLOT_BOTTOM
+          : PLOT_BOTTOM -
+            clamp(
+              scaleValue(
+                positionedValue,
+                yScale.domain[0],
+                yScale.domain[1],
+                this.layout.yScale,
+              ),
+              0,
+              1,
+            ) *
+              (PLOT_BOTTOM - PLOT_TOP);
+    }
+
     const context = this.context;
     context.save();
     context.setLineDash([6, 5]);

@@ -4,6 +4,10 @@ import {
   initCitationMetricsStore,
 } from "./services/citationMetricsStore";
 import {
+  closeExternalWorkCache,
+  initExternalWorkCache,
+} from "./services/externalWorkCacheService";
+import {
   registerAutomaticCitationUpdates,
   unregisterAutomaticCitationUpdates,
   waitForCitationUpdates,
@@ -74,13 +78,13 @@ function beginTeardown(closeGraphTab = true): void {
 async function onStartup(): Promise<void> {
   teardownStarted = false;
   addon.data.alive = true;
-  await Promise.all([
-    Zotero.initializationPromise,
-    Zotero.unlockPromise,
-    Zotero.uiReadyPromise,
-  ]);
+  await Promise.all([Zotero.initializationPromise, Zotero.unlockPromise]);
+  // Restored Citation Map tabs can render during UI restoration. Initialize
+  // both persistent stores before waiting for uiReady so no restored tab can
+  // read from, or write to, an uninitialized external-work cache.
+  await Promise.all([initCitationMetricsStore(), initExternalWorkCache()]);
+  await Zotero.uiReadyPromise;
   for (const win of Zotero.getMainWindows()) await onMainWindowLoad(win);
-  await initCitationMetricsStore();
   await registerCitationColumns();
   registerCitationItemPane();
   await registerCitationMapPreferencePane();
@@ -91,6 +95,9 @@ async function onStartup(): Promise<void> {
 }
 
 async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
+  // This hook can race startup during session restoration. The initializers
+  // are idempotent and ensure the graph never observes an empty cache mirror.
+  await Promise.all([initCitationMetricsStore(), initExternalWorkCache()]);
   // Install the custom tab hook immediately. Zotero may restore saved tabs
   // before the user has ever opened Citation Map in this session.
   try {
@@ -135,6 +142,9 @@ async function onMainWindowUnload(win: _ZoteroTypes.MainWindow): Promise<void> {
 async function onShutdown(): Promise<void> {
   beginTeardown();
   await waitForCitationUpdates();
+  await closeExternalWorkCache().catch((error: unknown) =>
+    Zotero.logError(error instanceof Error ? error : new Error(String(error))),
+  );
   await closeCitationMetricsStore().catch((error: unknown) =>
     Zotero.logError(error instanceof Error ? error : new Error(String(error))),
   );

@@ -164,9 +164,18 @@ function requireDB(): _ZoteroTypes.DBConnection {
   return db;
 }
 
+async function ensureExternalWorkCache(): Promise<boolean> {
+  if (closing) return false;
+  await initExternalWorkCache();
+  return initialized && !closing;
+}
+
 function queueWrite(task: () => Promise<void>): Promise<void> {
   const previous = writeTail.catch(() => undefined);
-  const next = previous.then(task);
+  const next = previous.then(async () => {
+    if (!(await ensureExternalWorkCache())) return;
+    await task();
+  });
   writeTail = next.catch(() => undefined);
   return next;
 }
@@ -224,6 +233,7 @@ export async function closeExternalWorkCache(): Promise<void> {
 }
 
 export async function clearExternalWorkCache(): Promise<void> {
+  if (!(await ensureExternalWorkCache())) return;
   mirror.clear();
   relationshipMirror.clear();
   await queueWrite(async () => {
@@ -248,7 +258,7 @@ export async function saveExternalRelationshipCache(
   relationshipKey: string,
   works: RelatedWorkMetadata[],
 ): Promise<void> {
-  if (closing) return;
+  if (!(await ensureExternalWorkCache())) return;
   const fetchedAt = new Date().toISOString();
   const existing = relationshipMirror.get(relationshipKey)?.works ?? [];
   const storedWorks = mergeRelationshipWorks(existing, works);
@@ -308,7 +318,7 @@ export async function saveExternalWorkCacheSuccesses(
     metadata: RelatedWorkMetadata;
   }>,
 ): Promise<void> {
-  if (closing || entries.length === 0) return;
+  if (entries.length === 0 || !(await ensureExternalWorkCache())) return;
   const fetchedAt = new Date().toISOString();
   const unique = new Map<string, RelatedWorkMetadata>();
   for (const entry of entries) unique.set(entry.identityKey, entry.metadata);
@@ -339,7 +349,7 @@ export async function saveExternalWorkCacheSuccesses(
 export async function saveExternalWorkCacheNotFound(
   identityKey: string,
 ): Promise<void> {
-  if (closing) return;
+  if (!(await ensureExternalWorkCache())) return;
   const fetchedAt = new Date().toISOString();
   const nextRetryAt = new Date(Date.now() + NOT_FOUND_RETRY_MS).toISOString();
   const entry: ExternalWorkCacheEntry = {

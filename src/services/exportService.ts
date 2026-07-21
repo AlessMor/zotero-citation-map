@@ -11,44 +11,73 @@ function sanitizeFilename(value: string): string {
   );
 }
 
-function download(
-  document: Document,
-  filename: string,
-  content: string | Blob,
-  type: string,
-): void {
-  const blob =
-    content instanceof Blob ? content : new Blob([content], { type });
-  const url = document.defaultView?.URL.createObjectURL(blob);
-  if (!url) throw new Error("Unable to create an export URL.");
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.style.display = "none";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  document.defaultView?.setTimeout(
-    () => document.defaultView?.URL.revokeObjectURL(url),
-    1000,
-  );
+interface SaveFileOptions {
+  title: string;
+  filename: string;
+  extension: string;
+  filterLabel: string;
 }
 
-export function exportGraphJSON(
+async function chooseSavePath(
+  document: Document,
+  options: SaveFileOptions,
+): Promise<string | null> {
+  const parentWindow = document.defaultView;
+  if (!parentWindow) {
+    throw new Error("Unable to open the export save dialog.");
+  }
+
+  const picker = Components.classes["@mozilla.org/filepicker;1"].createInstance(
+    Components.interfaces.nsIFilePicker,
+  );
+  picker.init(
+    (parentWindow as any).browsingContext,
+    options.title,
+    picker.modeSave,
+  );
+  picker.defaultString = options.filename;
+  picker.defaultExtension = options.extension;
+  picker.appendFilter(options.filterLabel, `*.${options.extension}`);
+  picker.appendFilters(picker.filterAll);
+
+  const result = await new Promise<number>((resolve) => picker.open(resolve));
+  if (result !== picker.returnOK && result !== picker.returnReplace) {
+    return null;
+  }
+  return String(picker.file?.path ?? "").trim() || null;
+}
+
+async function saveExport(
+  document: Document,
+  options: SaveFileOptions,
+  content: string | Blob,
+): Promise<void> {
+  const path = await chooseSavePath(document, options);
+  if (!path) return;
+  await Zotero.File.putContentsAsync(path, content);
+}
+
+export async function exportGraphJSON(
   document: Document,
   snapshot: LibrarySnapshot,
   model: CitationGraphModel,
   visibleKeys: Set<string>,
   includeExternal = false,
-): void {
+): Promise<void> {
   const nodes = model.nodes.filter((node) => visibleKeys.has(node.key));
   const keys = new Set(nodes.map((node) => node.key));
   const edges = model.edges.filter(
     (edge) => keys.has(edge.source) && keys.has(edge.target),
   );
-  download(
+  const filename = `${sanitizeFilename(snapshot.libraryName)}-citation-map.json`;
+  await saveExport(
     document,
-    `${sanitizeFilename(snapshot.libraryName)}-citation-map.json`,
+    {
+      title: "Export Citation Map as JSON",
+      filename,
+      extension: "json",
+      filterLabel: "JSON files",
+    },
     JSON.stringify(
       {
         schema: "zotero-citation-map/1",
@@ -61,7 +90,6 @@ export function exportGraphJSON(
       null,
       2,
     ),
-    "application/json",
   );
 }
 
@@ -70,12 +98,12 @@ function csvEscape(value: unknown): string {
   return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
-export function exportGraphCSV(
+export async function exportGraphCSV(
   document: Document,
   snapshot: LibrarySnapshot,
   model: CitationGraphModel,
   visibleKeys: Set<string>,
-): void {
+): Promise<void> {
   const nodes = model.nodes.filter((node) => visibleKeys.has(node.key));
   const keys = new Set(nodes.map((node) => node.key));
   const nodeByKey = new Map(nodes.map((node) => [node.key, node]));
@@ -110,26 +138,41 @@ export function exportGraphCSV(
         .join(","),
     );
   }
-  download(
+  const filename = `${sanitizeFilename(snapshot.libraryName)}-citation-links.csv`;
+  await saveExport(
     document,
-    `${sanitizeFilename(snapshot.libraryName)}-citation-links.csv`,
+    {
+      title: "Export Citation Map as CSV",
+      filename,
+      extension: "csv",
+      filterLabel: "CSV files",
+    },
     lines.join("\r\n"),
-    "text/csv;charset=utf-8",
   );
 }
 
-export function exportGraphPNG(
+function canvasBlob(canvas: HTMLCanvasElement): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error("Unable to render the graph image."));
+    }, "image/png");
+  });
+}
+
+export async function exportGraphPNG(
   document: Document,
   canvas: HTMLCanvasElement,
   snapshot: LibrarySnapshot,
-): void {
-  canvas.toBlob((blob) => {
-    if (!blob) throw new Error("Unable to render the graph image.");
-    download(
-      document,
-      `${sanitizeFilename(snapshot.libraryName)}-citation-map.png`,
-      blob,
-      "image/png",
-    );
-  }, "image/png");
+): Promise<void> {
+  const filename = `${sanitizeFilename(snapshot.libraryName)}-citation-map.png`;
+  const path = await chooseSavePath(document, {
+    title: "Export Citation Map as PNG",
+    filename,
+    extension: "png",
+    filterLabel: "PNG images",
+  });
+  if (!path) return;
+  const blob = await canvasBlob(canvas);
+  await Zotero.File.putContentsAsync(path, blob);
 }

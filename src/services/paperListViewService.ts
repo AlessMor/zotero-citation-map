@@ -386,13 +386,14 @@ function createPopupController(
   menu.setAttribute("role", "menu");
   Object.assign(menu.style, {
     display: "none",
-    position: "absolute",
-    zIndex: "2147483645",
-    top: "calc(100% + 4px)",
-    right: "0",
+    position: "fixed",
+    zIndex: "2147483647",
+    top: "0",
+    left: "0",
+    right: "auto",
     minWidth: "190px",
-    maxWidth: "min(390px, calc(100vw - 32px))",
-    maxHeight: "min(620px, calc(100vh - 80px))",
+    maxWidth: "min(390px, calc(100vw - 16px))",
+    maxHeight: "min(620px, calc(100vh - 16px))",
     overflow: "auto",
     padding: "5px",
     border: "1px solid color-mix(in srgb, CanvasText 18%, transparent)",
@@ -401,9 +402,91 @@ function createPopupController(
     color: "CanvasText",
     boxShadow: "0 8px 24px rgba(0, 0, 0, .24)",
   });
+
+  // Keep the popup outside the item-pane/graph containers. Those containers
+  // use overflow clipping, which cannot be escaped by increasing z-index.
+  const overlayHost = document.body ?? document.documentElement;
+  root.appendChild(button);
+  overlayHost.appendChild(menu);
+
+  let nativeFilterSelectActive = false;
+  const isTaggedFilterSelect = (target: EventTarget | null): boolean => {
+    const targetElement = target as Element | null;
+    return Boolean(
+      targetElement?.closest?.(
+        'select[data-citation-map-filter-select="true"]',
+      ),
+    );
+  };
+  menu.addEventListener(
+    "pointerdown",
+    (event) => {
+      if (isTaggedFilterSelect(event.target)) nativeFilterSelectActive = true;
+    },
+    true,
+  );
+  menu.addEventListener(
+    "change",
+    (event) => {
+      if (isTaggedFilterSelect(event.target)) nativeFilterSelectActive = false;
+    },
+    true,
+  );
+
   const isOpen = (): boolean => menu.style.display !== "none";
+  const positionMenu = (): void => {
+    if (!isOpen() || !button.isConnected) return;
+    const view = document.defaultView;
+    const viewportWidth =
+      view?.innerWidth ?? document.documentElement.clientWidth;
+    const viewportHeight =
+      view?.innerHeight ?? document.documentElement.clientHeight;
+    const margin = 8;
+    const gap = 4;
+    const buttonRect = button.getBoundingClientRect();
+
+    // Measure after display so the actual menu width and content height are
+    // available. Keep it invisible during positioning to avoid a visible jump.
+    menu.style.visibility = "hidden";
+    menu.style.maxHeight = `${Math.max(96, viewportHeight - margin * 2)}px`;
+    const naturalRect = menu.getBoundingClientRect();
+    const menuWidth = Math.min(naturalRect.width, viewportWidth - margin * 2);
+    const below = Math.max(
+      0,
+      viewportHeight - buttonRect.bottom - gap - margin,
+    );
+    const above = Math.max(0, buttonRect.top - gap - margin);
+    const opensBelow =
+      below >= Math.min(naturalRect.height, 240) || below >= above;
+    const availableHeight = Math.max(96, opensBelow ? below : above);
+
+    menu.style.maxHeight = `${Math.min(620, availableHeight)}px`;
+    const measuredHeight = Math.min(
+      menu.getBoundingClientRect().height,
+      availableHeight,
+    );
+    const left = Math.max(
+      margin,
+      Math.min(
+        buttonRect.right - menuWidth,
+        viewportWidth - menuWidth - margin,
+      ),
+    );
+    const top = opensBelow
+      ? Math.min(
+          buttonRect.bottom + gap,
+          viewportHeight - measuredHeight - margin,
+        )
+      : Math.max(margin, buttonRect.top - gap - measuredHeight);
+
+    menu.style.left = `${Math.round(left)}px`;
+    menu.style.top = `${Math.round(top)}px`;
+    menu.style.visibility = "visible";
+  };
   const close = (focusButton = false): void => {
+    nativeFilterSelectActive = false;
     menu.style.display = "none";
+    menu.style.visibility = "visible";
     button.setAttribute("aria-expanded", "false");
     if (focusButton && root.isConnected) button.focus();
   };
@@ -411,6 +494,7 @@ function createPopupController(
     beforeOpen?.();
     menu.style.display = "grid";
     button.setAttribute("aria-expanded", "true");
+    positionMenu();
   };
   button.addEventListener("click", (event) => {
     event.preventDefault();
@@ -422,15 +506,23 @@ function createPopupController(
     if (!root.isConnected) {
       document.removeEventListener("pointerdown", onDocumentPointerDown, true);
       document.removeEventListener("keydown", onDocumentKeyDown, true);
+      document.removeEventListener("scroll", onViewportChange, true);
+      document.defaultView?.removeEventListener("resize", onViewportChange);
+      menu.remove();
       return;
     }
     const target = event.target as Node | null;
-    if (target && root.contains(target)) return;
+    if (target && (root.contains(target) || menu.contains(target))) return;
+    if (nativeFilterSelectActive) {
+      // Firefox renders native HTML select options outside the document tree.
+      // Ignore the option-selection pointer event so the select can commit.
+      nativeFilterSelectActive = false;
+      return;
+    }
     const focused = document.activeElement;
-    // Firefox renders the native <select> popup outside the DOM subtree. Do
-    // not treat a click in that popup as an outside click while the select
-    // inside this filter menu owns focus.
-    if (focused?.tagName === "SELECT" && root.contains(focused)) return;
+    // Firefox renders the native <select> popup outside the document subtree.
+    // Do not close while a select in this detached overlay owns focus.
+    if (focused?.tagName === "SELECT" && menu.contains(focused)) return;
     close();
   };
   const onDocumentKeyDown = (event: KeyboardEvent): void => {
@@ -438,9 +530,13 @@ function createPopupController(
     event.preventDefault();
     close(true);
   };
+  const onViewportChange = (): void => {
+    if (isOpen()) positionMenu();
+  };
   document.addEventListener("pointerdown", onDocumentPointerDown, true);
   document.addEventListener("keydown", onDocumentKeyDown, true);
-  root.append(button, menu);
+  document.addEventListener("scroll", onViewportChange, true);
+  document.defaultView?.addEventListener("resize", onViewportChange);
   return {
     root,
     button,
@@ -450,7 +546,10 @@ function createPopupController(
     destroy: () => {
       document.removeEventListener("pointerdown", onDocumentPointerDown, true);
       document.removeEventListener("keydown", onDocumentKeyDown, true);
+      document.removeEventListener("scroll", onViewportChange, true);
+      document.defaultView?.removeEventListener("resize", onViewportChange);
       close();
+      menu.remove();
     },
   };
 }
@@ -711,6 +810,7 @@ export function createPaperFilterController(
 
     const collections = options.collections ?? [];
     const collectionSelect = element(document, "select");
+    collectionSelect.dataset.citationMapFilterSelect = "true";
     appendOption(document, collectionSelect, "Whole library", "");
     for (const collection of collections) {
       appendOption(
@@ -733,6 +833,7 @@ export function createPaperFilterController(
     appendLabelledControl(document, menu, "Collection", collectionSelect);
 
     const tagSelect = element(document, "select");
+    tagSelect.dataset.citationMapFilterSelect = "true";
     appendOption(document, tagSelect, "All tags", "");
     const tags = [...new Set(latestDescriptors.flatMap((entry) => entry.tags))]
       .filter(Boolean)

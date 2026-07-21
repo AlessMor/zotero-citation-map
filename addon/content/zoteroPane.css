@@ -1,7 +1,9 @@
 .citation-map-progress {
-  position: absolute;
-  right: 18px;
-  bottom: 18px;
+  position: fixed !important;
+  top: auto !important;
+  right: 18px !important;
+  bottom: 18px !important;
+  left: auto !important;
   z-index: 2147483647;
   display: grid;
   gap: 5px;
