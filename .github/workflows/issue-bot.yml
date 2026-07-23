@@ -17,4 +17,4 @@ permissions:
 
 jobs:
   issue-bot:
-    uses: zotero-plugin-dev/workflows/.github/workflows/issue-bot.yml@main
+    uses: zotero-plugin-dev/workflows/.github/workflows/issue-bot.yml@1539798bf7f71455f77e682b9ca49078249b34e7

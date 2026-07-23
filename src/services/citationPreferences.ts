@@ -7,12 +7,12 @@ import type { GraphLayoutOptions } from "../domain/graphTypes";
 
 const key = (name: string): string => `${config.prefsPrefix}.${name}`;
 const PROVIDER_LABELS: Record<CitationProviderPreference, string> = {
-  auto: "Automatic — Crossref preferred",
+  auto: "Automatic — combine available providers",
   crossref: "Crossref",
   "semantic-scholar": "Semantic Scholar",
   opencitations: "OpenCitations",
   inspire: "INSPIRE-HEP",
-  openalex: "OpenAlex (opportunistic public access)",
+  openalex: "OpenAlex",
 };
 const CONCRETE = new Set<CitationProviderID>([
   "crossref",
@@ -42,6 +42,13 @@ export function setProviderPreference(
   provider: CitationProviderPreference,
 ): void {
   Zotero.Prefs.set(key("provider"), provider, true);
+}
+
+export function getOpenAlexAPIKey(): string {
+  return String(Zotero.Prefs.get(key("openAlexAPIKey"), true) ?? "").trim();
+}
+export function setOpenAlexAPIKey(apiKey: string): void {
+  Zotero.Prefs.set(key("openAlexAPIKey"), apiKey.trim(), true);
 }
 
 export function getAutomaticUpdatesEnabled(): boolean {

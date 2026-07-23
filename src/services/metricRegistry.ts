@@ -1,13 +1,7 @@
 import type { CitationGraphNode, MetricID } from "../domain/graphTypes";
 
 export type MetricGroup =
-  | "Core"
-  | "Impact"
-  | "Status"
-  | "Source"
-  | "Library network"
-  | "Bibliography"
-  | "Data quality";
+  "Core" | "Impact" | "Source" | "Library" | "Bibliography" | "Data quality";
 
 export type MetricValueType =
   "integer" | "decimal" | "percentage" | "boolean" | "days";
@@ -29,7 +23,7 @@ export interface MetricDefinition {
         defaultVisible: boolean;
         width: number;
       };
-  itemPane: "summary" | "overview" | "advanced" | false;
+  itemPane: "summary" | "advanced" | false;
   graph: {
     axis: boolean;
     logarithmic: boolean;
@@ -40,6 +34,27 @@ export interface MetricDefinition {
   value: (node: CitationGraphNode) => number | boolean | null;
 }
 
+export interface SupplementaryPropertyDefinition {
+  id: string;
+  label: string;
+  description: string;
+  group: MetricGroup;
+  column:
+    | false
+    | {
+        primary: boolean;
+        defaultVisible: boolean;
+        width: number;
+      };
+  itemPane: "summary" | "advanced" | false;
+  graph: {
+    nodeColor: boolean;
+    filter: boolean;
+  };
+  value: (node: CitationGraphNode) => string | boolean | null;
+  format: (value: string | boolean) => string;
+}
+
 const graphAll = {
   axis: true,
   logarithmic: true,
@@ -47,27 +62,25 @@ const graphAll = {
   nodeColor: true,
   filter: true,
 };
+const graphLinear = { ...graphAll, logarithmic: false };
 
 export const METRIC_DEFINITIONS: MetricDefinition[] = [
   {
     id: "year",
     label: "Publication year",
     group: "Core",
-    description: "The publication year stored on the Zotero item.",
+    description: "Publication year stored in the Zotero item.",
     valueType: "integer",
     column: false,
     itemPane: false,
-    graph: { ...graphAll, logarithmic: false, nodeSize: false },
+    graph: { ...graphLinear, nodeSize: false },
     value: (node) => node.year,
   },
   {
     id: "citations",
     label: "Citations",
     group: "Core",
-    description:
-      "The aggregate number of works reported by the active provider as citing this paper.",
-    interpretation:
-      "Counts differ between scholarly indexes; the item pane shows the provider used.",
+    description: "Number of works known to cite this paper.",
     valueType: "integer",
     column: { primary: true, defaultVisible: true, width: 88 },
     itemPane: "summary",
@@ -78,44 +91,12 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     id: "references",
     label: "References",
     group: "Core",
-    description:
-      "The provider-declared number of works in this paper's bibliography.",
+    description: "Number of works known to be referenced by this paper.",
     valueType: "integer",
     column: { primary: true, defaultVisible: true, width: 92 },
     itemPane: "summary",
     graph: graphAll,
     value: (node) => node.referenceCount,
-  },
-  {
-    id: "citation-rate",
-    label: "Citation rate",
-    shortLabel: "Citations/year",
-    group: "Core",
-    description:
-      "Average citations received per year over the three most recent complete calendar years.",
-    interpretation: "Higher values indicate more recent citation activity.",
-    valueType: "decimal",
-    decimals: 2,
-    column: { primary: true, defaultVisible: false, width: 112 },
-    itemPane: "summary",
-    graph: graphAll,
-    value: (node) => node.citationVelocity,
-  },
-  {
-    id: "citation-acceleration",
-    label: "Citation acceleration",
-    group: "Impact",
-    description:
-      "Citations in the last complete calendar year minus citations in the preceding year.",
-    interpretation:
-      "Positive values indicate rising citation activity; negative values indicate a decline.",
-    valueType: "decimal",
-    decimals: 2,
-    allowsNegative: true,
-    column: { primary: false, defaultVisible: false, width: 142 },
-    itemPane: "overview",
-    graph: { ...graphAll, logarithmic: false },
-    value: (node) => node.citationAcceleration,
   },
   {
     id: "citations-last-year",
@@ -125,20 +106,49 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
       "Citations received during the most recent complete calendar year.",
     valueType: "integer",
     column: { primary: false, defaultVisible: false, width: 128 },
-    itemPane: "overview",
+    itemPane: "advanced",
     graph: graphAll,
     value: (node) => node.citationsLastYear,
+  },
+  {
+    id: "citation-rate",
+    label: "Recent citation rate",
+    shortLabel: "Citation rate",
+    group: "Impact",
+    description:
+      "Average citations received per year over the three most recent complete calendar years.",
+    valueType: "decimal",
+    decimals: 2,
+    column: { primary: false, defaultVisible: false, width: 124 },
+    itemPane: "advanced",
+    graph: graphAll,
+    value: (node) => node.citationVelocity,
+  },
+  {
+    id: "citation-acceleration",
+    label: "Change in annual citations",
+    shortLabel: "Annual citation change",
+    group: "Impact",
+    description:
+      "Citations in the most recent complete calendar year minus citations in the preceding year. Positive values indicate growth; negative values indicate decline.",
+    valueType: "decimal",
+    decimals: 0,
+    allowsNegative: true,
+    column: { primary: false, defaultVisible: false, width: 154 },
+    itemPane: "advanced",
+    graph: graphLinear,
+    value: (node) => node.citationAcceleration,
   },
   {
     id: "fwci",
     label: "FWCI",
     group: "Impact",
     description:
-      "Field-Weighted Citation Impact compares this paper with works from the same field, year and publication type. A value of 1 is the field average.",
+      "Field-Weighted Citation Impact reported by OpenAlex: citations received divided by the expected citations for comparable works. A value of 1 is approximately expected.",
     valueType: "decimal",
     decimals: 2,
     column: { primary: false, defaultVisible: false, width: 78 },
-    itemPane: "overview",
+    itemPane: "advanced",
     graph: graphAll,
     value: (node) => node.fwci,
   },
@@ -147,12 +157,12 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     label: "Citation percentile",
     group: "Impact",
     description:
-      "The paper's citation percentile among comparable works in its field and publication year.",
+      "OpenAlex citation percentile among works of the same type, publication year and subfield.",
     valueType: "percentage",
     decimals: 1,
     column: { primary: false, defaultVisible: false, width: 126 },
-    itemPane: "overview",
-    graph: { ...graphAll, logarithmic: false },
+    itemPane: "advanced",
+    graph: graphLinear,
     value: (node) =>
       node.citationPercentile === null
         ? null
@@ -162,38 +172,25 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
   },
   {
     id: "influential-citations",
-    label: "Influential citations",
+    label: "Highly influential citations",
     group: "Impact",
     description:
-      "Citations classified by the provider as substantially influencing the citing work.",
+      "Number of citing works classified by Semantic Scholar as substantially influenced by this paper. The machine-generated classification is available only where sufficient citing-paper text can be analysed.",
     valueType: "integer",
-    column: { primary: false, defaultVisible: false, width: 132 },
+    column: { primary: false, defaultVisible: false, width: 160 },
     itemPane: "advanced",
     graph: graphAll,
     value: (node) => node.influentialCitationCount,
-  },
-  {
-    id: "two-year-mean-citedness",
-    label: "2-year mean citedness",
-    group: "Source",
-    description:
-      "Average citations received by recent works from this journal or source. This is a source-level metric, not a property of the individual paper.",
-    valueType: "decimal",
-    decimals: 2,
-    column: { primary: false, defaultVisible: false, width: 150 },
-    itemPane: "overview",
-    graph: graphAll,
-    value: (node) => node.sourceMetrics?.twoYearMeanCitedness ?? null,
   },
   {
     id: "journal-h-index",
     label: "Journal h-index",
     group: "Source",
     description:
-      "The h-index reported for this paper's journal or source. This is a source-level metric.",
+      "OpenAlex source h-index: the largest h for which the journal has at least h works cited at least h times.",
     valueType: "integer",
     column: { primary: false, defaultVisible: false, width: 118 },
-    itemPane: "overview",
+    itemPane: "advanced",
     graph: graphAll,
     value: (node) => node.sourceMetrics?.hIndex ?? null,
   },
@@ -202,7 +199,7 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     label: "Journal i10-index",
     group: "Source",
     description:
-      "Number of works from this journal or source with at least ten citations, when supplied by the provider.",
+      "Number of works from the journal or source that OpenAlex reports as having at least ten citations.",
     valueType: "integer",
     column: { primary: false, defaultVisible: false, width: 126 },
     itemPane: "advanced",
@@ -210,105 +207,45 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     value: (node) => node.sourceMetrics?.i10Index ?? null,
   },
   {
+    id: "two-year-mean-citedness",
+    label: "Journal 2-year mean citedness",
+    group: "Source",
+    description:
+      "OpenAlex source metric measuring the recent average citation activity of works from this journal or source.",
+    valueType: "decimal",
+    decimals: 2,
+    column: { primary: false, defaultVisible: false, width: 172 },
+    itemPane: "advanced",
+    graph: graphAll,
+    value: (node) => node.sourceMetrics?.twoYearMeanCitedness ?? null,
+  },
+  {
     id: "library-coverage",
-    label: "Library coverage",
-    group: "Library network",
+    label: "Connections in library",
+    group: "Library",
     description:
-      "References linked to items anywhere in this Zotero library divided by the provider-declared reference count.",
-    valueType: "percentage",
-    decimals: 1,
-    column: { primary: false, defaultVisible: false, width: 124 },
-    itemPane: "overview",
-    graph: { ...graphAll, logarithmic: false },
-    value: (node) => node.libraryCoverage,
-  },
-  {
-    id: "local-global-impact",
-    label: "Local/global impact",
-    group: "Library network",
-    description:
-      "Citations received from papers in this Zotero library divided by the global provider citation count.",
-    valueType: "percentage",
-    decimals: 1,
-    column: { primary: false, defaultVisible: false, width: 132 },
-    itemPane: "advanced",
-    graph: { ...graphAll, logarithmic: false },
-    value: (node) => node.localGlobalImpactRatio,
-  },
-  {
-    id: "pagerank",
-    label: "PageRank",
-    group: "Library network",
-    description:
-      "Relative network importance calculated from citation links between papers in this Zotero library.",
-    valueType: "decimal",
-    decimals: 4,
-    column: { primary: false, defaultVisible: false, width: 92 },
-    itemPane: "advanced",
-    graph: graphAll,
-    value: (node) => node.pageRank,
-  },
-  {
-    id: "betweenness",
-    label: "Betweenness",
-    group: "Library network",
-    description:
-      "How often the paper lies on shortest citation paths between other papers in this library.",
-    valueType: "decimal",
-    decimals: 4,
-    column: { primary: false, defaultVisible: false, width: 108 },
-    itemPane: "advanced",
-    graph: graphAll,
-    value: (node) => node.betweennessCentrality,
-  },
-  {
-    id: "eigenvector",
-    label: "Eigenvector centrality",
-    group: "Library network",
-    description:
-      "Network importance that gives greater weight to links from other well-connected papers.",
-    valueType: "decimal",
-    decimals: 4,
-    column: { primary: false, defaultVisible: false, width: 146 },
-    itemPane: "advanced",
-    graph: graphAll,
-    value: (node) => node.eigenvectorCentrality,
-  },
-  {
-    id: "component-size",
-    label: "Component size",
-    group: "Library network",
-    description:
-      "Number of papers in the connected citation-network component containing this paper.",
+      "Number of citation connections between this paper and papers in the current Zotero library. Incoming and outgoing connections are combined.",
     valueType: "integer",
-    column: { primary: false, defaultVisible: false, width: 116 },
+    column: { primary: false, defaultVisible: false, width: 140 },
     itemPane: "advanced",
     graph: graphAll,
-    value: (node) => node.componentSize,
-  },
-  {
-    id: "citation-chain-depth",
-    label: "Citation-chain depth",
-    group: "Library network",
-    description:
-      "Longest directed citation path starting from this paper within the current library graph.",
-    valueType: "integer",
-    column: { primary: false, defaultVisible: false, width: 138 },
-    itemPane: "advanced",
-    graph: graphAll,
-    value: (node) => node.citationChainDepth,
+    value: (node) =>
+      Math.max(
+        0,
+        node.incomingLibraryCitations + node.outgoingLibraryReferences,
+      ),
   },
   {
     id: "reference-coverage",
     label: "Reference coverage",
     group: "Bibliography",
     description:
-      "Structured reference records retrieved from the provider divided by the provider-declared bibliography count.",
+      "Retrieved structured references divided by the reported bibliography size.",
     valueType: "percentage",
     decimals: 1,
     column: { primary: false, defaultVisible: false, width: 132 },
     itemPane: "advanced",
-    graph: { ...graphAll, logarithmic: false },
+    graph: graphLinear,
     value: (node) => node.referenceCoverage,
   },
   {
@@ -316,7 +253,7 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     label: "Mean reference age",
     group: "Bibliography",
     description:
-      "Average number of years between this paper and the works in its retrieved bibliography.",
+      "Mean publication-age difference between this paper and its externally retrieved structured references. Displayed only with at least five usable references and at least 25% reference coverage.",
     valueType: "decimal",
     decimals: 1,
     column: { primary: false, defaultVisible: false, width: 134 },
@@ -329,7 +266,7 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     label: "Reference-age spread",
     group: "Bibliography",
     description:
-      "Standard deviation of reference ages in the retrieved bibliography.",
+      "Standard deviation of reference ages among externally retrieved structured references. Displayed only with at least five usable references and at least 25% reference coverage.",
     valueType: "decimal",
     decimals: 1,
     column: { primary: false, defaultVisible: false, width: 138 },
@@ -342,72 +279,115 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     label: "Estimated self-citations",
     group: "Bibliography",
     description:
-      "Estimated fraction of retrieved references sharing at least one author surname with this paper.",
+      "Estimated share of externally retrieved structured references sharing an author identifier, or a normalized surname when identifiers are unavailable. Displayed only with at least five comparable references and at least 25% reference coverage.",
     valueType: "percentage",
     decimals: 1,
     column: { primary: false, defaultVisible: false, width: 152 },
     itemPane: "advanced",
-    graph: { ...graphAll, logarithmic: false },
+    graph: graphLinear,
     value: (node) => node.selfCitationEstimate,
-  },
-  {
-    id: "future-references",
-    label: "Future-dated references",
-    group: "Bibliography",
-    description:
-      "Retrieved references whose publication year is later than this paper's year; useful as a metadata diagnostic.",
-    valueType: "integer",
-    column: { primary: false, defaultVisible: false, width: 154 },
-    itemPane: "advanced",
-    graph: graphAll,
-    value: (node) => node.futureReferenceCount,
-  },
-  {
-    id: "data-age",
-    label: "Data age",
-    group: "Data quality",
-    description: "Days since citation data for this item were last refreshed.",
-    valueType: "days",
-    decimals: 0,
-    column: { primary: false, defaultVisible: false, width: 92 },
-    itemPane: "advanced",
-    graph: graphAll,
-    value: (node) => node.dataAgeDays,
   },
   {
     id: "metadata-completeness",
     label: "Metadata completeness",
     group: "Data quality",
     description:
-      "Fraction of core identity fields available for matching and graph display.",
+      "Percentage of six Zotero metadata categories populated: title, creators, publication year, publication source, abstract and at least one external identifier.",
     valueType: "percentage",
-    decimals: 1,
+    decimals: 0,
     column: { primary: false, defaultVisible: false, width: 150 },
     itemPane: "advanced",
-    graph: { ...graphAll, logarithmic: false },
+    graph: graphLinear,
     value: (node) => node.metadataCompleteness,
-  },
-  {
-    id: "match-confidence",
-    label: "Match confidence",
-    group: "Data quality",
-    description:
-      "Confidence that the provider record corresponds to the Zotero item. Identifier matches are normally exact.",
-    valueType: "percentage",
-    decimals: 1,
-    column: { primary: false, defaultVisible: false, width: 124 },
-    itemPane: "advanced",
-    graph: { ...graphAll, logarithmic: false },
-    value: (node) => node.matchConfidence,
   },
 ];
 
+export const SUPPLEMENTARY_PROPERTY_DEFINITIONS: SupplementaryPropertyDefinition[] =
+  [
+    {
+      id: "openAccessStatus",
+      label: "Open Access",
+      description:
+        "Open-access status reported by scholarly-data providers. Detailed values may include Gold, Diamond, Hybrid, Green, Bronze or Open.",
+      group: "Data quality",
+      column: { primary: false, defaultVisible: false, width: 104 },
+      itemPane: "advanced",
+      graph: { nodeColor: true, filter: true },
+      value: (node) => node.openAccessStatus ?? node.isOpenAccess,
+      format: (value) =>
+        typeof value === "boolean"
+          ? value
+            ? "Open"
+            : "Closed"
+          : String(value),
+    },
+    {
+      id: "retractionStatus",
+      label: "Retracted",
+      description:
+        "Whether a scholarly-data provider reports that this work has been retracted. Verify critical cases with the publisher.",
+      group: "Data quality",
+      column: { primary: false, defaultVisible: false, width: 92 },
+      itemPane: "advanced",
+      graph: { nodeColor: true, filter: true },
+      value: (node) => node.isRetracted,
+      format: (value) => (value === true ? "Yes" : "No"),
+    },
+    {
+      id: "lastUpdate",
+      label: "Last update",
+      description:
+        "Date and time of the most recent successful general citation-data refresh for this paper.",
+      group: "Data quality",
+      column: { primary: false, defaultVisible: false, width: 150 },
+      itemPane: "advanced",
+      graph: { nodeColor: false, filter: false },
+      value: (node) => node.metricsUpdatedAt,
+      format: (value) =>
+        typeof value === "string" && value
+          ? new Date(value).toLocaleString()
+          : "—",
+    },
+    {
+      id: "matchMethod",
+      label: "Match method",
+      description:
+        "Identifier or metadata field used to match the Zotero item to the external scholarly record.",
+      group: "Data quality",
+      column: { primary: false, defaultVisible: false, width: 112 },
+      itemPane: "advanced",
+      graph: { nodeColor: false, filter: false },
+      value: (node) => node.matchedBy,
+      format: (value) =>
+        String(value)
+          .replace("arxiv", "arXiv ID")
+          .replace("pmid", "PMID")
+          .replace("doi", "DOI")
+          .replace("isbn", "ISBN")
+          .replace("title", "Exact title"),
+    },
+  ];
+
 const BY_ID = new Map(METRIC_DEFINITIONS.map((metric) => [metric.id, metric]));
+const PROPERTY_BY_ID = new Map<
+  string,
+  MetricDefinition | SupplementaryPropertyDefinition
+>();
+for (const property of METRIC_DEFINITIONS) {
+  PROPERTY_BY_ID.set(property.id, property);
+}
+for (const property of SUPPLEMENTARY_PROPERTY_DEFINITIONS) {
+  PROPERTY_BY_ID.set(property.id, property);
+}
 
 export function getMetricDefinition(id: MetricID): MetricDefinition {
   const metric = BY_ID.get(id);
   if (!metric) throw new Error(`Unknown Citation Map metric: ${id}`);
   return metric;
+}
+
+export function getPropertyDefinition(id: string) {
+  return PROPERTY_BY_ID.get(id) ?? null;
 }
 
 export function metricValue(
@@ -433,10 +413,7 @@ export function formatMetricValue(
     }).format(value);
   }
   if (definition.valueType === "days") {
-    return `${new Intl.NumberFormat(undefined, {
-      useGrouping: false,
-      maximumFractionDigits: 0,
-    }).format(value)} d`;
+    return `${new Intl.NumberFormat(undefined, { useGrouping: false, maximumFractionDigits: 0 }).format(value)} d`;
   }
   return new Intl.NumberFormat(undefined, {
     useGrouping: false,
@@ -453,11 +430,9 @@ export function metricTooltip(id: MetricID): string {
 export function axisMetricDefinitions(): MetricDefinition[] {
   return METRIC_DEFINITIONS.filter((metric) => metric.graph.axis);
 }
-
 export function nodeSizeMetricDefinitions(): MetricDefinition[] {
   return METRIC_DEFINITIONS.filter((metric) => metric.graph.nodeSize);
 }
-
 export function nodeColorMetricDefinitions(): MetricDefinition[] {
   return METRIC_DEFINITIONS.filter((metric) => metric.graph.nodeColor);
 }

@@ -1,0 +1,6 @@
+.icon-item-type[data-item-type="citation-map-network"] {
+  width: 16px;
+  height: 16px;
+  background: url("chrome://citationmap/content/icons/network.svg") center /
+    16px 16px no-repeat;
+}

@@ -4,7 +4,7 @@ import type {
   CitationUpdateBatchResult,
   ProviderLookupFailure,
 } from "../domain/citationTypes";
-import { lookupCitationMetrics } from "../providers/registry";
+import { getProviderPlan, lookupCitationMetrics } from "../providers/registry";
 import {
   cancelPendingCitationRequests,
   isCitationRequestCancellationRequested,
@@ -25,14 +25,15 @@ import {
   getProviderPreference,
   getUpdateNewItemsEnabled,
 } from "./citationPreferences";
-import {
-  refreshExternalRelationships,
-  storeExternalRelationshipSnapshot,
-} from "./externalDiscoveryService";
+import { storeExternalRelationshipSnapshot } from "./externalDiscoveryService";
 import { refreshCitationColumns } from "./itemTreeColumnService";
-import { mergeRelatedWorkLists } from "./relationshipStoreService";
+import {
+  getStoredRelationshipWorks,
+  mergeRelatedWorkLists,
+} from "./relationshipStoreService";
 import { createMetricNodeForItem } from "./itemMetricContext";
 import { refreshCitationItemPanes } from "./itemPaneService";
+import { ensureSourceMetricsForNodes } from "./sourceMetricsService";
 import { refreshOpenCitationMapViews } from "./windowService";
 import {
   closeAllUpdateProgress,
@@ -41,11 +42,15 @@ import {
 } from "./updateProgressService";
 
 interface UpdateOptions {
+  /** Update every item in the scope even when its cache is still current. */
   force?: boolean;
   silent?: boolean;
   provider?: CitationProviderPreference;
-  /** Fetch complete cited-by/reference lists. Defaults to true for a single
-   * item and false for multi-item batches. */
+  /**
+   * Retained for API compatibility. General field-update actions never hydrate
+   * complete cited-by/reference lists; relationship views provide their own
+   * explicit refresh controls.
+   */
   includeRelationships?: boolean;
   /** Document in which the modeless progress window should be shown. */
   progressDocument?: Document;
@@ -187,8 +192,10 @@ function createProgress(
 ): UpdateProgressHandle {
   return createUpdateProgress({
     document,
-    title: "Updating citation data",
-    message: `Preparing ${total} paper${total === 1 ? "" : "s"} with ${getProviderLabel(provider)}`,
+    title: "Updating fields",
+    message:
+      `Preparing ${total} paper${total === 1 ? "" : "s"} with ` +
+      getProviderLabel(provider),
     total,
   });
 }
@@ -205,7 +212,9 @@ function updateProgress(
   progress.setProgress(
     completed,
     total,
-    `Updating ${completed}/${total} complete${active ? ` · ${active} active` : ""}: ${title}`,
+    `Updating ${completed}/${total} complete${
+      active ? ` · ${active} active` : ""
+    }: ${title}`,
   );
 }
 
@@ -215,7 +224,8 @@ function finishProgress(
 ): void {
   if (!progress || shuttingDown) return;
   progress.finish(
-    `${result.updated} updated · ${result.cached} current · ${result.failed} failed · ${result.skipped} skipped`,
+    `${result.updated} updated · ${result.cached} current · ` +
+      `${result.failed} failed · ${result.skipped} skipped`,
   );
 }
 
@@ -245,12 +255,17 @@ function nextRetryAt(
   }
 }
 
+function nonEmptyYearCounts<T>(
+  current: T[] | null | undefined,
+  previous: T[] | null | undefined,
+): T[] {
+  return current?.length ? current : (previous ?? []);
+}
+
 async function updateOneItem(
   item: Zotero.Item,
   preference: CitationProviderPreference,
   force: boolean,
-  includeRelationships: boolean,
-  includeOptionalEnrichment: boolean,
 ): Promise<UpdateOutcome> {
   if (shuttingDown || isCitationRequestCancellationRequested()) {
     return "skipped";
@@ -268,11 +283,14 @@ async function updateOneItem(
     ...extracted,
     doi: extracted.doi ?? (previous?.matchConfirmed ? previous.doi : null),
   };
+  // Every explicit or automatic field update attempts the full scalar-field
+  // enrichment path. This remains bounded because complete relationship lists
+  // are refreshed separately by the relationship views.
   const result = await lookupCitationMetrics(
     preference,
     identifiers,
     getExactTitleFallbackEnabled(),
-    includeOptionalEnrichment,
+    true,
   );
   if (shuttingDown || isCitationRequestCancellationRequested()) {
     return "skipped";
@@ -289,10 +307,8 @@ async function updateOneItem(
     );
     return "failed";
   }
+
   const now = new Date().toISOString();
-  // DOI and unique non-contradictory exact-title matches are accepted
-  // automatically. Exact fallback identifiers remain visible as provisional
-  // until the user confirms them in the item pane.
   const sameConfirmedIdentity = Boolean(
     previous?.matchConfirmed &&
     ((previous.providerWorkID &&
@@ -303,29 +319,51 @@ async function updateOneItem(
     result.matchedBy === "doi" ||
     result.matchedBy === "title" ||
     sameConfirmedIdentity;
+  const cachedRelationshipNode = createMetricNodeForItem(item);
   const mergedReferences = mergeRelatedWorkLists(
     previous?.references ?? [],
+    getStoredRelationshipWorks(cachedRelationshipNode, "references"),
     result.references,
   );
+  const citationCount = result.citationCount ?? previous?.citationCount ?? null;
+  const referenceCount =
+    result.referenceCount ?? previous?.referenceCount ?? null;
+
   const record: CitationMetricRecord = {
     libraryID,
     itemKey,
     provider: result.provider,
-    providerWorkID: result.providerWorkID,
-    matchedBy: result.matchedBy,
-    matchConfidence: result.matchConfidence,
+    providerWorkID: result.providerWorkID ?? previous?.providerWorkID ?? null,
+    matchedBy: result.matchedBy ?? previous?.matchedBy ?? null,
+    matchConfidence:
+      result.matchConfidence ?? previous?.matchConfidence ?? null,
     matchConfirmed,
-    doi: result.doi ?? identifiers.doi,
-    title: result.title ?? identifiers.title,
-    normalizedTitle: identifiers.normalizedTitle,
-    year: result.year ?? identifiers.year,
-    authors: result.authors.length ? result.authors : identifiers.authors,
-    sourceTitle: result.sourceTitle ?? identifiers.sourceTitle,
-    abstract: result.abstract,
-    citationCount: result.citationCount,
-    citationCountProvider: result.citationCountProvider,
-    referenceCount: result.referenceCount,
-    referenceCountProvider: result.referenceCountProvider,
+    doi: result.doi ?? identifiers.doi ?? previous?.doi ?? null,
+    title: result.title ?? identifiers.title ?? previous?.title ?? null,
+    normalizedTitle:
+      identifiers.normalizedTitle ?? previous?.normalizedTitle ?? null,
+    year: result.year ?? identifiers.year ?? previous?.year ?? null,
+    authors: result.authors.length
+      ? result.authors
+      : identifiers.authors.length
+        ? identifiers.authors
+        : (previous?.authors ?? []),
+    sourceTitle:
+      result.sourceTitle ??
+      identifiers.sourceTitle ??
+      previous?.sourceTitle ??
+      null,
+    abstract: result.abstract ?? previous?.abstract ?? null,
+    citationCount,
+    citationCountProvider:
+      result.citationCount !== null
+        ? result.citationCountProvider
+        : (previous?.citationCountProvider ?? result.citationCountProvider),
+    referenceCount,
+    referenceCountProvider:
+      result.referenceCount !== null
+        ? result.referenceCountProvider
+        : (previous?.referenceCountProvider ?? result.referenceCountProvider),
     resolvedReferenceCount: Math.max(
       previous?.resolvedReferenceCount ?? 0,
       result.resolvedReferenceCount,
@@ -333,20 +371,32 @@ async function updateOneItem(
     ),
     references: mergedReferences,
     matchCandidates: [],
-    fwci: result.fwci ?? null,
-    citationPercentile: result.citationPercentile ?? null,
-    isTop1Percent: result.isTop1Percent ?? null,
-    isTop10Percent: result.isTop10Percent ?? null,
-    citationCountsByYear: result.citationCountsByYear ?? [],
-    citationsLastYear: result.citationsLastYear ?? null,
-    citationVelocity: result.citationVelocity ?? null,
-    citationAcceleration: result.citationAcceleration ?? null,
-    influentialCitationCount: result.influentialCitationCount ?? null,
-    isRetracted: result.isRetracted ?? null,
-    openAccessStatus: result.openAccessStatus ?? null,
-    isOpenAccess: result.isOpenAccess ?? null,
-    publicationType: result.publicationType ?? null,
-    sourceMetrics: result.sourceMetrics ?? null,
+    fwci: result.fwci ?? previous?.fwci ?? null,
+    citationPercentile:
+      result.citationPercentile ?? previous?.citationPercentile ?? null,
+    isTop1Percent: result.isTop1Percent ?? previous?.isTop1Percent ?? null,
+    isTop10Percent: result.isTop10Percent ?? previous?.isTop10Percent ?? null,
+    citationCountsByYear: nonEmptyYearCounts(
+      result.citationCountsByYear,
+      previous?.citationCountsByYear,
+    ),
+    citationsLastYear:
+      result.citationsLastYear ?? previous?.citationsLastYear ?? null,
+    citationVelocity:
+      result.citationVelocity ?? previous?.citationVelocity ?? null,
+    citationAcceleration:
+      result.citationAcceleration ?? previous?.citationAcceleration ?? null,
+    influentialCitationCount:
+      result.influentialCitationCount ??
+      previous?.influentialCitationCount ??
+      null,
+    isRetracted: result.isRetracted ?? previous?.isRetracted ?? null,
+    openAccessStatus:
+      result.openAccessStatus ?? previous?.openAccessStatus ?? null,
+    isOpenAccess: result.isOpenAccess ?? previous?.isOpenAccess ?? null,
+    publicationType:
+      result.publicationType ?? previous?.publicationType ?? null,
+    sourceMetrics: result.sourceMetrics ?? previous?.sourceMetrics ?? null,
     status: "success",
     fetchedAt: now,
     lastAttemptAt: now,
@@ -356,28 +406,21 @@ async function updateOneItem(
   };
   await saveCitationMetricRecord(record);
 
-  // The references embedded in the metric response are cheap to persist and
-  // are merged immediately. Complete paginated relationship hydration is
-  // optional so a multi-item count update cannot remain at 0/N while waiting
-  // for hundreds of relationship requests.
+  // Persist the provider's embedded reference snapshot, but do not paginate
+  // cited-by/reference endpoints here. The relationship tabs own those actions.
   try {
-    const node = createMetricNodeForItem(item);
+    const updatedNode = createMetricNodeForItem(item);
     await storeExternalRelationshipSnapshot(
-      node,
+      updatedNode,
       "references",
       record.references,
     );
-    if (includeRelationships) {
-      await refreshExternalRelationships(node, [node], "references");
-      if ((record.citationCount ?? 0) > 0) {
-        await refreshExternalRelationships(node, [node], "cited-by");
-      } else {
-        await storeExternalRelationshipSnapshot(node, "cited-by", []);
-      }
+    if (getProviderPlan("source-metrics", preference).providers.length) {
+      await ensureSourceMetricsForNodes([updatedNode]);
     }
   } catch (error) {
     Zotero.debug(
-      "Citation Map: relationship refresh failed for " +
+      "Citation Map: post-update enrichment failed for " +
         `${itemKey}: ${String(error)}`,
     );
   }
@@ -391,11 +434,8 @@ async function runUpdate(
   const selected = regularItems(items);
   const provider = options.provider ?? getProviderPreference();
   const force = Boolean(options.force);
-  const includeRelationships =
-    options.includeRelationships ?? selected.length === 1;
-  // Optional provider enrichment is valuable for direct single-paper refreshes
-  // but makes Ctrl+A batches substantially slower and less predictable.
-  const includeOptionalEnrichment = force && selected.length <= 3;
+  // Read the legacy option so development builds passing it remain compatible.
+  void options.includeRelationships;
   const result: CitationUpdateBatchResult = {
     total: selected.length,
     updated: 0,
@@ -434,7 +474,6 @@ async function runUpdate(
         pending.length,
         String(item.getField("title") ?? "Untitled"),
       );
-      // Let Zotero paint the modeless progress window before provider work starts.
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       let outcome: UpdateOutcome;
       try {
@@ -443,15 +482,9 @@ async function runUpdate(
             ? SINGLE_ITEM_DEADLINE_MS
             : BATCH_ITEM_DEADLINE_MS;
         outcome = await withDeadline(
-          updateOneItem(
-            item,
-            provider,
-            force,
-            includeRelationships,
-            includeOptionalEnrichment,
-          ),
+          updateOneItem(item, provider, force),
           deadline,
-          `Citation update for ${String(item.getField("title") ?? item.key)}`,
+          `Field update for ${String(item.getField("title") ?? item.key)}`,
         );
       } catch (error) {
         Zotero.logError(
@@ -486,8 +519,6 @@ async function runUpdate(
     }
 
     if (!shuttingDown && !isCitationRequestCancellationRequested()) {
-      // Finish the user-visible operation before refreshing secondary views. A
-      // graph-tab lifecycle problem must never leave citation progress stuck.
       finishProgress(progress, result);
       refreshViewsAfterUpdate(selected.length <= 3);
     } else {
@@ -505,8 +536,8 @@ export function updateCitationDataForItems(
     !options.silent && operationBusy
       ? createUpdateProgress({
           document: options.progressDocument,
-          title: "Updating citation data",
-          message: "Waiting for the current citation update to finish…",
+          title: "Updating fields",
+          message: "Waiting for the current field update to finish…",
           total: Math.max(1, regularItems(items).length),
         })
       : null;

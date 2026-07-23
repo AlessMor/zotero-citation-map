@@ -33,22 +33,26 @@ import {
 } from "./services/windowService";
 
 const MAIN_STYLESHEET_ID = `${config.addonRef}-main-stylesheet`;
+const TAB_ICON_STYLESHEET_ID = `${config.addonRef}-tab-icon-stylesheet`;
 const TEARDOWN_MARKER = `__${config.addonRef}RuntimeTeardownListener`;
 let teardownStarted = false;
 
 function installStyles(win: _ZoteroTypes.MainWindow): void {
-  if (win.document.getElementById(MAIN_STYLESHEET_ID)) return;
-  const link = win.document.createElementNS(
-    "http://www.w3.org/1999/xhtml",
-    "link",
-  );
-  link.id = MAIN_STYLESHEET_ID;
-  link.setAttribute("rel", "stylesheet");
-  link.setAttribute(
-    "href",
-    `chrome://${config.addonRef}/content/zoteroPane.css`,
-  );
-  win.document.documentElement.appendChild(link);
+  const stylesheets: Array<[string, string]> = [
+    [MAIN_STYLESHEET_ID, `chrome://${config.addonRef}/content/zoteroPane.css`],
+    [TAB_ICON_STYLESHEET_ID, `chrome://${config.addonRef}/content/tabIcon.css`],
+  ];
+  for (const [id, href] of stylesheets) {
+    if (win.document.getElementById(id)) continue;
+    const link = win.document.createElementNS(
+      "http://www.w3.org/1999/xhtml",
+      "link",
+    );
+    link.id = id;
+    link.setAttribute("rel", "stylesheet");
+    link.setAttribute("href", href);
+    win.document.documentElement.appendChild(link);
+  }
 }
 
 function beginTeardown(closeGraphTab = true): void {
@@ -137,6 +141,7 @@ async function onMainWindowUnload(win: _ZoteroTypes.MainWindow): Promise<void> {
   else closeCitationMapWindow();
   uninstallCitationColumnTooltips(win);
   win.document.getElementById(MAIN_STYLESHEET_ID)?.remove();
+  win.document.getElementById(TAB_ICON_STYLESHEET_ID)?.remove();
 }
 
 async function onShutdown(): Promise<void> {

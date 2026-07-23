@@ -62,10 +62,32 @@ function workIdentity(work: RelatedWorkMetadata): string {
   ])}`;
 }
 
+function latestTimestamp(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): string | null {
+  const candidates = [left, right]
+    .filter((value): value is string => Boolean(value))
+    .sort((a, b) => Date.parse(a) - Date.parse(b));
+  return candidates.at(-1) ?? null;
+}
+
 function mergeWorkMetadata(
   existing: RelatedWorkMetadata,
   incoming: RelatedWorkMetadata,
 ): RelatedWorkMetadata {
+  const dataSources = [
+    ...new Set([
+      ...(existing.dataSources ?? []),
+      ...(incoming.dataSources ?? []),
+      ...(existing.provider === "manual" || existing.provider === "zotero"
+        ? []
+        : [existing.provider]),
+      ...(incoming.provider === "manual" || incoming.provider === "zotero"
+        ? []
+        : [incoming.provider]),
+    ]),
+  ];
   return {
     ...existing,
     ...incoming,
@@ -87,6 +109,8 @@ function mergeWorkMetadata(
     openAccessStatus: incoming.openAccessStatus ?? existing.openAccessStatus,
     isRetracted: incoming.isRetracted ?? existing.isRetracted,
     zoteroItemKey: incoming.zoteroItemKey ?? existing.zoteroItemKey,
+    dataSources,
+    updatedAt: latestTimestamp(existing.updatedAt, incoming.updatedAt),
   };
 }
 

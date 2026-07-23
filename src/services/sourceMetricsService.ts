@@ -6,12 +6,16 @@ import type {
   GraphNodeSizeMetric,
 } from "../domain/graphTypes";
 import { requestJSON } from "../providers/http";
-import { getCitationProvider } from "../providers/registry";
+import { getCitationProvider, getProviderPlan } from "../providers/registry";
 import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
 import {
   getCitationMetricRecord,
   saveCitationMetricRecord,
 } from "./citationMetricsStore";
+import {
+  getOpenAlexAPIKey,
+  getProviderPreference,
+} from "./citationPreferences";
 
 const SOURCE_METRIC_IDS = new Set<string>([
   "two-year-mean-citedness",
@@ -41,6 +45,20 @@ interface OpenAlexSourceList {
 interface OpenAlexWorkSource {
   primary_location?: { source?: OpenAlexSource | null } | null;
   locations?: Array<{ source?: OpenAlexSource | null }> | null;
+}
+
+function openAlexURL(
+  path: string,
+  parameters: Record<string, string | number> = {},
+): string {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const url = new URL(`https://api.openalex.org${normalizedPath}`);
+  for (const [name, value] of Object.entries(parameters)) {
+    url.searchParams.set(name, String(value));
+  }
+  const apiKey = getOpenAlexAPIKey();
+  if (apiKey) url.searchParams.set("api_key", apiKey);
+  return url.toString();
 }
 
 function finiteNonNegative(value: unknown): number | null {
@@ -142,7 +160,9 @@ async function sourceMetricsBySourceID(
   if (!normalizedID) return null;
   const response = await requestJSON<OpenAlexSource>(
     "openalex",
-    `https://api.openalex.org/sources/${encodeURIComponent(normalizedID)}?select=id,display_name,issn_l,issn,summary_stats`,
+    openAlexURL(`/sources/${encodeURIComponent(normalizedID)}`, {
+      select: "id,display_name,issn_l,issn,summary_stats",
+    }),
   );
   return response.ok ? metricsFromSource(response.data) : null;
 }
@@ -155,7 +175,11 @@ async function sourceMetricsByISSN(
   const formatted = `${compact.slice(0, 4)}-${compact.slice(4)}`;
   const response = await requestJSON<OpenAlexSourceList>(
     "openalex",
-    `https://api.openalex.org/sources?filter=${encodeURIComponent(`issn:${formatted}`)}&per-page=5&select=id,display_name,issn_l,issn,summary_stats`,
+    openAlexURL("/sources", {
+      filter: `issn:${formatted}`,
+      per_page: 5,
+      select: "id,display_name,issn_l,issn,summary_stats",
+    }),
   );
   if (!response.ok || !response.data) return null;
   const candidate = (response.data.results ?? [])[0] ?? null;
@@ -171,7 +195,11 @@ async function sourceMetricsByTitle(
   if (!normalized) return null;
   const response = await requestJSON<OpenAlexSourceList>(
     "openalex",
-    `https://api.openalex.org/sources?search=${encodeURIComponent(title)}&per-page=20&select=id,display_name,issn_l,issn,summary_stats`,
+    openAlexURL("/sources", {
+      search: title,
+      per_page: 20,
+      select: "id,display_name,issn_l,issn,summary_stats",
+    }),
   );
   if (!response.ok || !response.data) return null;
   const candidates = response.data.results ?? [];
@@ -189,7 +217,9 @@ async function sourceMetricsByDOI(doi: string): Promise<SourceMetrics | null> {
   if (!normalized) return null;
   const response = await requestJSON<OpenAlexWorkSource>(
     "openalex",
-    `https://api.openalex.org/works/${encodeURIComponent(`doi:${normalized}`)}?select=primary_location,locations`,
+    openAlexURL(`/works/${encodeURIComponent(`doi:${normalized}`)}`, {
+      select: "primary_location,locations",
+    }),
   );
   if (!response.ok || !response.data) return null;
   const sources = [
@@ -287,7 +317,8 @@ async function enrichNode(node: CitationGraphNode): Promise<boolean> {
       return true;
     } catch (error) {
       Zotero.debug(
-        `Citation Map: source-metric enrichment failed for ${node.itemKey}: ${String(error)}`,
+        "Citation Map: source-metric enrichment failed for " +
+          `${node.itemKey}: ${String(error)}`,
       );
       return false;
     }
@@ -300,6 +331,10 @@ export async function ensureSourceMetricsForNodes(
   nodes: CitationGraphNode[],
   onUpdate?: (updated: number, total: number) => void,
 ): Promise<number> {
+  const preference = getProviderPreference();
+  const plan = getProviderPlan("source-metrics", preference);
+  if (!plan.providers.includes("openalex") || !getOpenAlexAPIKey()) return 0;
+
   const missing = nodes.filter((node) => !hasSourceMetric(node.sourceMetrics));
   let updated = 0;
   for (const node of missing) {

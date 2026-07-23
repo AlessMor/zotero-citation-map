@@ -8,7 +8,7 @@ Whenever I wanted to explore the connections between a set of papers, I had to m
 
 So I decided to see if something along those lines could be integrated directly inside Zotero... and this plugin is the result!
 
-![zotero-citation-map overview](docs/assets/citationmapoverview.gif)
+![zotero-citation-map overview](docs/assets/Registrazione%202026-07-20%20231456.gif)
 
 ## Installation:
 
@@ -34,21 +34,44 @@ The plugin should now be available in Zotero.
 
 Download the newest `.xpi` file from the [Releases](https://github.com/AlessMor/zotero-citation-map/releases/latest) page and repeat the installation procedure. Zotero will replace the existing version.
 
-# Main Features:
-
 ## Main Features
 
 - **See how papers in your library are connected**
   Visualize which papers cite each other and which references they share.
-
-- **Explore citations and references directly in Zotero**
-  Start from a selected paper and move through the surrounding literature without opening a separate website.
-
-- **Keep the map linked to your library**
+  Generate a graph from your library or from a collection, with every library paper linked back to its Zotero item, notes and PDF. Use filters to change what you want to see.
   Papers already present in Zotero are matched to their library items, so you can quickly return to their metadata, notes and PDFs.
+  ![graph](docs/assets/FreeGraph.png)
 
-- **Find missing papers**
-  Citation providers may report papers that are not yet in your library, helping you identify relevant references or later citing work.
+- **Customize and export your citation map view**
+  Arrange papers by properties such as publication year and citation count, or secondary properties such as journal h-index.
+  Use nodes colour and size to visualize other properties.
+  You can export the map view as an image, CSV or JSON.
+  ![axes](docs/assets/OrderedGraph.png)
+
+- **Find missing papers from several data providers**
+  External papers discovered through the graph can be imported directly into Zotero when sufficient metadata are available.
+  Add a paper to Zotero by either the graph view or from the properties panel in the main Zotero page.
+  You can see a preview on the graph before adding any paper.
+  Combine Crossref, Semantic Scholar, OpenCitations and INSPIRE and OpenAlex.
+  ![add](docs/assets/AddToZotero.png)
 
 - **Update citation data**
   Refresh the citation and reference relationships when provider data changes or when new papers are added to your library. You can also do it manually if you want to create custom maps.
+
+## Acknowledgements:
+
+The project was mainly inspired by other Zotero plugins:
+
+- [windingwind/zotero-plugin-template](https://github.com/windingwind/zotero-plugin-template)
+
+- [zotero-cita/zotero-cita](https://github.com/zotero-cita/zotero-cita)
+
+- [phdemotions/zotero-citegeist](https://github.com/phdemotions/zotero-citegeist)
+
+- [eschnett/zotero-citationcounts](https://github.com/eschnett/zotero-citationcounts)
+
+- [MuiseDestiny/zotero-style](https://github.com/MuiseDestiny/zotero-style)
+
+- [danieleongari/zotero-openalex](https://github.com/danieleongari/zotero-openalex)
+
+Citation and bibliographic data are retrieved from the public APIs provided by [Crossref](https://www.crossref.org/), [Semantic Scholar](https://www.semanticscholar.org/), [OpenCitations](https://opencitations.net/), [INSPIRE-HEP](https://inspirehep.net/), and [OpenAlex](https://openalex.org/). These services are independent of this project, and their respective terms, coverage, and data-quality limitations apply.

@@ -39,6 +39,23 @@
     class="citation-map-pref-help"
     data-l10n-id="pref-provider-help"
   />
+  <hbox class="citation-map-pref-row" align="center">
+    <html:label
+      for="zotero-prefpane-citationmap-openalex-api-key"
+      data-l10n-id="pref-openalex-api-key"
+    ></html:label>
+    <html:input
+      id="zotero-prefpane-citationmap-openalex-api-key"
+      type="password"
+      preference="openAlexAPIKey"
+      autocomplete="off"
+      spellcheck="false"
+    />
+  </hbox>
+  <description
+    class="citation-map-pref-help"
+    data-l10n-id="pref-openalex-api-key-help"
+  />
   <checkbox
     id="zotero-prefpane-citationmap-automatic-updates"
     preference="automaticUpdates"
@@ -106,9 +123,10 @@
     />
     <hbox class="citation-map-pref-actions">
       <html:button
+        class="citation-map-danger-button"
         type="button"
         data-l10n-id="pref-clear-cache"
-        onclick="Zotero.CitationMap.api.clearCache()"
+        onclick="Zotero.CitationMap.api.clearAllCachedData()"
       ></html:button>
     </hbox>
   </groupbox>

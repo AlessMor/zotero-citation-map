@@ -1,4 +1,5 @@
 pref("extensions.zotero.citationmap.provider", "auto");
+pref("extensions.zotero.citationmap.openAlexAPIKey", "");
 pref("extensions.zotero.citationmap.automaticUpdates", true);
 pref("extensions.zotero.citationmap.updateNewItems", true);
 pref("extensions.zotero.citationmap.cacheDays", 30);

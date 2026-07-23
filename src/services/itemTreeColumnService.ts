@@ -1,11 +1,17 @@
 import { config } from "../../package.json";
-import type { CitationGraphNode } from "../domain/graphTypes";
 import {
   formatMetricValue,
   METRIC_DEFINITIONS,
+  SUPPLEMENTARY_PROPERTY_DEFINITIONS,
   type MetricDefinition,
+  type SupplementaryPropertyDefinition,
 } from "./metricRegistry";
 import { createMetricNodeForItem } from "./itemMetricContext";
+import {
+  installDataSourceHoverTooltips,
+  nodeFieldDataSourceTooltip,
+  uninstallDataSourceHoverTooltips,
+} from "./dataSourceTooltipService";
 
 const registeredDataKeys: string[] = [];
 const descriptions = new Map<string, string>();
@@ -18,44 +24,7 @@ interface EncodedCell {
   className?: string;
 }
 
-interface SupplementaryColumn {
-  dataKey: string;
-  label: string;
-  description: string;
-  width: number;
-  value: (node: CitationGraphNode) => string | number | boolean | null;
-  format: (value: string | number | boolean) => string;
-}
-
-const SUPPLEMENTARY_COLUMNS: SupplementaryColumn[] = [
-  {
-    dataKey: "openAccessStatus",
-    label: "Open Access",
-    description:
-      "Whether the active scholarly-data provider reports that this work is openly accessible.",
-    width: 104,
-    value: (node) => node.isOpenAccess,
-    format: (value) => (value ? "Yes" : "No"),
-  },
-  {
-    dataKey: "retractionStatus",
-    label: "Retracted",
-    description:
-      "Whether a trusted provider reports that this work has been retracted. Verify critical cases with the publisher.",
-    width: 92,
-    value: (node) => node.isRetracted,
-    format: (value) => (value ? "Yes" : "No"),
-  },
-  {
-    dataKey: "citationProvider",
-    label: "Citation provider",
-    description:
-      "The provider supplying the canonical work identity and citation relationships for this item.",
-    width: 126,
-    value: (node) => node.provider,
-    format: String,
-  },
-];
+type SupplementaryColumn = SupplementaryPropertyDefinition;
 
 function escapeAttribute(value: string): string {
   return value
@@ -123,15 +92,14 @@ function renderCell(
 
 function metricData(spec: MetricDefinition, item: Zotero.Item): string {
   if (!item?.isRegularItem?.()) return "";
-  const raw = spec.value(createMetricNodeForItem(item));
+  const node = createMetricNodeForItem(item);
+  const raw = spec.value(node);
   if (typeof raw !== "number" || !Number.isFinite(raw)) return "";
   const display = formatMetricValue(spec.id, raw);
   return encodeCell(
     floatSortKey(raw),
     display,
-    [spec.description, spec.interpretation, `Value: ${display}`]
-      .filter(Boolean)
-      .join("\n"),
+    nodeFieldDataSourceTooltip(node, spec.id, item),
   );
 }
 
@@ -140,7 +108,8 @@ function supplementaryData(
   item: Zotero.Item,
 ): string {
   if (!item?.isRegularItem?.()) return "";
-  const value = spec.value(createMetricNodeForItem(item));
+  const node = createMetricNodeForItem(item);
+  const value = spec.value(node);
   if (value === null || value === undefined || value === "") return "";
   const display = spec.format(value);
   const sortKey =
@@ -152,8 +121,8 @@ function supplementaryData(
   return encodeCell(
     sortKey,
     display,
-    `${spec.description}\nValue: ${display}`,
-    spec.dataKey === "retractionStatus" && value === true
+    nodeFieldDataSourceTooltip(node, spec.id, item),
+    spec.id === "retractionStatus" && value === true
       ? "citation-map-column-warning"
       : undefined,
   );
@@ -172,7 +141,6 @@ async function registerColumn(options: {
     label: options.label,
     htmlLabel: columnLabel(options.label, options.description),
     pluginID: config.addonID,
-    // Zotero 9 replacement for deprecated defaultIn/disableIn properties.
     enabledTreeIDs: ["main"],
     width: String(options.width),
     minWidth: Math.min(options.width, 64),
@@ -212,6 +180,7 @@ export function installCitationColumnTooltips(
     }
   };
   win.document.addEventListener("mouseover", handler, true);
+  installDataSourceHoverTooltips(win.document);
   tooltipHandlers.set(win, handler);
 }
 
@@ -221,6 +190,7 @@ export function uninstallCitationColumnTooltips(
   const handler = tooltipHandlers.get(win);
   if (!handler) return;
   win.document.removeEventListener("mouseover", handler, true);
+  uninstallDataSourceHoverTooltips(win.document);
   tooltipHandlers.delete(win);
 }
 
@@ -237,10 +207,14 @@ export async function registerCitationColumns(): Promise<void> {
       dataProvider: (item) => metricData(spec, item),
     });
   }
-  for (const spec of SUPPLEMENTARY_COLUMNS) {
+  for (const spec of SUPPLEMENTARY_PROPERTY_DEFINITIONS) {
+    if (!spec.column) continue;
     await registerColumn({
-      ...spec,
-      primary: false,
+      dataKey: spec.id,
+      label: spec.label,
+      description: spec.description,
+      width: spec.column.width,
+      primary: spec.column.primary,
       dataProvider: (item) => supplementaryData(spec, item),
     });
   }
@@ -258,6 +232,7 @@ export function refreshCitationColumns(): void {
 export function unregisterCitationColumns(): void {
   for (const [win, handler] of tooltipHandlers) {
     win.document.removeEventListener("mouseover", handler, true);
+    uninstallDataSourceHoverTooltips(win.document);
   }
   tooltipHandlers.clear();
   descriptions.clear();

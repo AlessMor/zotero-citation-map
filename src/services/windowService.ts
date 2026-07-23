@@ -1,16 +1,25 @@
+import { config } from "../../package.json";
 import type { LibrarySnapshot } from "../domain/types";
 import {
   destroyCitationMapView,
   renderCitationMapView,
 } from "./graphViewService";
 import { loadWholeLibrary } from "./zoteroLibraryService";
+import {
+  installDataSourceHoverTooltips,
+  uninstallDataSourceHoverTooltips,
+} from "./dataSourceTooltipService";
 
 const TAB_TYPE = "citationmap";
 const TAB_STATE_FILTER_MARKER = "__citationMapStateFilterInstalled";
 const TAB_HOOK_MARKER = "__citationMapTabHooksInstalled";
 const NETWORK_ICON_TYPE = "citation-map-network";
 const CONTEXT_HANDLER_MARKER = "__citationMapContextHandlerInstalled";
+const DETACHED_WINDOW_URL = `chrome://${config.addonRef}/content/citationMapWindow.xhtml`;
 let pendingSelectionItemID: number | null = null;
+let detachedWindow: Window | null = null;
+let detachedMount: HTMLElement | null = null;
+let detachedHostWindow: _ZoteroTypes.MainWindow | null = null;
 
 function defaultMainWindow(): _ZoteroTypes.MainWindow {
   const win = Zotero.getMainWindows().find(
@@ -24,6 +33,108 @@ function tabs(win: _ZoteroTypes.MainWindow): any {
   const value = (win as any).Zotero_Tabs;
   if (!value) throw new Error("Zotero tabs are unavailable.");
   return value;
+}
+
+function liveHostWindow(
+  preferred?: _ZoteroTypes.MainWindow | null,
+): _ZoteroTypes.MainWindow {
+  if (preferred && !(preferred as any).closed) return preferred;
+  return defaultMainWindow();
+}
+
+function reportAsyncError(context: string, error: unknown): void {
+  const detail =
+    error instanceof Error
+      ? `${error.name}: ${error.message}`
+      : error === undefined
+        ? "Promise rejected with undefined."
+        : String(error);
+  const wrapped = new Error(`${context}: ${detail}`);
+  if (error instanceof Error && error.stack) {
+    wrapped.stack = `${wrapped.stack}\nCaused by: ${error.stack}`;
+  }
+  Zotero.logError(wrapped);
+}
+
+async function waitForWindowLoad(win: Window): Promise<void> {
+  if (win.document.readyState === "complete") return;
+  await new Promise<void>((resolve) => {
+    win.addEventListener("load", () => resolve(), { once: true });
+  });
+}
+
+async function selectPaper(
+  win: _ZoteroTypes.MainWindow,
+  itemID: number,
+): Promise<void> {
+  const host = liveHostWindow(win);
+  tabs(host).select("zotero-pane");
+  await host.ZoteroPane.selectItem(itemID);
+  host.focus();
+}
+
+function renderDetachedWindow(
+  snapshot: LibrarySnapshot,
+  initialItemID: number | null = null,
+): void {
+  if (!detachedWindow || detachedWindow.closed || !detachedMount) return;
+  const host = liveHostWindow(detachedHostWindow);
+  renderCitationMapView(detachedWindow.document, detachedMount, snapshot, {
+    mode: "window",
+    onSelectPaper: (itemID) => {
+      void selectPaper(host, itemID).catch((error) =>
+        reportAsyncError("Citation Map: paper selection failed", error),
+      );
+    },
+    initialItemID,
+  });
+}
+
+async function openDetachedCitationMapWindow(
+  hostWindow: _ZoteroTypes.MainWindow,
+  snapshot: LibrarySnapshot,
+  initialItemID: number | null = null,
+): Promise<void> {
+  detachedHostWindow = hostWindow;
+  if (detachedWindow && !detachedWindow.closed && detachedMount) {
+    renderDetachedWindow(snapshot, initialItemID);
+    detachedWindow.focus();
+    return;
+  }
+
+  const popup = (hostWindow as any).openDialog?.(
+    DETACHED_WINDOW_URL,
+    "citation-map-window",
+    "chrome,dialog=no,resizable,centerscreen,width=1200,height=820",
+  ) as Window | null;
+  if (!popup) throw new Error("Unable to open the Citation Map window.");
+
+  await waitForWindowLoad(popup);
+  const mount = popup.document.getElementById(
+    "citation-map-window-root",
+  ) as HTMLElement | null;
+  if (!mount) {
+    popup.close();
+    throw new Error("Citation Map window mount point is unavailable.");
+  }
+
+  detachedWindow = popup;
+  detachedMount = mount;
+  installDataSourceHoverTooltips(popup.document);
+  popup.addEventListener(
+    "unload",
+    () => {
+      if (detachedWindow !== popup) return;
+      destroyCitationMapView(mount);
+      uninstallDataSourceHoverTooltips(popup.document);
+      detachedWindow = null;
+      detachedMount = null;
+      detachedHostWindow = null;
+    },
+    { once: true },
+  );
+  renderDetachedWindow(snapshot, initialItemID);
+  popup.focus();
 }
 
 /**
@@ -49,24 +160,32 @@ export function installCitationMapTabHooks(win: _ZoteroTypes.MainWindow): void {
   manager.tabHooks.getTitle ??= {};
   manager.tabHooks.focusFirst ??= {};
   manager.tabHooks.refocus ??= {};
+  manager.tabHooks.moveToNewWindow ??= {};
   manager.tabHooks.restoreState[TAB_TYPE] = async () => ({ itemID: null });
   manager.tabHooks.getTitle[TAB_TYPE] = async () => "Citation Map";
-  const focus = async (tab: any): Promise<void> => {
+  const focus = (tab: any): void => {
     const container = manager.getTabContent(tab.id);
     (container?.querySelector(".cm-search") as HTMLElement | null)?.focus();
   };
   manager.tabHooks.focusFirst[TAB_TYPE] = focus;
   manager.tabHooks.refocus[TAB_TYPE] = focus;
+  manager.tabHooks.moveToNewWindow[TAB_TYPE] = async (tab: any) => {
+    try {
+      const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
+      await openDetachedCitationMapWindow(
+        win,
+        snapshot,
+        Number(tab?.data?.itemID) || null,
+      );
+      manager.close(tab.id);
+    } catch (error) {
+      reportAsyncError(
+        "Citation Map: moving the tab to a new window failed",
+        error,
+      );
+    }
+  };
   manager[TAB_HOOK_MARKER] = true;
-}
-
-async function selectPaper(
-  win: _ZoteroTypes.MainWindow,
-  itemID: number,
-): Promise<void> {
-  tabs(win).select("zotero-pane");
-  await win.ZoteroPane.selectItem(itemID);
-  win.focus();
 }
 
 function hideGlobalContextPane(
@@ -125,6 +244,7 @@ function renderTab(
   snapshot: LibrarySnapshot,
 ): void {
   prepareContainer(win, container);
+  installDataSourceHoverTooltips(win.document);
   let attempts = 10;
   const render = (): void => {
     if (win.closed) return;
@@ -137,7 +257,11 @@ function renderTab(
     pendingSelectionItemID = null;
     renderCitationMapView(win.document, container, snapshot, {
       mode: "tab",
-      onSelectPaper: (itemID) => selectPaper(win, itemID),
+      onSelectPaper: (itemID) => {
+        void selectPaper(win, itemID).catch((error) =>
+          reportAsyncError("Citation Map: paper selection failed", error),
+        );
+      },
       initialItemID,
     });
   };
@@ -168,6 +292,12 @@ export async function openCitationMapWindow(
   const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
   if (!snapshot.papers.length) {
     throw new Error("Citation Map requires at least one regular Zotero item.");
+  }
+  if (detachedWindow && !detachedWindow.closed) {
+    const initialItemID = pendingSelectionItemID;
+    pendingSelectionItemID = null;
+    await openDetachedCitationMapWindow(win, snapshot, initialItemID);
+    return;
   }
   const manager = tabs(win);
   const existing = existingGraphTab(manager);
@@ -203,9 +333,13 @@ export async function openCitationMapAndSelectItem(
 }
 
 export async function refreshOpenCitationMapViews(): Promise<void> {
+  const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
+  if (detachedWindow && !detachedWindow.closed && detachedMount) {
+    renderDetachedWindow(snapshot);
+  }
+
   const tabID = addon.data.graphTabID;
   if (!tabID) return;
-  const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
   for (const win of Zotero.getMainWindows()) {
     try {
       const manager = tabs(win);
@@ -219,6 +353,14 @@ export async function refreshOpenCitationMapViews(): Promise<void> {
 }
 
 export function closeCitationMapWindow(closeTab = true): void {
+  if (detachedWindow && !detachedWindow.closed) {
+    if (detachedMount) destroyCitationMapView(detachedMount);
+    detachedWindow.close();
+  }
+  detachedWindow = null;
+  detachedMount = null;
+  detachedHostWindow = null;
+
   const tabID = addon.data.graphTabID;
   if (!tabID) return;
   if (!closeTab) {

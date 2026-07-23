@@ -7,3 +7,4 @@ dist/
 *.tsbuildinfo
 FILE_MANIFEST.sha256
 .DS_Store
+TODO.md

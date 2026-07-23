@@ -10,16 +10,19 @@ import {
   normalizeDOI,
   normalizeExactTitle,
 } from "../services/citationIdentifiers";
-import { requestJSON } from "./http";
+import { getOpenAlexAPIKey } from "../services/citationPreferences";
+import { requestJSON, type HTTPResult } from "./http";
 import type { CitationProvider } from "./types";
 import { failureStatusFromHTTP, numberOrNull, stringOrNull } from "./types";
 
+const OPENALEX_BASE_URL = "https://api.openalex.org";
+const OPENALEX_MAX_PER_PAGE = 100;
 const BACKGROUND_REFERENCE_LIMIT = 200;
 const ON_DEMAND_REFERENCE_LIMIT = 25;
 const sourceMetricsCache = new Map<string, SourceMetrics | null>();
 
 interface OpenAlexAuthor {
-  author?: { display_name?: string };
+  author?: { id?: string; display_name?: string; orcid?: string | null };
 }
 interface OpenAlexSource {
   id?: string;
@@ -39,6 +42,8 @@ interface OpenAlexWork {
   cited_by_count?: number;
   referenced_works_count?: number;
   referenced_works?: string[];
+  related_works?: string[];
+  relevance_score?: number;
   authorships?: OpenAlexAuthor[];
   counts_by_year?: Array<{ year?: number; cited_by_count?: number }>;
   fwci?: number | null;
@@ -61,6 +66,43 @@ function shortID(value: unknown): string | null {
   const text = String(value ?? "").trim();
   if (!text) return null;
   return text.replace(/^https:\/\/openalex\.org\//i, "");
+}
+
+function openAlexURL(
+  path: string,
+  parameters: Record<string, string | number> = {},
+): string {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const url = new URL(`${OPENALEX_BASE_URL}${normalizedPath}`);
+  for (const [name, value] of Object.entries(parameters)) {
+    url.searchParams.set(name, String(value));
+  }
+  const apiKey = getOpenAlexAPIKey();
+  if (apiKey) url.searchParams.set("api_key", apiKey);
+  return url.toString();
+}
+
+async function requestOpenAlex<T>(
+  path: string,
+  parameters: Record<string, string | number> = {},
+): Promise<HTTPResult<T>> {
+  if (!getOpenAlexAPIKey()) {
+    return {
+      ok: false,
+      status: 401,
+      data: null,
+      message:
+        "OpenAlex API key is not configured. Add it in Settings → Citation Map.",
+    };
+  }
+  return requestJSON<T>("openalex", openAlexURL(path, parameters));
+}
+
+function failureMessage<T>(response: HTTPResult<T>, fallback: string): string {
+  if (response.status === 401 || response.status === 403) {
+    return response.message || "OpenAlex rejected the configured API key.";
+  }
+  return response.message || fallback;
 }
 
 function abstractFromIndex(
@@ -88,6 +130,16 @@ function toRelated(work: OpenAlexWork): RelatedWorkMetadata | null {
     authors: (work.authorships ?? [])
       .map((entry) => String(entry.author?.display_name ?? "").trim())
       .filter(Boolean),
+    authorIDs: [
+      ...(work.authorships ?? []).map((entry) =>
+        String(entry.author?.orcid ?? "").trim(),
+      ),
+      ...(work.authorships ?? []).map((entry) =>
+        String(entry.author?.id ?? "")
+          .replace(/^https:\/\/openalex\.org\//i, "")
+          .trim(),
+      ),
+    ].filter(Boolean),
     sourceTitle: stringOrNull(work.primary_location?.source?.display_name),
     abstract: abstractFromIndex(work.abstract_inverted_index),
     citationCount: numberOrNull(work.cited_by_count),
@@ -103,11 +155,49 @@ function toRelated(work: OpenAlexWork): RelatedWorkMetadata | null {
 }
 
 async function fetchWorkByID(id: string): Promise<OpenAlexWork | null> {
-  const response = await requestJSON<OpenAlexWork>(
-    "openalex",
-    `https://api.openalex.org/works/${encodeURIComponent(id)}`,
+  const normalizedID = shortID(id);
+  if (!normalizedID) return null;
+  const response = await requestOpenAlex<OpenAlexWork>(
+    `/works/${encodeURIComponent(normalizedID)}`,
   );
   return response.ok && response.data ? response.data : null;
+}
+
+/**
+ * Resolve OpenAlex work IDs into display-ready metadata. OpenAlex relationship
+ * payloads often contain only dehydrated work IDs, so callers must hydrate
+ * those IDs before presenting them as papers.
+ */
+export async function fetchOpenAlexWorksBatch(
+  identifiers: string[],
+): Promise<Array<RelatedWorkMetadata | null>> {
+  if (!identifiers.length) return [];
+
+  const normalized = identifiers.map(shortID);
+  const unique = [
+    ...new Set(normalized.filter((id): id is string => Boolean(id))),
+  ];
+  const resolved = new Map<string, RelatedWorkMetadata>();
+
+  for (let start = 0; start < unique.length; start += OPENALEX_MAX_PER_PAGE) {
+    const batch = unique.slice(start, start + OPENALEX_MAX_PER_PAGE);
+    const response = await requestOpenAlex<OpenAlexList>("/works", {
+      filter: `ids.openalex:${batch.join("|")}`,
+      per_page: batch.length,
+    });
+    if (!response.ok || !response.data) {
+      throw new Error(
+        failureMessage(response, "OpenAlex batch metadata lookup failed."),
+      );
+    }
+    for (const work of response.data.results ?? []) {
+      const id = shortID(work.id);
+      const metadata = toRelated(work);
+      if (id && metadata) resolved.set(id, metadata);
+    }
+  }
+
+  return normalized.map((id) => (id ? (resolved.get(id) ?? null) : null));
 }
 
 function resolveReferences(work: OpenAlexWork): RelatedWorkMetadata[] {
@@ -152,9 +242,8 @@ async function sourceMetrics(
   if (sourceMetricsCache.has(id)) return sourceMetricsCache.get(id) ?? null;
   let resolved = source ?? null;
   if (!resolved?.summary_stats) {
-    const response = await requestJSON<OpenAlexSource>(
-      "openalex",
-      `https://api.openalex.org/sources/${encodeURIComponent(id)}`,
+    const response = await requestOpenAlex<OpenAlexSource>(
+      `/sources/${encodeURIComponent(id)}`,
     );
     resolved = response.ok ? response.data : resolved;
   }
@@ -240,12 +329,15 @@ async function success(
 
 function workURL(
   identifiers: WorkIdentifiers,
-): { id: string; kind: "doi" | "pmid" | "arxiv" | "isbn" } | null {
+): { id: string; kind: "doi" | "pmid" | "arxiv" } | null {
   if (identifiers.doi) return { id: `doi:${identifiers.doi}`, kind: "doi" };
   if (identifiers.pmid) return { id: `pmid:${identifiers.pmid}`, kind: "pmid" };
-  if (identifiers.arxiv)
-    return { id: `arxiv:${identifiers.arxiv}`, kind: "arxiv" };
-  if (identifiers.isbn) return { id: `isbn:${identifiers.isbn}`, kind: "isbn" };
+  if (identifiers.arxiv) {
+    return {
+      id: `doi:10.48550/arxiv.${identifiers.arxiv}`,
+      kind: "arxiv",
+    };
+  }
   return null;
 }
 
@@ -254,15 +346,152 @@ async function listByFilter(
   maximum: number,
   offset = 0,
 ): Promise<RelatedWorkMetadata[]> {
-  const page = Math.floor(offset / Math.max(1, maximum)) + 1;
-  const response = await requestJSON<OpenAlexList>(
-    "openalex",
-    `https://api.openalex.org/works?filter=${encodeURIComponent(filter)}&per-page=${Math.min(200, maximum)}&page=${page}`,
+  const requested = Math.max(0, Math.floor(maximum));
+  let currentOffset = Math.max(0, Math.floor(offset));
+  const works: RelatedWorkMetadata[] = [];
+
+  while (works.length < requested) {
+    const page = Math.floor(currentOffset / OPENALEX_MAX_PER_PAGE) + 1;
+    const withinPage = currentOffset % OPENALEX_MAX_PER_PAGE;
+    const response = await requestOpenAlex<OpenAlexList>("/works", {
+      filter,
+      per_page: OPENALEX_MAX_PER_PAGE,
+      page,
+    });
+    if (!response.ok || !response.data) break;
+
+    const pageResults = response.data.results ?? [];
+    const raw = pageResults.slice(
+      withinPage,
+      withinPage + (requested - works.length),
+    );
+    works.push(
+      ...raw
+        .map(toRelated)
+        .filter((work): work is RelatedWorkMetadata => Boolean(work)),
+    );
+    currentOffset += raw.length;
+
+    if (!raw.length || pageResults.length < OPENALEX_MAX_PER_PAGE) break;
+  }
+
+  return works.slice(0, requested);
+}
+
+function titleTokens(value: string | null | undefined): Set<string> {
+  return new Set(
+    normalizeExactTitle(value)
+      .split(/\s+/)
+      .map((token) => token.trim())
+      .filter((token) => token.length > 1),
   );
-  if (!response.ok || !response.data) return [];
-  return (response.data.results ?? [])
-    .map(toRelated)
-    .filter((work): work is RelatedWorkMetadata => Boolean(work));
+}
+
+function titleSimilarity(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): number {
+  const leftNormalized = normalizeExactTitle(left);
+  const rightNormalized = normalizeExactTitle(right);
+  if (!leftNormalized || !rightNormalized) return 0;
+  if (leftNormalized === rightNormalized) return 1;
+  const leftTokens = titleTokens(left);
+  const rightTokens = titleTokens(right);
+  if (!leftTokens.size || !rightTokens.size) return 0;
+  let overlap = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) overlap += 1;
+  }
+  return (2 * overlap) / (leftTokens.size + rightTokens.size);
+}
+
+async function resolveOpenAlexWork(
+  identifiers: WorkIdentifiers,
+): Promise<OpenAlexWork | null> {
+  const direct = workURL(identifiers);
+  if (direct) {
+    const response = await requestOpenAlex<OpenAlexWork>(
+      `/works/${encodeURIComponent(direct.id)}`,
+    );
+    if (response.ok && response.data) return response.data;
+  }
+
+  const title = String(identifiers.title ?? "").trim();
+  if (!title) return null;
+  const response = await requestOpenAlex<OpenAlexList>("/works", {
+    search: title,
+    per_page: 20,
+  });
+  if (!response.ok || !response.data) return null;
+  const candidates = response.data.results ?? [];
+  const exact = candidates.filter(
+    (work) =>
+      normalizeExactTitle(work.display_name ?? work.title) ===
+      identifiers.normalizedTitle,
+  );
+  const compatible = exact.filter((work) =>
+    metadataIsNonContradictory(identifiers, {
+      year: numberOrNull(work.publication_year),
+      authors: (work.authorships ?? []).map((entry) =>
+        String(entry.author?.display_name ?? ""),
+      ),
+    }),
+  );
+  if (compatible.length === 1) return compatible[0];
+
+  const closest = [...candidates].sort(
+    (left, right) =>
+      titleSimilarity(title, right.display_name ?? right.title) -
+        titleSimilarity(title, left.display_name ?? left.title) ||
+      Number(right.relevance_score ?? 0) - Number(left.relevance_score ?? 0),
+  )[0];
+  if (!closest) return null;
+  const similarity = titleSimilarity(
+    title,
+    closest.display_name ?? closest.title,
+  );
+  if (similarity < 0.72) return null;
+  if (
+    (identifiers.year !== null || identifiers.authors.length > 0) &&
+    !metadataIsNonContradictory(identifiers, {
+      year: numberOrNull(closest.publication_year),
+      authors: (closest.authorships ?? []).map((entry) =>
+        String(entry.author?.display_name ?? ""),
+      ),
+    })
+  ) {
+    return null;
+  }
+  return closest;
+}
+
+/** Return OpenAlex's algorithmically computed related works. OpenAlex is used
+ * only when the centralized provider policy permits it and an API key exists. */
+export async function fetchOpenAlexRelatedWorks(
+  seeds: WorkIdentifiers[],
+  maximum = 100,
+): Promise<RelatedWorkMetadata[]> {
+  const relatedIDs: string[] = [];
+  for (const seed of seeds.slice(0, 25)) {
+    const work = await resolveOpenAlexWork(seed);
+    for (const value of work?.related_works ?? []) {
+      const id = shortID(value);
+      if (id && !relatedIDs.includes(id)) relatedIDs.push(id);
+      if (relatedIDs.length >= maximum * 2) break;
+    }
+    if (relatedIDs.length >= maximum * 2) break;
+  }
+  if (!relatedIDs.length) return [];
+  const metadata = await fetchOpenAlexWorksBatch(
+    relatedIDs.slice(0, Math.max(1, maximum)),
+  );
+  return metadata.filter((work): work is RelatedWorkMetadata =>
+    Boolean(work?.title),
+  );
+}
+
+export function clearOpenAlexProviderCache(): void {
+  sourceMetricsCache.clear();
 }
 
 export const openAlexProvider: CitationProvider = {
@@ -273,7 +502,7 @@ export const openAlexProvider: CitationProvider = {
       doi: true,
       pmid: true,
       arxiv: true,
-      isbn: true,
+      isbn: false,
       titleSearch: true,
     },
     citationCount: true,
@@ -292,17 +521,16 @@ export const openAlexProvider: CitationProvider = {
       return {
         status: "no-identifier",
         provider: "openalex",
-        message: "OpenAlex needs a supported identifier.",
+        message: "OpenAlex needs a DOI, PMID, or arXiv identifier.",
       };
-    const response = await requestJSON<OpenAlexWork>(
-      "openalex",
-      `https://api.openalex.org/works/${encodeURIComponent(target.id)}`,
+    const response = await requestOpenAlex<OpenAlexWork>(
+      `/works/${encodeURIComponent(target.id)}`,
     );
     if (!response.ok || !response.data) {
       return {
         status: failureStatusFromHTTP(response.status),
         provider: "openalex",
-        message: response.message || "OpenAlex did not return a work.",
+        message: failureMessage(response, "OpenAlex did not return a work."),
       };
     }
     return success(
@@ -312,15 +540,15 @@ export const openAlexProvider: CitationProvider = {
     );
   },
   searchExactTitle: async (identifiers) => {
-    const response = await requestJSON<OpenAlexList>(
-      "openalex",
-      `https://api.openalex.org/works?search=${encodeURIComponent(identifiers.title)}&per-page=20`,
-    );
+    const response = await requestOpenAlex<OpenAlexList>("/works", {
+      search: identifiers.title,
+      per_page: 20,
+    });
     if (!response.ok || !response.data)
       return {
         status: failureStatusFromHTTP(response.status),
         provider: "openalex",
-        message: response.message || "OpenAlex title search failed.",
+        message: failureMessage(response, "OpenAlex title search failed."),
       };
     const exact = (response.data.results ?? []).filter(
       (work) =>
@@ -353,8 +581,10 @@ export const openAlexProvider: CitationProvider = {
           message: "OpenAlex did not return a unique exact-title match.",
         };
   },
-  fetchCitingWorks: (id, maximum, offset) =>
-    listByFilter(`cites:${shortID(id)}`, maximum, offset),
+  fetchCitingWorks: async (id, maximum, offset) => {
+    const workID = shortID(id);
+    return workID ? listByFilter(`cites:${workID}`, maximum, offset) : [];
+  },
   fetchReferencedWorks: async (id, maximum, offset = 0) => {
     const work = await fetchWorkByID(id);
     if (!work) return [];

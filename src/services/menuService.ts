@@ -56,8 +56,9 @@ export function registerMenus(): void {
             icon: ICON,
             onCommand: () =>
               void updateWholeLibraryCitationData({
-                force: false,
+                force: true,
                 silent: false,
+                includeRelationships: false,
               }).catch(report),
           },
         ],
@@ -84,6 +85,7 @@ export function registerMenus(): void {
             void updateCitationDataForItems(items, {
               force: true,
               silent: false,
+              includeRelationships: false,
             }).catch(report);
           }
         },

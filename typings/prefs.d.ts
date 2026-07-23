@@ -8,6 +8,7 @@ declare namespace _ZoteroTypes {
   interface Prefs {
     PluginPrefsMap: {
       "provider": string;
+      "openAlexAPIKey": string;
       "automaticUpdates": boolean;
       "updateNewItems": boolean;
       "cacheDays": number;

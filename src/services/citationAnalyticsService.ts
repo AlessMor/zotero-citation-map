@@ -26,6 +26,8 @@ interface CacheEntry {
   values: Map<string, CitationDerivedAnalytics>;
 }
 const cache = new Map<number, CacheEntry>();
+const MIN_USABLE_REFERENCES = 5;
+const MIN_REFERENCE_COVERAGE = 0.25;
 
 function ratio(numerator: number, denominator: number | null): number | null {
   if (denominator === null || denominator < 0) return null;
@@ -33,17 +35,24 @@ function ratio(numerator: number, denominator: number | null): number | null {
   return numerator / denominator;
 }
 
+function sufficientCoverage(record: CitationMetricRecord): boolean {
+  const coverage = ratio(record.resolvedReferenceCount, record.referenceCount);
+  return coverage !== null && coverage >= MIN_REFERENCE_COVERAGE;
+}
+
 function referenceAgeStats(record: CitationMetricRecord): {
   mean: number | null;
   spread: number | null;
 } {
-  if (record.year === null) return { mean: null, spread: null };
+  if (record.year === null || !sufficientCoverage(record)) {
+    return { mean: null, spread: null };
+  }
   const ages = record.references
     .map((reference) =>
       reference.year === null ? null : record.year! - reference.year,
     )
     .filter((age): age is number => age !== null && Number.isFinite(age));
-  if (!ages.length) return { mean: null, spread: null };
+  if (ages.length < MIN_USABLE_REFERENCES) return { mean: null, spread: null };
   const mean = ages.reduce((sum, age) => sum + age, 0) / ages.length;
   const variance =
     ages.reduce((sum, age) => sum + (age - mean) ** 2, 0) / ages.length;
@@ -67,29 +76,45 @@ function surnameKeys(authors: string[]): Set<string> {
   );
 }
 
+function normalizedAuthorIDs(values: string[] | undefined): Set<string> {
+  return new Set(
+    (values ?? [])
+      .map((value) =>
+        value
+          .trim()
+          .toLocaleLowerCase()
+          .replace(/^https?:\/\/(?:orcid\.org|openalex\.org)\//, ""),
+      )
+      .filter(Boolean),
+  );
+}
+
 export function calculateSelfCitationEstimate(
   record: CitationMetricRecord,
 ): number | null {
-  const source = surnameKeys(record.authors);
-  if (!source.size) return null;
+  if (!sufficientCoverage(record)) return null;
+  const sourceNames = surnameKeys(record.authors);
+  const sourceIDs = new Set<string>();
   let comparable = 0;
   let shared = 0;
   for (const reference of record.references) {
-    const target = surnameKeys(reference.authors);
-    if (!target.size) continue;
+    const targetNames = surnameKeys(reference.authors);
+    const targetIDs = normalizedAuthorIDs(reference.authorIDs);
+    if (!targetNames.size && !targetIDs.size) continue;
     comparable += 1;
-    if ([...target].some((author) => source.has(author))) shared += 1;
+    const idMatch = [...targetIDs].some((id) => sourceIDs.has(id));
+    const surnameMatch = [...targetNames].some((author) =>
+      sourceNames.has(author),
+    );
+    if (idMatch || surnameMatch) shared += 1;
   }
-  return comparable ? shared / comparable : null;
+  return comparable >= MIN_USABLE_REFERENCES ? shared / comparable : null;
 }
 
 export function calculateFutureReferenceCount(
-  record: CitationMetricRecord,
+  _record: CitationMetricRecord,
 ): number | null {
-  if (record.year === null) return null;
-  return record.references.filter(
-    (reference) => reference.year !== null && reference.year > record.year!,
-  ).length;
+  return null;
 }
 
 function build(libraryID: number): Map<string, CitationDerivedAnalytics> {
@@ -126,7 +151,7 @@ function build(libraryID: number): Map<string, CitationDerivedAnalytics> {
       referenceAgeMean: age.mean,
       referenceAgeSpread: age.spread,
       selfCitationEstimate: calculateSelfCitationEstimate(record),
-      futureReferenceCount: calculateFutureReferenceCount(record),
+      futureReferenceCount: null,
     });
   }
   return result;

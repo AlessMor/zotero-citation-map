@@ -5,10 +5,10 @@ open-command =
     .label = Open Citation Map
 
 update-library-command =
-    .label = Refresh stale citation data for whole library
+    .label = Update fields for whole library
 
 update-items-command =
-    .label = Update citation and reference counts
+    .label = Update fields
 
 automatic-updates-command =
     .label = { $marker }Automatic citation updates

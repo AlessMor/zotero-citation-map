@@ -16,6 +16,9 @@
 .citation-map-pref-row html|input[type="number"] {
   width: 90px;
 }
+.citation-map-pref-row html|input[type="password"] {
+  width: min(360px, 55vw);
+}
 .citation-map-pref-help {
   max-width: 640px;
   margin: 4px 0 9px 26px;
@@ -29,6 +32,28 @@
 .citation-map-pref-actions html|button {
   min-height: 30px;
   padding: 4px 12px;
+}
+.citation-map-pref-actions html|button.citation-map-danger-button {
+  display: inline-flex;
+  gap: 7px;
+  align-items: center;
+  border-color: #b42318;
+  background: #b42318;
+  color: #fff;
+  font-weight: 600;
+}
+.citation-map-pref-actions html|button.citation-map-danger-button:hover {
+  border-color: #912018;
+  background: #912018;
+}
+.citation-map-pref-actions html|button.citation-map-danger-button::before {
+  content: "";
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  background: url("chrome://citationmap/content/icons/trash.svg") center / 16px
+    16px no-repeat;
 }
 .citation-map-advanced {
   margin-top: 6px;

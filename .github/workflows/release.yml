@@ -16,8 +16,6 @@ jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Check out repository and tags
@@ -49,4 +47,6 @@ jobs:
         run: npm run check
 
       - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run release

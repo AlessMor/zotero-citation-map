@@ -17,6 +17,8 @@ export type FluentMessageId =
   | 'pref-debug'
   | 'pref-local-relations'
   | 'pref-note-extraction'
+  | 'pref-openalex-api-key'
+  | 'pref-openalex-api-key-help'
   | 'pref-pdf-extraction'
   | 'pref-provider'
   | 'pref-provider-auto'

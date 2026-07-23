@@ -50,6 +50,8 @@ export interface RelatedWorkMetadata {
   title: string | null;
   year: number | null;
   authors: string[];
+  /** Stable provider author identifiers when available (ORCID/provider IDs). */
+  authorIDs?: string[];
   sourceTitle?: string | null;
   abstract?: string | null;
   citationCount?: number | null;
@@ -58,6 +60,10 @@ export interface RelatedWorkMetadata {
   openAccessStatus?: string | null;
   isRetracted?: boolean | null;
   zoteroItemKey?: string | null;
+  /** Providers that contributed one or more values to this merged record. */
+  dataSources?: CitationProviderID[];
+  /** Most recent provider fetch involved in this merged record. */
+  updatedAt?: string | null;
 }
 
 export interface ProviderLookupSuccess {

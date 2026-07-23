@@ -1,4 +1,6 @@
 import { config } from "../../package.json";
+import { clearOpenAlexProviderCache } from "../providers/openAlexProvider";
+import { resetCitationProviderSessionState } from "../providers/registry";
 import {
   clearCitationMetrics,
   getCitationCacheStatus,
@@ -30,23 +32,36 @@ async function runPreferenceAction(
   }
 }
 
+async function clearAllCachedData(): Promise<void> {
+  await Promise.all([clearCitationMetrics(), clearExternalWorkCache()]);
+  clearOpenAlexProviderCache();
+  resetCitationProviderSessionState();
+  refreshCitationColumns();
+  refreshCitationItemPanes();
+  await refreshOpenCitationMapViews();
+}
+
 function exposePreferenceActions(): void {
   Object.assign(addon.api, {
     refreshAll: (): void => {
-      void runPreferenceAction("refreshing stale items", async () => {
-        await updateWholeLibraryCitationData({
-          force: false,
-          silent: false,
-        });
-      });
+      void runPreferenceAction(
+        "updating fields for the whole library",
+        async () => {
+          await updateWholeLibraryCitationData({
+            force: true,
+            silent: false,
+            includeRelationships: false,
+          });
+        },
+      );
     },
+    clearAllCachedData: (): void => {
+      void runPreferenceAction("clearing all cached data", clearAllCachedData);
+    },
+    // Retain the old API name for compatibility with an already-open
+    // preferences pane during a development reload.
     clearCache: (): void => {
-      void runPreferenceAction("clearing the citation cache", async () => {
-        await Promise.all([clearCitationMetrics(), clearExternalWorkCache()]);
-        refreshCitationColumns();
-        refreshCitationItemPanes();
-        await refreshOpenCitationMapViews();
-      });
+      void runPreferenceAction("clearing all cached data", clearAllCachedData);
     },
     cacheStatus: (): ReturnType<typeof getCitationCacheStatus> =>
       getCitationCacheStatus(),
@@ -74,6 +89,28 @@ export async function registerCitationMapPreferencePane(): Promise<void> {
             },
           );
         }
+      },
+      true,
+    ),
+    Zotero.Prefs.registerObserver(
+      `${config.prefsPrefix}.provider`,
+      () => {
+        resetCitationProviderSessionState();
+        refreshCitationColumns();
+        refreshCitationItemPanes();
+        void refreshOpenCitationMapViews().catch((error: unknown) => {
+          Zotero.logError(
+            preferenceError("refresh after provider change", error),
+          );
+        });
+      },
+      true,
+    ),
+    Zotero.Prefs.registerObserver(
+      `${config.prefsPrefix}.openAlexAPIKey`,
+      () => {
+        clearOpenAlexProviderCache();
+        resetCitationProviderSessionState();
       },
       true,
     ),
