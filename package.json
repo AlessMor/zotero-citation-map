@@ -49,11 +49,11 @@
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",
     "@types/node": "^24.10.0",
-    "@zotero-plugin/eslint-config": "^0.6.7",
+    "@zotero-plugin/eslint-config": "^0.6.10",
     "chai": "^6.2.1",
     "eslint": "^9.39.2",
     "mocha": "^11.7.5",
-    "prettier": "^3.7.4",
+    "prettier": "^3.9.6",
     "typescript": "^5.9.3",
     "zotero-plugin-scaffold": "^0.8.7",
     "zotero-types": "^4.1.0-beta.4"
