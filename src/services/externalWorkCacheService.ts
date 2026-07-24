@@ -95,11 +95,23 @@ function parseRelationshipWorks(
   return parsed as RelatedWorkMetadata[];
 }
 
-function relationshipWorkIdentity(work: RelatedWorkMetadata): string {
+function relationshipIdentity(work: RelatedWorkMetadata): string {
   const localKey = work.zoteroItemKey?.trim();
   if (localKey) return `zotero:${localKey.toLocaleUpperCase()}`;
   const doi = normalizeDOI(work.doi);
   if (doi) return `doi:${doi}`;
+  const pmid = String(work.pmid ?? "")
+    .trim()
+    .toLocaleLowerCase();
+  if (pmid) return `pmid:${pmid}`;
+  const arxiv = String(work.arxiv ?? "")
+    .trim()
+    .toLocaleLowerCase();
+  if (arxiv) return `arxiv:${arxiv}`;
+  const isbn = String(work.isbn ?? "")
+    .replace(/[-\s]/g, "")
+    .toLocaleLowerCase();
+  if (isbn) return `isbn:${isbn}`;
   if (work.providerWorkID?.trim()) {
     return `${work.provider}:${work.providerWorkID.trim().toLocaleLowerCase()}`;
   }
@@ -108,42 +120,12 @@ function relationshipWorkIdentity(work: RelatedWorkMetadata): string {
   return `${work.provider}:unknown:${JSON.stringify([work.authors.slice(0, 2), work.year])}`;
 }
 
-function mergeRelationshipWorks(
-  existing: RelatedWorkMetadata[],
-  incoming: RelatedWorkMetadata[],
+function deduplicateRelationshipWorks(
+  works: RelatedWorkMetadata[],
 ): RelatedWorkMetadata[] {
-  const merged = new Map<string, RelatedWorkMetadata>();
-  for (const work of [...existing, ...incoming]) {
-    const key = relationshipWorkIdentity(work);
-    const previous = merged.get(key);
-    if (!previous) {
-      merged.set(key, { ...work });
-      continue;
-    }
-    merged.set(key, {
-      ...previous,
-      ...work,
-      providerWorkID: work.providerWorkID ?? previous.providerWorkID,
-      doi: work.doi ?? previous.doi,
-      pmid: work.pmid ?? previous.pmid,
-      arxiv: work.arxiv ?? previous.arxiv,
-      isbn: work.isbn ?? previous.isbn,
-      title: work.title?.trim() ? work.title : previous.title,
-      year: work.year ?? previous.year,
-      authors: work.authors.length ? work.authors : previous.authors,
-      sourceTitle: work.sourceTitle?.trim()
-        ? work.sourceTitle
-        : previous.sourceTitle,
-      abstract: work.abstract?.trim() ? work.abstract : previous.abstract,
-      citationCount: work.citationCount ?? previous.citationCount,
-      referenceCount: work.referenceCount ?? previous.referenceCount,
-      isOpenAccess: work.isOpenAccess ?? previous.isOpenAccess,
-      openAccessStatus: work.openAccessStatus ?? previous.openAccessStatus,
-      isRetracted: work.isRetracted ?? previous.isRetracted,
-      zoteroItemKey: work.zoteroItemKey ?? previous.zoteroItemKey,
-    });
-  }
-  return [...merged.values()];
+  const unique = new Map<string, RelatedWorkMetadata>();
+  for (const work of works) unique.set(relationshipIdentity(work), { ...work });
+  return [...unique.values()];
 }
 
 function rowToRelationshipEntry(
@@ -247,21 +229,18 @@ export function getExternalRelationshipCacheEntry(
 ): ExternalRelationshipCacheEntry | null {
   const entry = relationshipMirror.get(relationshipKey);
   return entry
-    ? {
-        ...entry,
-        works: entry.works.map((work) => ({ ...work })),
-      }
+    ? { ...entry, works: entry.works.map((work) => ({ ...work })) }
     : null;
 }
 
+/** Replace one complete relationship snapshot atomically. */
 export async function saveExternalRelationshipCache(
   relationshipKey: string,
   works: RelatedWorkMetadata[],
 ): Promise<void> {
   if (!(await ensureExternalWorkCache())) return;
   const fetchedAt = new Date().toISOString();
-  const existing = relationshipMirror.get(relationshipKey)?.works ?? [];
-  const storedWorks = mergeRelationshipWorks(existing, works);
+  const storedWorks = deduplicateRelationshipWorks(works);
   relationshipMirror.set(relationshipKey, {
     relationshipKey,
     works: storedWorks,
@@ -313,10 +292,7 @@ export async function saveExternalWorkCacheSuccess(
 }
 
 export async function saveExternalWorkCacheSuccesses(
-  entries: Array<{
-    identityKey: string;
-    metadata: RelatedWorkMetadata;
-  }>,
+  entries: Array<{ identityKey: string; metadata: RelatedWorkMetadata }>,
 ): Promise<void> {
   if (entries.length === 0 || !(await ensureExternalWorkCache())) return;
   const fetchedAt = new Date().toISOString();

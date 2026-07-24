@@ -2,12 +2,13 @@ import type {
   CitationGraphModel,
   CitationGraphNode,
 } from "../domain/graphTypes";
-import type { LibrarySnapshot } from "../domain/types";
+import type { LibrarySnapshot, ZoteroPaper } from "../domain/types";
 import { getItemCitationAnalytics } from "./citationAnalyticsService";
 import {
   computeNetworkAnalytics,
   resolveRecordCitationEdges,
   type LocalCitationRelation,
+  type LocalWorkIdentity,
 } from "./citationNetworkAnalytics";
 import {
   getCitationMetricRecord,
@@ -21,6 +22,11 @@ import {
   getPDFExtractionEnabled,
 } from "./citationPreferences";
 import { normalizeDOI } from "./citationIdentifiers";
+import {
+  getStoredRelationshipWorks,
+  mergeRelatedWorkLists,
+  type RelationshipStoreSubject,
+} from "./relationshipStoreService";
 
 const graphCacheByLibrary = new Map<number, CitationGraphModel>();
 
@@ -128,21 +134,66 @@ function getLocalCitationRelations(
   return results;
 }
 
+function relationshipSubjectForPaper(
+  paper: ZoteroPaper,
+): RelationshipStoreSubject {
+  const record = getCitationMetricRecord(paper.libraryID, paper.itemKey);
+  return {
+    itemID: paper.itemID,
+    itemKey: paper.itemKey,
+    doi: record?.doi ?? paper.doi,
+    provider: record?.provider ?? paper.metrics.provider,
+    providerWorkID: record?.providerWorkID ?? null,
+    title: record?.title?.trim() || paper.title,
+    year: record?.year ?? paper.year,
+  };
+}
+
 export function buildCitationGraph(
   snapshot: LibrarySnapshot,
 ): CitationGraphModel {
   const nodeKeys = snapshot.papers.map((paper) => paper.itemKey);
   const records = getCitationMetricRecords(snapshot.libraryID);
+  const recordByItemKey = new Map(
+    records.map((record) => [record.itemKey, record]),
+  );
+  const relationshipSubjects = new Map(
+    snapshot.papers.map((paper) => [
+      paper.itemKey,
+      relationshipSubjectForPaper(paper),
+    ]),
+  );
+  const storedReferencesBySource = new Map(
+    snapshot.papers.map((paper) => {
+      const subject = relationshipSubjects.get(paper.itemKey)!;
+      return [
+        paper.itemKey.toLocaleUpperCase(),
+        getStoredRelationshipWorks(subject, "references"),
+      ] as const;
+    }),
+  );
+  const localWorks: LocalWorkIdentity[] = snapshot.papers.map((paper) => {
+    const record = recordByItemKey.get(paper.itemKey);
+    return {
+      itemKey: paper.itemKey,
+      doi: record?.doi ?? paper.doi,
+      title: record?.title?.trim() || paper.title,
+      year: record?.year ?? paper.year,
+      provider: record?.provider ?? paper.metrics.provider,
+      providerWorkID: record?.providerWorkID ?? null,
+    };
+  });
   const edges = resolveRecordCitationEdges(
     records,
     nodeKeys,
     getManualRelations(snapshot.libraryID),
     getIgnoredRelations(snapshot.libraryID),
     getLocalCitationRelations(snapshot),
+    { localWorks, storedReferencesBySource },
   );
   const network = computeNetworkAnalytics(nodeKeys, edges);
   const nodes: CitationGraphNode[] = snapshot.papers.map((paper) => {
-    const record = getCitationMetricRecord(snapshot.libraryID, paper.itemKey);
+    const record = recordByItemKey.get(paper.itemKey);
     const derived = getItemCitationAnalytics(snapshot.libraryID, paper.itemKey);
     const local = network.get(paper.itemKey) ?? {
       incoming: 0,
@@ -164,6 +215,12 @@ export function buildCitationGraph(
             ? 1
             : null
           : metrics.resolvedReferenceCount / referenceCount;
+    const storedReferences =
+      storedReferencesBySource.get(paper.itemKey.toLocaleUpperCase()) ?? [];
+    const references = mergeRelatedWorkLists(
+      record?.references ?? [],
+      storedReferences,
+    );
     return {
       key: paper.itemKey,
       itemID: paper.itemID,
@@ -230,7 +287,7 @@ export function buildCitationGraph(
       referenceAgeSpread: derived?.referenceAgeSpread ?? null,
       selfCitationEstimate: derived?.selfCitationEstimate ?? null,
       futureReferenceCount: derived?.futureReferenceCount ?? null,
-      references: record?.references ?? [],
+      references,
     };
   });
   const model: CitationGraphModel = {

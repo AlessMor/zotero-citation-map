@@ -3,6 +3,7 @@ import type {
   CitationProviderID,
   IgnoredProviderRelation,
   ManualCitationRelation,
+  RelatedWorkMetadata,
 } from "../domain/citationTypes";
 import type { CitationGraphEdge } from "../domain/graphTypes";
 import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
@@ -22,6 +23,23 @@ export interface NetworkMetricValues {
   componentSize: number;
   citationChainDepth: number;
   isIsolated: boolean;
+}
+
+export interface LocalWorkIdentity {
+  itemKey: string;
+  doi: string | null;
+  title: string | null;
+  year: number | null;
+  provider: CitationProviderID | null;
+  providerWorkID: string | null;
+}
+
+export interface CitationReferenceSources {
+  localWorks?: readonly LocalWorkIdentity[];
+  storedReferencesBySource?: ReadonlyMap<
+    string,
+    readonly RelatedWorkMetadata[]
+  >;
 }
 
 function normalizeProviderWorkID(
@@ -72,39 +90,130 @@ export interface LocalCitationRelation {
   provenance: "zotero-relation" | "note-extraction" | "pdf-extraction";
 }
 
+function normalizeItemKey(value: unknown): string | null {
+  const key = String(value ?? "").trim();
+  return key ? key.toLocaleUpperCase() : null;
+}
+
+function explicitLocalTarget(
+  reference: RelatedWorkMetadata,
+  allowed: Set<string>,
+): string | null {
+  const extended = reference as RelatedWorkMetadata & {
+    inLibraryItemKey?: string | null;
+  };
+  const key = normalizeItemKey(
+    extended.inLibraryItemKey ?? reference.zoteroItemKey,
+  );
+  return key && allowed.has(key) ? key : null;
+}
+
+function compatibleTitleTarget(
+  reference: RelatedWorkMetadata,
+  candidates: readonly LocalWorkIdentity[],
+): string | null {
+  const compatible = candidates.filter(
+    (candidate) =>
+      reference.year === null ||
+      reference.year === undefined ||
+      candidate.year === null ||
+      Math.abs(reference.year - candidate.year) <= 1,
+  );
+  if (compatible.length === 1) return compatible[0].itemKey;
+  if (reference.year !== null && reference.year !== undefined) {
+    const exactYear = compatible.filter(
+      (candidate) => candidate.year === reference.year,
+    );
+    if (exactYear.length === 1) return exactYear[0].itemKey;
+  }
+  return null;
+}
+
+function mergeLocalIdentity(
+  current: LocalWorkIdentity | undefined,
+  incoming: LocalWorkIdentity,
+): LocalWorkIdentity {
+  if (!current) return incoming;
+  return {
+    itemKey: current.itemKey,
+    doi: current.doi ?? incoming.doi,
+    title: current.title?.trim() ? current.title : incoming.title,
+    year: current.year ?? incoming.year,
+    provider: current.provider ?? incoming.provider,
+    providerWorkID: current.providerWorkID ?? incoming.providerWorkID,
+  };
+}
+
 export function resolveRecordCitationEdges(
   records: CitationMetricRecord[],
   nodeKeys: string[],
   manualRelations: ManualCitationRelation[] = [],
   ignoredRelations: IgnoredProviderRelation[] = [],
   localRelations: LocalCitationRelation[] = [],
+  referenceSources: CitationReferenceSources = {},
 ): CitationGraphEdge[] {
-  const allowed = new Set(nodeKeys);
+  const allowed = new Set(nodeKeys.map((key) => key.toLocaleUpperCase()));
+  const recordByItemKey = new Map(
+    records
+      .filter((record) => allowed.has(record.itemKey.toLocaleUpperCase()))
+      .map((record) => [record.itemKey.toLocaleUpperCase(), record]),
+  );
+  const localByItemKey = new Map<string, LocalWorkIdentity>();
+
+  const addLocalIdentity = (work: LocalWorkIdentity): void => {
+    const itemKey = work.itemKey.toLocaleUpperCase();
+    if (!allowed.has(itemKey)) return;
+    localByItemKey.set(
+      itemKey,
+      mergeLocalIdentity(localByItemKey.get(itemKey), {
+        ...work,
+        itemKey,
+      }),
+    );
+  };
+
+  for (const work of referenceSources.localWorks ?? []) addLocalIdentity(work);
+  for (const record of records) {
+    addLocalIdentity({
+      itemKey: record.itemKey,
+      doi: record.doi,
+      title: record.title,
+      year: record.year,
+      provider: record.provider,
+      providerWorkID: record.providerWorkID,
+    });
+  }
+
   const keyByDOI = new Map<string, string>();
   const keyByIdentity = new Map<string, string>();
-  const keyByTitle = new Map<string, Set<string>>();
-  for (const record of records) {
-    if (!allowed.has(record.itemKey)) continue;
-    const doi = normalizeDOI(record.doi);
-    if (doi && !keyByDOI.has(doi)) keyByDOI.set(doi, record.itemKey);
-    const identity = identityKey(record.provider, record.providerWorkID);
-    if (identity && !keyByIdentity.has(identity)) {
-      keyByIdentity.set(identity, record.itemKey);
+  const worksByTitle = new Map<string, LocalWorkIdentity[]>();
+  for (const work of localByItemKey.values()) {
+    const doi = normalizeDOI(work.doi);
+    if (doi && !keyByDOI.has(doi)) keyByDOI.set(doi, work.itemKey);
+    if (work.provider) {
+      const identity = identityKey(work.provider, work.providerWorkID);
+      if (identity && !keyByIdentity.has(identity)) {
+        keyByIdentity.set(identity, work.itemKey);
+      }
     }
-    const title = normalizeExactTitle(record.title);
+    const title = normalizeExactTitle(work.title);
     if (title) {
-      const entries = keyByTitle.get(title) ?? new Set<string>();
-      entries.add(record.itemKey);
-      keyByTitle.set(title, entries);
+      const entries = worksByTitle.get(title) ?? [];
+      if (!entries.some((entry) => entry.itemKey === work.itemKey)) {
+        entries.push(work);
+      }
+      worksByTitle.set(title, entries);
     }
   }
+
   const ignoredBySubject = new Map<string, Set<string>>();
   for (const relation of ignoredRelations) {
-    const set =
-      ignoredBySubject.get(relation.subjectItemKey) ?? new Set<string>();
+    const subjectKey = relation.subjectItemKey.toLocaleUpperCase();
+    const set = ignoredBySubject.get(subjectKey) ?? new Set<string>();
     set.add(ignoredKey(relation));
-    ignoredBySubject.set(relation.subjectItemKey, set);
+    ignoredBySubject.set(subjectKey, set);
   }
+
   const edges: CitationGraphEdge[] = [];
   const seen = new Set<string>();
   const add = (
@@ -113,19 +222,41 @@ export function resolveRecordCitationEdges(
     provenance: string,
     manual: boolean,
   ): void => {
-    if (!allowed.has(source) || !allowed.has(target) || source === target) {
+    const normalizedSource = source.toLocaleUpperCase();
+    const normalizedTarget = target.toLocaleUpperCase();
+    if (
+      !allowed.has(normalizedSource) ||
+      !allowed.has(normalizedTarget) ||
+      normalizedSource === normalizedTarget
+    ) {
       return;
     }
-    const key = `${source}>${target}`;
+    const key = `${normalizedSource}>${normalizedTarget}`;
     if (seen.has(key)) return;
     seen.add(key);
-    edges.push({ key, source, target, provenance, manual });
+    edges.push({
+      key,
+      source: normalizedSource,
+      target: normalizedTarget,
+      provenance,
+      manual,
+    });
   };
 
-  for (const source of records) {
-    if (!allowed.has(source.itemKey)) continue;
-    const ignored = ignoredBySubject.get(source.itemKey) ?? new Set<string>();
-    for (const reference of source.references) {
+  for (const rawSourceKey of nodeKeys) {
+    const sourceItemKey = rawSourceKey.toLocaleUpperCase();
+    const sourceRecord = recordByItemKey.get(sourceItemKey);
+    const storedReferences =
+      referenceSources.storedReferencesBySource?.get(sourceItemKey) ??
+      referenceSources.storedReferencesBySource?.get(rawSourceKey) ??
+      [];
+    const references = [
+      ...(sourceRecord?.references ?? []),
+      ...storedReferences,
+    ];
+    const ignored = ignoredBySubject.get(sourceItemKey) ?? new Set<string>();
+
+    for (const reference of references) {
       const referenceKey = ignoredKey({
         provider: reference.provider,
         providerWorkID: reference.providerWorkID,
@@ -133,9 +264,10 @@ export function resolveRecordCitationEdges(
         normalizedTitle: normalizeExactTitle(reference.title),
       });
       if (ignored.has(referenceKey)) continue;
-      let target: string | null = null;
+
+      let target = explicitLocalTarget(reference, allowed);
       const doi = normalizeDOI(reference.doi);
-      if (doi) target = keyByDOI.get(doi) ?? null;
+      if (!target && doi) target = keyByDOI.get(doi) ?? null;
       if (!target) {
         const identity = identityKey(
           reference.provider,
@@ -145,12 +277,15 @@ export function resolveRecordCitationEdges(
       }
       if (!target) {
         const title = normalizeExactTitle(reference.title);
-        const matches = title ? keyByTitle.get(title) : undefined;
-        if (matches?.size === 1) target = [...matches][0];
+        const candidates = title ? worksByTitle.get(title) : undefined;
+        if (candidates?.length) {
+          target = compatibleTitleTarget(reference, candidates);
+        }
       }
-      if (target) add(source.itemKey, target, reference.provider, false);
+      if (target) add(sourceItemKey, target, reference.provider, false);
     }
   }
+
   for (const relation of manualRelations) {
     if (relation.direction === "reference") {
       add(relation.subjectItemKey, relation.relatedItemKey, "manual", true);

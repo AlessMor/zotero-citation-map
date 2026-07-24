@@ -41,13 +41,21 @@ import {
 } from "./citationMetricsStore";
 import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
 import {
+  citationDataSourceLabel,
+  externalWorkURL,
+} from "./providerPresentation";
+import {
+  externalWorkAuthorsText,
+  externalWorkMetadataText,
+} from "./externalWorkPresentationService";
+import {
   getRelationshipReportedCounts,
   getRelationshipViewSnapshot,
   RELATIONSHIP_VIEW_LIMIT,
+  newlyRetrievedRelationshipWorkCount,
   notifyRelationshipMutation,
   relationshipPreviewSourceKeys,
   relationshipStatusText,
-  relationshipWorkKey,
   subscribeRelationshipMutations,
   type RelationshipMutationEvent,
 } from "./relationshipViewService";
@@ -202,80 +210,8 @@ function paperSearchText(paper: ZoteroPaper): string {
   );
 }
 
-function externalProviderLabel(work: ExternalWork): string {
-  switch (work.provider) {
-    case "semantic-scholar":
-      return "Semantic Scholar";
-    case "openalex":
-      return "OpenAlex";
-    case "opencitations":
-      return "OpenCitations";
-    case "inspire":
-      return "INSPIRE";
-    case "crossref":
-      return "Crossref";
-    case "manual":
-      return "manual";
-    case "zotero":
-      return "Zotero";
-    default:
-      return "provider";
-  }
-}
-
-function externalWorkURL(work: ExternalWork): string | null {
-  const doi = work.doi?.trim();
-  if (doi) return `https://doi.org/${encodeURIComponent(doi)}`;
-  const id = work.providerWorkID?.trim();
-  if (!id) return null;
-  switch (work.provider) {
-    case "semantic-scholar":
-      return `https://www.semanticscholar.org/paper/${encodeURIComponent(id)}`;
-    case "openalex":
-      return id.startsWith("http")
-        ? id
-        : `https://openalex.org/${encodeURIComponent(id)}`;
-    case "inspire":
-      return `https://inspirehep.net/literature/${encodeURIComponent(id)}`;
-    case "crossref":
-    case "opencitations":
-      return id.includes("/")
-        ? `https://doi.org/${encodeURIComponent(id)}`
-        : null;
-    case "manual":
-    case "zotero":
-      return null;
-    default:
-      return null;
-  }
-}
-
 function externalWorkTitle(work: ExternalWork): string {
   return externalWorkDisplayTitle(work) ?? "Title unavailable";
-}
-
-function externalWorkAuthorsText(work: ExternalWork): string {
-  return work.authors.length
-    ? work.authors.slice(0, 6).join(", ")
-    : "Authors unavailable";
-}
-
-function externalWorkMetadataText(work: ExternalWork): string {
-  return [
-    work.sourceTitle,
-    work.year,
-    work.citationCount === null || work.citationCount === undefined
-      ? ""
-      : `${formatCount(work.citationCount)} citations`,
-    work.referenceCount === null || work.referenceCount === undefined
-      ? ""
-      : `${formatCount(work.referenceCount)} references`,
-    work.recommendationScore
-      ? `connected to ${work.recommendationScore} visible papers`
-      : "",
-  ]
-    .filter(Boolean)
-    .join(" · ");
 }
 
 function colorForCollection(id: number, depth: number): string {
@@ -1291,10 +1227,13 @@ export function renderCitationMapView(
     const tabs = element(document, "div", "cm-detail-tabs");
     for (const [mode, label] of [
       ["overview", "Overview"],
-      ["cited-by", `Cited by (${formatCount(reportedCounts.citationCount)})`],
+      [
+        "cited-by",
+        `Cited by (${formatCount(reportedCounts.citationCount)} reported)`,
+      ],
       [
         "references",
-        `References (${formatCount(reportedCounts.referenceCount)})`,
+        `References (${formatCount(reportedCounts.referenceCount)} reported)`,
       ],
     ] as const) {
       const button = element(document, "button");
@@ -1375,7 +1314,10 @@ export function renderCitationMapView(
       card.appendChild(
         text(document, "p", externalWorkAuthorsText(work), "cm-detail-meta"),
       );
-      const metadataText = externalWorkMetadataText(work);
+      const metadataText = externalWorkMetadataText(
+        work,
+        work.recommendationScore,
+      );
       if (metadataText) {
         card.appendChild(text(document, "p", metadataText, "cm-detail-meta"));
       }
@@ -1389,7 +1331,7 @@ export function renderCitationMapView(
         link.href = url;
         link.textContent = work.doi?.trim()
           ? `DOI: ${work.doi.trim()}`
-          : `Open ${externalProviderLabel(work)} record`;
+          : `Open ${citationDataSourceLabel(work.provider)} record`;
         link.style.minWidth = "0";
         link.style.overflowWrap = "anywhere";
         link.addEventListener("click", (event) => {
@@ -1957,7 +1899,7 @@ export function renderCitationMapView(
         message: "Checking provider pages for new relationships…",
       });
       void (async () => {
-        const before = new Set(works.map(relationshipWorkKey));
+        const previousWorks = works;
         try {
           await refreshExternalRelationships(
             node,
@@ -1973,10 +1915,9 @@ export function renderCitationMapView(
             RELATIONSHIP_VIEW_LIMIT,
           );
           works = relationshipSnapshot.works;
-          const added = works.reduce(
-            (count, work) =>
-              count + (before.has(relationshipWorkKey(work)) ? 0 : 1),
-            0,
+          const added = newlyRetrievedRelationshipWorkCount(
+            previousWorks,
+            works,
           );
           updateOutcome = added
             ? `${added} new paper${added === 1 ? "" : "s"} added`

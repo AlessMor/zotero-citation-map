@@ -1,4 +1,7 @@
-import type { WorkIdentifiers } from "../domain/citationTypes";
+import type {
+  RelatedWorkMetadata,
+  WorkIdentifiers,
+} from "../domain/citationTypes";
 
 export function normalizeDOI(value: unknown): string | null {
   const text = String(value ?? "")
@@ -42,6 +45,52 @@ export function normalizeExactTitle(value: unknown): string {
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim()
     .replace(/\s+/g, " ");
+}
+
+export function normalizeIdentifier(value: unknown): string | null {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLocaleLowerCase();
+  return normalized || null;
+}
+
+export function relatedWorkStableAliases(work: RelatedWorkMetadata): string[] {
+  const aliases: string[] = [];
+  const localKey = normalizeIdentifier(
+    work.inLibraryItemKey ?? work.zoteroItemKey,
+  );
+  if (localKey) aliases.push(`zotero:${localKey.toLocaleUpperCase()}`);
+  const doi = normalizeDOI(work.doi);
+  if (doi) aliases.push(`doi:${doi}`);
+  const pmid = normalizeIdentifier(work.pmid);
+  if (pmid) aliases.push(`pmid:${pmid}`);
+  const arxiv = normalizeIdentifier(work.arxiv);
+  if (arxiv) aliases.push(`arxiv:${arxiv}`);
+  const isbn = normalizeIdentifier(work.isbn);
+  if (isbn) aliases.push(`isbn:${isbn.replace(/[-\s]/g, "")}`);
+  const providerWorkID = normalizeIdentifier(work.providerWorkID);
+  if (providerWorkID) aliases.push(`${work.provider}:${providerWorkID}`);
+  return aliases;
+}
+
+export function relatedWorkMetadataAliases(
+  work: RelatedWorkMetadata,
+): string[] {
+  const aliases = relatedWorkStableAliases(work);
+  const title = normalizeExactTitle(work.title);
+  if (title) aliases.push(`title:${title}:year:${work.year ?? "unknown"}`);
+  return aliases;
+}
+
+export function externalWorkCacheIdentity(
+  work: RelatedWorkMetadata,
+): string | null {
+  const doi = normalizeDOI(work.doi);
+  if (doi) return `doi:${doi}`;
+  const providerWorkID = String(work.providerWorkID ?? "").trim();
+  if (providerWorkID) return `${work.provider}:${providerWorkID}`;
+  const title = normalizeExactTitle(work.title);
+  return title ? `title:${title}` : null;
 }
 
 function getExtraLines(item: Zotero.Item): string[] {

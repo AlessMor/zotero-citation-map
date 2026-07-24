@@ -12,23 +12,15 @@ import {
   SUPPLEMENTARY_PROPERTY_DEFINITIONS,
   metricTooltip,
 } from "./metricRegistry";
+import {
+  citationDataSourceLabel,
+  type CitationDataSourceID,
+} from "./providerPresentation";
 import { getStoredRelationshipEntry } from "./relationshipStoreService";
 
-export type DataSourceID =
-  CitationProviderID | "zotero" | "citation-map" | "manual";
+export type DataSourceID = CitationDataSourceID;
 
 const HTML_NS = "http://www.w3.org/1999/xhtml";
-
-const PROVIDER_LABELS: Record<DataSourceID, string> = {
-  crossref: "Crossref",
-  "semantic-scholar": "Semantic Scholar",
-  opencitations: "OpenCitations",
-  inspire: "INSPIRE-HEP",
-  openalex: "OpenAlex",
-  zotero: "Zotero",
-  "citation-map": "Citation Map",
-  manual: "Manual",
-};
 
 interface DocumentTooltipHandlers {
   mouseover: EventListener;
@@ -106,9 +98,7 @@ export function dataSourceTooltip(
   sources: Array<DataSourceID | CitationProviderID | null | undefined>,
   updatedAt: string | null | undefined,
 ): string {
-  const labels = normalizedSources(sources).map(
-    (source) => PROVIDER_LABELS[source],
-  );
+  const labels = normalizedSources(sources).map(citationDataSourceLabel);
   return [
     `Sources: ${labels.length ? labels.join(", ") : "Not recorded"}`,
     `Last update: ${formatUpdate(updatedAt)}`,

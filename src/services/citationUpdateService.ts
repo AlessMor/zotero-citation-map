@@ -4,6 +4,7 @@ import type {
   CitationUpdateBatchResult,
   ProviderLookupFailure,
 } from "../domain/citationTypes";
+import type { CitationGraphNode } from "../domain/graphTypes";
 import { getProviderPlan, lookupCitationMetrics } from "../providers/registry";
 import {
   cancelPendingCitationRequests,
@@ -25,10 +26,18 @@ import {
   getProviderPreference,
   getUpdateNewItemsEnabled,
 } from "./citationPreferences";
-import { storeExternalRelationshipSnapshot } from "./externalDiscoveryService";
+import {
+  refreshExternalRelationships,
+  storeExternalRelationshipSnapshot,
+  type ExternalWork,
+} from "./externalDiscoveryService";
+import {
+  maximumKnownCount,
+  richestCountAttribution,
+} from "./citationCountPolicy";
 import { refreshCitationColumns } from "./itemTreeColumnService";
 import {
-  getStoredRelationshipWorks,
+  getStoredRelationshipEntry,
   mergeRelatedWorkLists,
 } from "./relationshipStoreService";
 import { createMetricNodeForItem } from "./itemMetricContext";
@@ -71,6 +80,7 @@ let startupTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingTimer: ReturnType<typeof setTimeout> | null = null;
 let shuttingDown = false;
 const pendingItemIDs = new Set<number>();
+const initialRelationshipDiscoveryKeys = new Set<string>();
 
 function backgroundError(context: string, error: unknown): Error {
   if (error instanceof Error) return error;
@@ -262,10 +272,54 @@ function nonEmptyYearCounts<T>(
   return current?.length ? current : (previous ?? []);
 }
 
+function relationshipDiscoveryKey(node: CitationGraphNode): string {
+  return `${node.itemID}:${node.itemKey.toLocaleUpperCase()}`;
+}
+
+function scheduleInitialRelationshipDiscovery(
+  node: CitationGraphNode,
+  needsReferences: boolean,
+  needsCitedBy: boolean,
+): void {
+  if (!needsReferences && !needsCitedBy) return;
+  const key = relationshipDiscoveryKey(node);
+  if (initialRelationshipDiscoveryKeys.has(key)) return;
+  initialRelationshipDiscoveryKeys.add(key);
+  runBackgroundUpdate(
+    `initial relationship discovery for ${node.itemKey}`,
+    (async (): Promise<void> => {
+      try {
+        const libraryNodes = [node];
+        const discoveries: Array<Promise<ExternalWork[]>> = [];
+        if (needsReferences) {
+          discoveries.push(
+            refreshExternalRelationships(node, libraryNodes, "references"),
+          );
+        }
+        if (needsCitedBy) {
+          discoveries.push(
+            refreshExternalRelationships(node, libraryNodes, "cited-by"),
+          );
+        }
+        const outcomes = await Promise.allSettled(discoveries);
+        if (!shuttingDown) refreshViewsAfterUpdate(true);
+        const failure = outcomes.find(
+          (outcome): outcome is PromiseRejectedResult =>
+            outcome.status === "rejected",
+        );
+        if (failure) throw failure.reason;
+      } finally {
+        initialRelationshipDiscoveryKeys.delete(key);
+      }
+    })(),
+  );
+}
+
 async function updateOneItem(
   item: Zotero.Item,
   preference: CitationProviderPreference,
   force: boolean,
+  includeRelationships: boolean,
 ): Promise<UpdateOutcome> {
   if (shuttingDown || isCitationRequestCancellationRequested()) {
     return "skipped";
@@ -284,8 +338,8 @@ async function updateOneItem(
     doi: extracted.doi ?? (previous?.matchConfirmed ? previous.doi : null),
   };
   // Every explicit or automatic field update attempts the full scalar-field
-  // enrichment path. This remains bounded because complete relationship lists
-  // are refreshed separately by the relationship views.
+  // enrichment path. First-time relationship retrieval then runs through the
+  // same paginated cache pipeline as the relationship views.
   const result = await lookupCitationMetrics(
     preference,
     identifiers,
@@ -319,15 +373,37 @@ async function updateOneItem(
     result.matchedBy === "doi" ||
     result.matchedBy === "title" ||
     sameConfirmedIdentity;
-  const cachedRelationshipNode = createMetricNodeForItem(item);
   const mergedReferences = mergeRelatedWorkLists(
     previous?.references ?? [],
-    getStoredRelationshipWorks(cachedRelationshipNode, "references"),
     result.references,
   );
-  const citationCount = result.citationCount ?? previous?.citationCount ?? null;
-  const referenceCount =
-    result.referenceCount ?? previous?.referenceCount ?? null;
+  const citationCount = richestCountAttribution([
+    {
+      count: previous?.citationCount ?? null,
+      provider: previous?.citationCountProvider ?? null,
+    },
+    {
+      count: result.citationCount,
+      provider: result.citationCountProvider,
+    },
+  ]);
+  const referenceCount = richestCountAttribution([
+    {
+      count: previous?.referenceCount ?? null,
+      provider: previous?.referenceCountProvider ?? null,
+    },
+    {
+      count: result.referenceCount,
+      provider: result.referenceCountProvider,
+    },
+    {
+      count: mergedReferences.length,
+      provider:
+        result.referenceCountProvider ??
+        previous?.referenceCountProvider ??
+        null,
+    },
+  ]);
 
   const record: CitationMetricRecord = {
     libraryID,
@@ -354,21 +430,16 @@ async function updateOneItem(
       previous?.sourceTitle ??
       null,
     abstract: result.abstract ?? previous?.abstract ?? null,
-    citationCount,
-    citationCountProvider:
-      result.citationCount !== null
-        ? result.citationCountProvider
-        : (previous?.citationCountProvider ?? result.citationCountProvider),
-    referenceCount,
-    referenceCountProvider:
-      result.referenceCount !== null
-        ? result.referenceCountProvider
-        : (previous?.referenceCountProvider ?? result.referenceCountProvider),
-    resolvedReferenceCount: Math.max(
-      previous?.resolvedReferenceCount ?? 0,
-      result.resolvedReferenceCount,
-      mergedReferences.length,
-    ),
+    citationCount: citationCount.count,
+    citationCountProvider: citationCount.provider,
+    referenceCount: referenceCount.count,
+    referenceCountProvider: referenceCount.provider,
+    resolvedReferenceCount:
+      maximumKnownCount([
+        previous?.resolvedReferenceCount,
+        result.resolvedReferenceCount,
+        mergedReferences.length,
+      ]) ?? 0,
     references: mergedReferences,
     matchCandidates: [],
     fwci: result.fwci ?? previous?.fwci ?? null,
@@ -406,15 +477,29 @@ async function updateOneItem(
   };
   await saveCitationMetricRecord(record);
 
-  // Persist the provider's embedded reference snapshot, but do not paginate
-  // cited-by/reference endpoints here. The relationship tabs own those actions.
   try {
     const updatedNode = createMetricNodeForItem(item);
+    const needsReferences = !getStoredRelationshipEntry(
+      updatedNode,
+      "references",
+    );
+    const needsCitedBy = !getStoredRelationshipEntry(updatedNode, "cited-by");
     await storeExternalRelationshipSnapshot(
       updatedNode,
       "references",
       record.references,
+      {
+        provider: result.provider,
+        reportedCount: result.referenceCount,
+      },
     );
+    if (includeRelationships) {
+      scheduleInitialRelationshipDiscovery(
+        updatedNode,
+        needsReferences,
+        needsCitedBy,
+      );
+    }
     if (getProviderPlan("source-metrics", preference).providers.length) {
       await ensureSourceMetricsForNodes([updatedNode]);
     }
@@ -434,8 +519,7 @@ async function runUpdate(
   const selected = regularItems(items);
   const provider = options.provider ?? getProviderPreference();
   const force = Boolean(options.force);
-  // Read the legacy option so development builds passing it remain compatible.
-  void options.includeRelationships;
+  const includeRelationships = options.includeRelationships === true;
   const result: CitationUpdateBatchResult = {
     total: selected.length,
     updated: 0,
@@ -482,7 +566,7 @@ async function runUpdate(
             ? SINGLE_ITEM_DEADLINE_MS
             : BATCH_ITEM_DEADLINE_MS;
         outcome = await withDeadline(
-          updateOneItem(item, provider, force),
+          updateOneItem(item, provider, force, includeRelationships),
           deadline,
           `Field update for ${String(item.getField("title") ?? item.key)}`,
         );

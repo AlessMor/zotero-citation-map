@@ -1,4 +1,7 @@
-import type { RelatedWorkMetadata } from "../domain/citationTypes";
+import type {
+  CitationProviderID,
+  RelatedWorkMetadata,
+} from "../domain/citationTypes";
 import type {
   CitationGraphModel,
   CitationGraphNode,
@@ -10,6 +13,8 @@ import {
 } from "./externalDiscoveryService";
 import { getCitationMetricRecord } from "./citationMetricsStore";
 import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
+import { getProviderLabel } from "./citationPreferences";
+import { mergeRelatedWorkLists } from "./relationshipStoreService";
 
 export type RelationshipViewDirection = "references" | "cited-by";
 export const RELATIONSHIP_VIEW_LIMIT = 2500;
@@ -46,7 +51,6 @@ export interface RelationshipMutationEvent {
 }
 
 type RelationshipMutationListener = (event: RelationshipMutationEvent) => void;
-
 const relationshipMutationListeners = new Set<RelationshipMutationListener>();
 
 export function subscribeRelationshipMutations(
@@ -74,6 +78,8 @@ export interface RelationshipViewSnapshot {
   direction: RelationshipViewDirection;
   works: ExternalWork[];
   reportedCount: number | null;
+  reportedCountProvider: CitationProviderID | null;
+  hasRetrievedWorks: boolean;
   relationshipLabel: "reference" | "citation";
   providerLabel: "references" | "citations";
 }
@@ -100,6 +106,22 @@ function graphNodeAsExternalWork(node: CitationGraphNode): ExternalWork {
     abstract: node.abstract,
     citationCount: node.citationCount,
     referenceCount: node.referenceCount,
+    resolvedReferenceCount: node.resolvedReferenceCount,
+    fwci: node.fwci,
+    citationPercentile: node.citationPercentile,
+    isTop1Percent: node.isTop1Percent,
+    isTop10Percent: node.isTop10Percent,
+    citationsLastYear: node.citationsLastYear,
+    citationVelocity: node.citationVelocity,
+    citationAcceleration: node.citationAcceleration,
+    influentialCitationCount: node.influentialCitationCount,
+    publicationType: node.publicationType,
+    sourceMetrics: node.sourceMetrics,
+    referenceAgeMean: node.referenceAgeMean,
+    referenceAgeSpread: node.referenceAgeSpread,
+    selfCitationEstimate: node.selfCitationEstimate,
+    futureReferenceCount: node.futureReferenceCount,
+    metadataCompleteness: node.metadataCompleteness,
     isOpenAccess: node.isOpenAccess,
     openAccessStatus: node.openAccessStatus,
     isRetracted: node.isRetracted,
@@ -140,51 +162,39 @@ function graphRelationshipWorks(
 
 export function relationshipWorkKey(work: ExternalWork): string {
   const localKey = work.inLibraryItemKey ?? work.zoteroItemKey;
-  if (localKey) return `zotero:${localKey}`;
+  if (localKey) return `zotero:${localKey.toLocaleUpperCase()}`;
   const doi = normalizeDOI(work.doi);
   if (doi) return `doi:${doi}`;
+  if (work.pmid?.trim()) return `pmid:${work.pmid.trim().toLocaleLowerCase()}`;
+  if (work.arxiv?.trim())
+    return `arxiv:${work.arxiv.trim().toLocaleLowerCase()}`;
+  if (work.isbn?.trim())
+    return `isbn:${work.isbn.replace(/[-\s]/g, "").toLocaleLowerCase()}`;
   if (work.providerWorkID) {
     return `${work.provider}:${String(work.providerWorkID).toLocaleLowerCase()}`;
   }
   const title = normalizeExactTitle(work.title);
-  return title ? `title:${title}` : `${work.provider}:unknown`;
+  return title
+    ? `title:${title}:year:${work.year ?? "unknown"}`
+    : `${work.provider}:unknown`;
+}
+
+export function newlyRetrievedRelationshipWorkCount(
+  previousWorks: readonly ExternalWork[],
+  currentWorks: readonly ExternalWork[],
+): number {
+  const previousKeys = new Set(previousWorks.map(relationshipWorkKey));
+  return currentWorks.reduce(
+    (count, work) =>
+      count + (previousKeys.has(relationshipWorkKey(work)) ? 0 : 1),
+    0,
+  );
 }
 
 export function mergeRelationshipWorks(
   ...groups: ExternalWork[][]
 ): ExternalWork[] {
-  const merged = new Map<string, ExternalWork>();
-  for (const group of groups) {
-    for (const work of group) {
-      const key = relationshipWorkKey(work);
-      const previous = merged.get(key);
-      if (!previous) {
-        merged.set(key, work);
-        continue;
-      }
-      merged.set(key, {
-        ...previous,
-        ...work,
-        provider:
-          previous.provider === "manual" || previous.provider !== "zotero"
-            ? previous.provider
-            : work.provider,
-        providerWorkID: previous.providerWorkID ?? work.providerWorkID,
-        doi: previous.doi ?? work.doi,
-        title: previous.title?.trim() ? previous.title : work.title,
-        year: previous.year ?? work.year,
-        authors: previous.authors.length ? previous.authors : work.authors,
-        sourceTitle: previous.sourceTitle ?? work.sourceTitle,
-        abstract: previous.abstract ?? work.abstract,
-        citationCount: previous.citationCount ?? work.citationCount,
-        referenceCount: previous.referenceCount ?? work.referenceCount,
-        zoteroItemKey: previous.zoteroItemKey ?? work.zoteroItemKey,
-        inLibraryItemKey:
-          previous.inLibraryItemKey ?? work.inLibraryItemKey ?? null,
-      });
-    }
-  }
-  return [...merged.values()];
+  return mergeRelatedWorkLists(...groups).map((work) => work as ExternalWork);
 }
 
 export function getRelationshipReportedCounts(
@@ -206,20 +216,34 @@ export function getRelationshipViewSnapshot(
   maximum = RELATIONSHIP_VIEW_LIMIT,
 ): RelationshipViewSnapshot {
   const record = getCitationMetricRecord(libraryID, node.itemKey);
-  const graphWorks = graphRelationshipWorks(graph, node, direction);
   const stored =
     direction === "references"
       ? getCachedExternalReferences(node, graph.nodes, maximum, 0)
       : getCachedExternalCitedBy(node, graph.nodes, maximum, 0);
-  const works = mergeRelationshipWorks(stored, graphWorks).slice(0, maximum);
+
+  // A complete provider snapshot is authoritative. Graph edges are a useful
+  // fallback before relationship data have been hydrated, but merging them into
+  // a stored snapshot can reintroduce stale/local-only edges and make the list
+  // exceed the canonical provider union.
+  const sourceWorks = stored.length
+    ? stored
+    : graphRelationshipWorks(graph, node, direction);
+  const works = mergeRelationshipWorks(sourceWorks).slice(0, maximum);
   const reportedCount =
     direction === "references"
       ? (record?.referenceCount ?? node.referenceCount)
       : (record?.citationCount ?? node.citationCount);
+  const reportedCountProvider =
+    direction === "references"
+      ? (record?.referenceCountProvider ?? node.referenceCountProvider)
+      : (record?.citationCountProvider ?? node.citationCountProvider);
+
   return {
     direction,
     works,
     reportedCount,
+    reportedCountProvider,
+    hasRetrievedWorks: stored.length > 0,
     relationshipLabel: direction === "references" ? "reference" : "citation",
     providerLabel: direction === "references" ? "references" : "citations",
   };
@@ -268,7 +292,6 @@ export function relationshipPreviewSourceKeys(
   const connected = new Set<string>();
   if (visibleKeys.has(subject.key)) connected.add(subject.key);
   if (visibleKeys.has(subject.itemKey)) connected.add(subject.itemKey);
-
   for (const key of work.citingNodeKeys ?? []) {
     if (visibleKeys.has(key)) connected.add(key);
   }
@@ -284,7 +307,6 @@ export function relationshipPreviewSourceKeys(
       }
     }
   }
-
   for (const candidate of graph.nodes) {
     if (!visibleKeys.has(candidate.key)) continue;
     if (
@@ -399,18 +421,20 @@ export function relationshipStatusText(
   searching = false,
 ): string {
   const total = snapshot.works.length;
-  const suffix = total === 1 ? "" : "s";
-  const local = filtered
-    ? `${formatCount(shownCount)} shown of ${formatCount(total)} ` +
-      `${snapshot.relationshipLabel} relationship${suffix}`
-    : `${formatCount(total)} ${snapshot.relationshipLabel} ` +
-      `relationship${suffix}`;
-  const provider =
+  const relationship = `${snapshot.relationshipLabel}${total === 1 ? "" : "s"}`;
+  const retrieved = snapshot.hasRetrievedWorks
+    ? filtered
+      ? `${formatCount(shownCount)} shown of ${formatCount(total)} retrieved ${relationship}`
+      : `${formatCount(total)} retrieved ${relationship}`
+    : `${formatCount(total)} linked library ${relationship}`;
+  const provider = snapshot.reportedCountProvider
+    ? ` by ${getProviderLabel(snapshot.reportedCountProvider)}`
+    : "";
+  const reported =
     snapshot.reportedCount === null
       ? ""
-      : ` · provider reports ${formatCount(snapshot.reportedCount)} ` +
-        snapshot.providerLabel;
+      : ` · ${formatCount(snapshot.reportedCount)} reported${provider}`;
   return searching
-    ? `${local}${provider} · ${relationshipUpdateText(snapshot.direction)}`
-    : `${local}${provider}`;
+    ? `${retrieved}${reported} · ${relationshipUpdateText(snapshot.direction)}`
+    : `${retrieved}${reported}`;
 }

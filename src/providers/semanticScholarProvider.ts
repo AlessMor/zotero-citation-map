@@ -97,6 +97,8 @@ function toRelated(paper: S2Paper): RelatedWorkMetadata | null {
     abstract: stringOrNull(paper.abstract),
     citationCount: numberOrNull(paper.citationCount),
     referenceCount: numberOrNull(paper.referenceCount),
+    influentialCitationCount: numberOrNull(paper.influentialCitationCount),
+    publicationType: stringOrNull(paper.publicationTypes?.join(", ")),
     isOpenAccess:
       typeof paper.isOpenAccess === "boolean" ? paper.isOpenAccess : null,
     openAccessStatus: paper.isOpenAccess ? "open" : null,

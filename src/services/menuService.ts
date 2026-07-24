@@ -85,7 +85,7 @@ export function registerMenus(): void {
             void updateCitationDataForItems(items, {
               force: true,
               silent: false,
-              includeRelationships: false,
+              includeRelationships: items.length === 1,
             }).catch(report);
           }
         },

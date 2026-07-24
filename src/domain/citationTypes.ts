@@ -56,10 +56,29 @@ export interface RelatedWorkMetadata {
   abstract?: string | null;
   citationCount?: number | null;
   referenceCount?: number | null;
+  citationCountsByYear?: CitationYearCount[];
+  references?: RelatedWorkMetadata[];
+  resolvedReferenceCount?: number | null;
+  fwci?: number | null;
+  citationPercentile?: number | null;
+  isTop1Percent?: boolean | null;
+  isTop10Percent?: boolean | null;
+  citationsLastYear?: number | null;
+  citationVelocity?: number | null;
+  citationAcceleration?: number | null;
+  influentialCitationCount?: number | null;
+  publicationType?: string | null;
+  sourceMetrics?: SourceMetrics | null;
+  referenceAgeMean?: number | null;
+  referenceAgeSpread?: number | null;
+  selfCitationEstimate?: number | null;
+  futureReferenceCount?: number | null;
+  metadataCompleteness?: number | null;
   isOpenAccess?: boolean | null;
   openAccessStatus?: string | null;
   isRetracted?: boolean | null;
   zoteroItemKey?: string | null;
+  inLibraryItemKey?: string | null;
   /** Providers that contributed one or more values to this merged record. */
   dataSources?: CitationProviderID[];
   /** Most recent provider fetch involved in this merged record. */

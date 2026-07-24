@@ -121,6 +121,15 @@ function toRelated(work: OpenAlexWork): RelatedWorkMetadata | null {
   const id = shortID(work.id);
   const title = stringOrNull(work.display_name ?? work.title);
   if (!id || !title) return null;
+  const counts: CitationYearCount[] = (work.counts_by_year ?? [])
+    .map((entry) => ({
+      year: Number(entry.year),
+      count: Number(entry.cited_by_count),
+    }))
+    .filter(
+      (entry) => Number.isFinite(entry.year) && Number.isFinite(entry.count),
+    );
+  const trend = yearlyMetrics(counts);
   return {
     provider: "openalex",
     providerWorkID: id,
@@ -144,6 +153,19 @@ function toRelated(work: OpenAlexWork): RelatedWorkMetadata | null {
     abstract: abstractFromIndex(work.abstract_inverted_index),
     citationCount: numberOrNull(work.cited_by_count),
     referenceCount: numberOrNull(work.referenced_works_count),
+    citationCountsByYear: counts,
+    fwci: numberOrNull(work.fwci),
+    citationPercentile: numberOrNull(
+      work.citation_normalized_percentile?.value,
+    ),
+    isTop1Percent:
+      work.citation_normalized_percentile?.is_in_top_1_percent ?? null,
+    isTop10Percent:
+      work.citation_normalized_percentile?.is_in_top_10_percent ?? null,
+    citationsLastYear: trend.lastYear,
+    citationVelocity: trend.velocity,
+    citationAcceleration: trend.acceleration,
+    publicationType: stringOrNull(work.type),
     isOpenAccess:
       typeof work.open_access?.is_oa === "boolean"
         ? work.open_access.is_oa
@@ -163,41 +185,78 @@ async function fetchWorkByID(id: string): Promise<OpenAlexWork | null> {
   return response.ok && response.data ? response.data : null;
 }
 
+interface OpenAlexBatchIdentifier {
+  kind: "openalex" | "doi";
+  key: string;
+}
+
+function openAlexBatchIdentifier(
+  value: string,
+): OpenAlexBatchIdentifier | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const withoutDOIPrefix = raw.replace(/^doi:\s*/i, "");
+  const doi = normalizeDOI(withoutDOIPrefix);
+  const id = shortID(raw);
+  if (id && /^W\d+$/i.test(id)) {
+    return { kind: "openalex", key: id.toLocaleUpperCase() };
+  }
+  return doi ? { kind: "doi", key: doi } : null;
+}
+
 /**
- * Resolve OpenAlex work IDs into display-ready metadata. OpenAlex relationship
- * payloads often contain only dehydrated work IDs, so callers must hydrate
- * those IDs before presenting them as papers.
+ * Resolve OpenAlex work IDs or DOIs into display-ready metadata. OpenAlex
+ * supports OR filters with up to 100 identifiers, so DOI-only relationship
+ * records can be hydrated in bulk instead of falling back to one HTTP request
+ * per work.
  */
 export async function fetchOpenAlexWorksBatch(
   identifiers: string[],
 ): Promise<Array<RelatedWorkMetadata | null>> {
   if (!identifiers.length) return [];
 
-  const normalized = identifiers.map(shortID);
-  const unique = [
-    ...new Set(normalized.filter((id): id is string => Boolean(id))),
-  ];
+  const normalized = identifiers.map(openAlexBatchIdentifier);
   const resolved = new Map<string, RelatedWorkMetadata>();
 
-  for (let start = 0; start < unique.length; start += OPENALEX_MAX_PER_PAGE) {
-    const batch = unique.slice(start, start + OPENALEX_MAX_PER_PAGE);
-    const response = await requestOpenAlex<OpenAlexList>("/works", {
-      filter: `ids.openalex:${batch.join("|")}`,
-      per_page: batch.length,
-    });
-    if (!response.ok || !response.data) {
-      throw new Error(
-        failureMessage(response, "OpenAlex batch metadata lookup failed."),
-      );
-    }
-    for (const work of response.data.results ?? []) {
-      const id = shortID(work.id);
-      const metadata = toRelated(work);
-      if (id && metadata) resolved.set(id, metadata);
+  for (const kind of ["openalex", "doi"] as const) {
+    const unique = [
+      ...new Set(
+        normalized
+          .filter(
+            (identifier): identifier is OpenAlexBatchIdentifier =>
+              identifier?.kind === kind,
+          )
+          .map((identifier) => identifier.key),
+      ),
+    ];
+    for (let start = 0; start < unique.length; start += OPENALEX_MAX_PER_PAGE) {
+      const batch = unique.slice(start, start + OPENALEX_MAX_PER_PAGE);
+      const filterName = kind === "openalex" ? "ids.openalex" : "doi";
+      const response = await requestOpenAlex<OpenAlexList>("/works", {
+        filter: `${filterName}:${batch.join("|")}`,
+        per_page: batch.length,
+      });
+      if (!response.ok || !response.data) {
+        throw new Error(
+          failureMessage(response, "OpenAlex batch metadata lookup failed."),
+        );
+      }
+      for (const work of response.data.results ?? []) {
+        const metadata = toRelated(work);
+        if (!metadata) continue;
+        const id = shortID(work.id);
+        const doi = normalizeDOI(work.doi);
+        if (id) resolved.set(`openalex:${id.toLocaleUpperCase()}`, metadata);
+        if (doi) resolved.set(`doi:${doi}`, metadata);
+      }
     }
   }
 
-  return normalized.map((id) => (id ? (resolved.get(id) ?? null) : null));
+  return normalized.map((identifier) =>
+    identifier
+      ? (resolved.get(`${identifier.kind}:${identifier.key}`) ?? null)
+      : null,
+  );
 }
 
 function resolveReferences(work: OpenAlexWork): RelatedWorkMetadata[] {

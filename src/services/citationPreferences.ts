@@ -4,15 +4,14 @@ import type {
   CitationProviderPreference,
 } from "../domain/citationTypes";
 import type { GraphLayoutOptions } from "../domain/graphTypes";
+import { citationDataSourceLabel } from "./providerPresentation";
 
 const key = (name: string): string => `${config.prefsPrefix}.${name}`;
-const PROVIDER_LABELS: Record<CitationProviderPreference, string> = {
+const PROVIDER_LABELS: Pick<
+  Record<CitationProviderPreference, string>,
+  "auto"
+> = {
   auto: "Automatic — combine available providers",
-  crossref: "Crossref",
-  "semantic-scholar": "Semantic Scholar",
-  opencitations: "OpenCitations",
-  inspire: "INSPIRE-HEP",
-  openalex: "OpenAlex",
 };
 const CONCRETE = new Set<CitationProviderID>([
   "crossref",
@@ -28,7 +27,9 @@ function boolPref(name: string, fallback: boolean): boolean {
 }
 
 export function getProviderLabel(provider: CitationProviderPreference): string {
-  return PROVIDER_LABELS[provider];
+  return provider === "auto"
+    ? PROVIDER_LABELS.auto
+    : citationDataSourceLabel(provider);
 }
 
 export function getProviderPreference(): CitationProviderPreference {

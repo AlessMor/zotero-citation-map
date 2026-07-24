@@ -12,6 +12,10 @@ import {
   normalizeDOI,
   normalizeExactTitle,
 } from "../services/citationIdentifiers";
+import {
+  maximumKnownCount,
+  richestCountAttribution,
+} from "../services/citationCountPolicy";
 import { getOpenAlexAPIKey } from "../services/citationPreferences";
 import { fetchCrossrefRelatedWorks } from "./crossrefDiscovery";
 import { crossrefProvider } from "./crossrefProvider";
@@ -81,9 +85,9 @@ const AUTOMATIC_PROVIDER_ORDERS: Record<
   ],
   "metadata-resolution": [
     "semantic-scholar",
+    "openalex",
     "crossref",
     "inspire",
-    "openalex",
   ],
   references: [
     "semantic-scholar",
@@ -295,18 +299,24 @@ function richerReferences(
   const references = mergeReferenceLists(left.references, right.references);
   const leftCount = left.referenceCount ?? left.resolvedReferenceCount;
   const rightCount = right.referenceCount ?? right.resolvedReferenceCount;
-  const rightReportedMore = rightCount > leftCount;
+  const richest = richestCountAttribution([
+    { count: leftCount, provider: left.referenceCountProvider },
+    { count: rightCount, provider: right.referenceCountProvider },
+    {
+      count: references.length,
+      provider: left.referenceCountProvider ?? right.referenceCountProvider,
+    },
+  ]);
   return {
     ...left,
-    referenceCount: Math.max(leftCount, rightCount, references.length),
-    referenceCountProvider: rightReportedMore
-      ? right.referenceCountProvider
-      : left.referenceCountProvider,
-    resolvedReferenceCount: Math.max(
-      left.resolvedReferenceCount,
-      right.resolvedReferenceCount,
-      references.length,
-    ),
+    referenceCount: richest.count,
+    referenceCountProvider: richest.provider ?? left.referenceCountProvider,
+    resolvedReferenceCount:
+      maximumKnownCount([
+        left.resolvedReferenceCount,
+        right.resolvedReferenceCount,
+        references.length,
+      ]) ?? 0,
     references,
   };
 }
@@ -315,12 +325,17 @@ function mergeEnrichment(
   canonical: ProviderLookupSuccess,
   enrichment: ProviderLookupSuccess,
 ): ProviderLookupSuccess {
-  // OpenAlex reference arrays are often ID-only. They may enrich scalar fields,
-  // but should not replace a richer structured bibliography.
-  const references =
-    enrichment.provider === "openalex"
-      ? canonical
-      : richerReferences(canonical, enrichment);
+  const references = richerReferences(canonical, enrichment);
+  const citationCount = richestCountAttribution([
+    {
+      count: canonical.citationCount,
+      provider: canonical.citationCountProvider,
+    },
+    {
+      count: enrichment.citationCount,
+      provider: enrichment.citationCountProvider,
+    },
+  ]);
   const canonicalTitle = String(canonical.title ?? "").trim();
   return {
     ...references,
@@ -331,11 +346,9 @@ function mergeEnrichment(
       canonical.authors.length > 0 ? canonical.authors : enrichment.authors,
     sourceTitle: canonical.sourceTitle ?? enrichment.sourceTitle,
     abstract: canonical.abstract ?? enrichment.abstract,
-    citationCount: canonical.citationCount ?? enrichment.citationCount,
+    citationCount: citationCount.count,
     citationCountProvider:
-      canonical.citationCount !== null
-        ? canonical.citationCountProvider
-        : enrichment.citationCountProvider,
+      citationCount.provider ?? canonical.citationCountProvider,
     fwci: canonical.fwci ?? enrichment.fwci ?? null,
     citationPercentile:
       canonical.citationPercentile ?? enrichment.citationPercentile ?? null,
@@ -390,51 +403,6 @@ async function providerLookup(
   };
 }
 
-function resultNeedsProviderEnrichment(
-  result: ProviderLookupSuccess,
-  provider: CitationProvider,
-): boolean {
-  if (!String(result.title ?? "").trim()) return true;
-  if (result.year === null || result.authors.length === 0) return true;
-  if (!String(result.sourceTitle ?? "").trim()) return true;
-  if (provider.capabilities.abstract && !result.abstract) return true;
-  if (provider.capabilities.citationCount && result.citationCount === null) {
-    return true;
-  }
-  if (provider.capabilities.referenceCount && result.referenceCount === null) {
-    return true;
-  }
-  if (provider.capabilities.referencedWorks) {
-    const resolved = Math.max(
-      result.resolvedReferenceCount,
-      result.references.length,
-    );
-    const referencesIncomplete =
-      result.referenceCount === null
-        ? resolved === 0
-        : resolved < result.referenceCount;
-    if (referencesIncomplete) return true;
-  }
-  if (provider.capabilities.openAccess && result.isOpenAccess == null) {
-    return true;
-  }
-  if (provider.capabilities.retraction && result.isRetracted == null) {
-    return true;
-  }
-  if (provider.capabilities.sourceMetrics && !result.sourceMetrics) return true;
-  if (provider.id === "semantic-scholar") {
-    return result.influentialCitationCount == null || !result.publicationType;
-  }
-  if (provider.id === "openalex") {
-    return (
-      result.fwci == null ||
-      result.citationPercentile == null ||
-      !result.citationCountsByYear?.length
-    );
-  }
-  return false;
-}
-
 async function enrichAutomaticResult(
   canonical: ProviderLookupSuccess,
   identifiers: WorkIdentifiers,
@@ -445,7 +413,6 @@ async function enrichAutomaticResult(
   for (const providerID of plan.providers) {
     if (providerID === canonical.provider) continue;
     const provider = PROVIDERS[providerID];
-    if (!resultNeedsProviderEnrichment(result, provider)) continue;
     try {
       const candidate = await providerLookup(
         provider,
@@ -520,12 +487,34 @@ export async function lookupCitationMetrics(
       };
 }
 
-function relatedWorkNeedsMetadata(work: RelatedWorkMetadata): boolean {
-  return (
+function relatedWorkNeedsMetadata(
+  work: RelatedWorkMetadata,
+  includeSecondaryMetrics = false,
+): boolean {
+  const basicMissing =
     !String(work.title ?? "").trim() ||
     work.year === null ||
     work.authors.length === 0 ||
-    !String(work.sourceTitle ?? "").trim()
+    !String(work.sourceTitle ?? "").trim();
+  if (basicMissing || !includeSecondaryMetrics) return basicMissing;
+
+  // A ghost preview can use any graph metric, so its on-demand hydration walks
+  // the provider plan while useful secondary values remain absent. Normal list
+  // hydration keeps the cheaper basic-metadata behavior.
+  return (
+    work.citationCount == null ||
+    work.referenceCount == null ||
+    work.fwci == null ||
+    work.citationPercentile == null ||
+    work.citationsLastYear == null ||
+    work.citationVelocity == null ||
+    work.citationAcceleration == null ||
+    work.influentialCitationCount == null ||
+    work.publicationType == null ||
+    work.sourceMetrics == null ||
+    work.isOpenAccess == null ||
+    work.isRetracted == null ||
+    !work.references?.length
   );
 }
 
@@ -555,6 +544,19 @@ function relatedFromLookup(result: ProviderLookupSuccess): RelatedWorkMetadata {
     abstract: result.abstract,
     citationCount: result.citationCount,
     referenceCount: result.referenceCount,
+    citationCountsByYear: result.citationCountsByYear ?? [],
+    references: result.references,
+    resolvedReferenceCount: result.resolvedReferenceCount,
+    fwci: result.fwci ?? null,
+    citationPercentile: result.citationPercentile ?? null,
+    isTop1Percent: result.isTop1Percent ?? null,
+    isTop10Percent: result.isTop10Percent ?? null,
+    citationsLastYear: result.citationsLastYear ?? null,
+    citationVelocity: result.citationVelocity ?? null,
+    citationAcceleration: result.citationAcceleration ?? null,
+    influentialCitationCount: result.influentialCitationCount ?? null,
+    publicationType: result.publicationType ?? null,
+    sourceMetrics: result.sourceMetrics ?? null,
     isOpenAccess: result.isOpenAccess ?? null,
     openAccessStatus: result.openAccessStatus ?? null,
     isRetracted: result.isRetracted ?? null,
@@ -597,11 +599,53 @@ export function mergeRelatedWorkMetadata<T extends RelatedWorkMetadata>(
     authors: work.authors.length ? work.authors : metadata.authors,
     sourceTitle: work.sourceTitle ?? metadata.sourceTitle,
     abstract: work.abstract ?? metadata.abstract,
-    citationCount: work.citationCount ?? metadata.citationCount,
-    referenceCount: work.referenceCount ?? metadata.referenceCount,
+    citationCount: maximumKnownCount([
+      work.citationCount,
+      metadata.citationCount,
+    ]),
+    referenceCount: maximumKnownCount([
+      work.referenceCount,
+      metadata.referenceCount,
+    ]),
+    citationCountsByYear: work.citationCountsByYear?.length
+      ? work.citationCountsByYear
+      : metadata.citationCountsByYear,
+    references:
+      (work.references?.length ?? 0) >= (metadata.references?.length ?? 0)
+        ? work.references
+        : metadata.references,
+    resolvedReferenceCount: maximumKnownCount([
+      work.resolvedReferenceCount,
+      metadata.resolvedReferenceCount,
+      work.references?.length,
+      metadata.references?.length,
+    ]),
+    fwci: work.fwci ?? metadata.fwci,
+    citationPercentile: work.citationPercentile ?? metadata.citationPercentile,
+    isTop1Percent: work.isTop1Percent ?? metadata.isTop1Percent,
+    isTop10Percent: work.isTop10Percent ?? metadata.isTop10Percent,
+    citationsLastYear: work.citationsLastYear ?? metadata.citationsLastYear,
+    citationVelocity: work.citationVelocity ?? metadata.citationVelocity,
+    citationAcceleration:
+      work.citationAcceleration ?? metadata.citationAcceleration,
+    influentialCitationCount:
+      work.influentialCitationCount ?? metadata.influentialCitationCount,
+    publicationType: work.publicationType ?? metadata.publicationType,
+    sourceMetrics: work.sourceMetrics ?? metadata.sourceMetrics,
+    referenceAgeMean: work.referenceAgeMean ?? metadata.referenceAgeMean,
+    referenceAgeSpread: work.referenceAgeSpread ?? metadata.referenceAgeSpread,
+    selfCitationEstimate:
+      work.selfCitationEstimate ?? metadata.selfCitationEstimate,
+    futureReferenceCount:
+      work.futureReferenceCount ?? metadata.futureReferenceCount,
+    metadataCompleteness:
+      work.metadataCompleteness ?? metadata.metadataCompleteness,
     isOpenAccess: work.isOpenAccess ?? metadata.isOpenAccess,
     openAccessStatus: work.openAccessStatus ?? metadata.openAccessStatus,
     isRetracted: work.isRetracted ?? metadata.isRetracted,
+    zoteroItemKey: work.zoteroItemKey ?? metadata.zoteroItemKey,
+    inLibraryItemKey:
+      work.inLibraryItemKey ?? metadata.inLibraryItemKey ?? null,
     dataSources: [...sources],
     updatedAt: timestamps.at(-1) ?? new Date().toISOString(),
   };
@@ -620,9 +664,11 @@ function semanticScholarIdentifier(work: RelatedWorkMetadata): string | null {
 }
 
 function openAlexIdentifier(work: RelatedWorkMetadata): string | null {
-  return work.provider === "openalex" && work.providerWorkID?.trim()
-    ? work.providerWorkID.trim()
-    : null;
+  if (work.provider === "openalex" && work.providerWorkID?.trim()) {
+    return work.providerWorkID.trim();
+  }
+  const doi = normalizeDOI(work.doi);
+  return doi ? `DOI:${doi}` : null;
 }
 
 async function runBounded<T>(
@@ -710,29 +756,51 @@ async function applyOpenAlexBatch(
   return resolved;
 }
 
+export interface RelatedWorkResolutionOptions {
+  /** Maximum non-batch lookups across all providers. Batch lookups are not
+   * counted. Use zero for latency-sensitive relationship refreshes. */
+  individualLookupLimit?: number;
+}
+
 /** Resolve incomplete external-paper records through the same user-selected
- * provider policy used by updates and relationship discovery. */
+ * provider policy used by updates and relationship discovery. Batch-capable
+ * providers run first. Per-work fallbacks are capped so a large bibliography
+ * cannot turn one refresh into hundreds or thousands of sequential requests. */
 export async function resolveRelatedWorksMetadata(
   input: RelatedWorkMetadata[],
   preference: CitationProviderPreference,
+  includeSecondaryMetrics = false,
+  options: RelatedWorkResolutionOptions = {},
 ): Promise<RelatedWorkMetadata[]> {
   const works = input.map((work) => ({ ...work, authors: [...work.authors] }));
   const plan = getProviderPlan("metadata-resolution", preference);
+  let remainingIndividualLookups = Math.max(
+    0,
+    options.individualLookupLimit ?? Number.POSITIVE_INFINITY,
+  );
 
   for (const providerID of plan.providers) {
     const unresolvedIndexes = works
       .map((work, index) => ({ work, index }))
-      .filter(({ work }) => relatedWorkNeedsMetadata(work))
+      .filter(({ work }) =>
+        relatedWorkNeedsMetadata(work, includeSecondaryMetrics),
+      )
       .map(({ index }) => index);
     if (!unresolvedIndexes.length) break;
 
     const subset = unresolvedIndexes.map((index) => works[index]);
-    let batchResolved = subset.map(() => false);
+    const batchEligible = subset.map((work) =>
+      providerID === "semantic-scholar"
+        ? Boolean(semanticScholarIdentifier(work))
+        : providerID === "openalex"
+          ? Boolean(openAlexIdentifier(work))
+          : false,
+    );
     try {
       if (providerID === "semantic-scholar") {
-        batchResolved = await applySemanticScholarBatch(subset);
+        await applySemanticScholarBatch(subset);
       } else if (providerID === "openalex") {
-        batchResolved = await applyOpenAlexBatch(subset);
+        await applyOpenAlexBatch(subset);
       }
     } catch (error) {
       Zotero.debug(
@@ -745,12 +813,19 @@ export async function resolveRelatedWorksMetadata(
       works[originalIndex] = subset[subsetIndex];
     }
 
+    if (remainingIndividualLookups <= 0) continue;
     const provider = PROVIDERS[providerID];
-    const genericCandidates = unresolvedIndexes.filter(
-      (_, subsetIndex) =>
-        !batchResolved[subsetIndex] &&
-        relatedWorkNeedsMetadata(works[unresolvedIndexes[subsetIndex]]),
-    );
+    const genericCandidates = unresolvedIndexes
+      .filter(
+        (_, subsetIndex) =>
+          !batchEligible[subsetIndex] &&
+          relatedWorkNeedsMetadata(
+            works[unresolvedIndexes[subsetIndex]],
+            includeSecondaryMetrics,
+          ),
+      )
+      .slice(0, remainingIndividualLookups);
+    remainingIndividualLookups -= genericCandidates.length;
     await runBounded(
       genericCandidates,
       METADATA_RESOLUTION_CONCURRENCY,

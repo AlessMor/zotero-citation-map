@@ -12,6 +12,11 @@ import {
   getMetricDefinition,
   metricValue,
 } from "./metricRegistry";
+import {
+  axisTicksForVisibleDomain,
+  visibleMetricDomain,
+  type GraphAxisViewport,
+} from "./graphAxisTickEnhancer";
 
 interface Position {
   x: number;
@@ -53,6 +58,8 @@ const MIN_NODE_RADIUS = 4;
 const MAX_NODE_RADIUS = 18;
 const MAX_CANVAS_DIMENSION = 8192;
 const MAX_CANVAS_PIXELS = 16_777_216;
+const COINCIDENT_NODE_GAP = 6;
+const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.max(minimum, Math.min(maximum, value));
@@ -270,53 +277,6 @@ function axisScaleForNodes(
     : linearAxisScale(values, metric, target);
 }
 
-function ticksForDomain(
-  domain: [number, number],
-  metric: GraphAxisMetric,
-  scale: GraphScaleType,
-  target: number,
-): number[] {
-  if (metric === "free") return [];
-  if (scale === "log") {
-    const candidates: number[] = [];
-    const firstExponent = Math.floor(Math.log10(domain[0]));
-    const lastExponent = Math.ceil(Math.log10(domain[1]));
-    for (
-      let exponent = firstExponent;
-      exponent <= lastExponent;
-      exponent += 1
-    ) {
-      const power = 10 ** exponent;
-      for (const multiplier of [1, 2, 5]) {
-        const value = multiplier * power;
-        if (value >= domain[0] && value <= domain[1]) candidates.push(value);
-      }
-    }
-    if (candidates.length <= target + 2) return candidates;
-    const stride = Math.max(
-      1,
-      Math.ceil(candidates.length / Math.max(2, target)),
-    );
-    const ticks = candidates.filter((_value, index) => index % stride === 0);
-    if (ticks.at(-1) !== domain[1]) ticks.push(domain[1]);
-    return ticks;
-  }
-  const integer = getMetricDefinition(metric).valueType === "integer";
-  const step = niceStep(domain[1] - domain[0], target, integer);
-  const ticks: number[] = [];
-  for (
-    let value = Math.ceil(domain[0] / step) * step;
-    value <= domain[1] + step * 1e-8;
-    value += step
-  ) {
-    ticks.push(Number(value.toPrecision(12)));
-    if (ticks.length > 60) break;
-  }
-  if (!ticks.length || ticks[0] > domain[0]) ticks.unshift(domain[0]);
-  if (ticks.at(-1)! < domain[1]) ticks.push(domain[1]);
-  return ticks;
-}
-
 export class CitationGraphRenderer {
   private readonly canvas: HTMLCanvasElement;
   private readonly context: CanvasRenderingContext2D;
@@ -411,6 +371,16 @@ export class CitationGraphRenderer {
     );
   }
 
+  private axisViewport(): GraphAxisViewport {
+    const rect = this.canvas.getBoundingClientRect();
+    return {
+      canvasWidth: this.canvas.width,
+      canvasHeight: this.canvas.height,
+      canvasCssWidth: rect.width,
+      transform: this.transform,
+    };
+  }
+
   private axisScale(
     nodes: CitationGraphNode[],
     axis: "x" | "y",
@@ -418,17 +388,23 @@ export class CitationGraphRenderer {
     const metric = axis === "x" ? this.layout.xMetric : this.layout.yMetric;
     const scale = axis === "x" ? this.layout.xScale : this.layout.yScale;
     const base = axisScaleForNodes(nodes, metric, scale, 6);
-    return base
-      ? {
-          domain: base.domain,
-          ticks: ticksForDomain(
-            base.domain,
-            metric,
-            scale,
-            this.axisTickTarget(axis),
-          ),
-        }
-      : null;
+    if (!base) return null;
+    if (metric === "free") return base;
+    const visibleDomain = visibleMetricDomain(
+      this.axisViewport(),
+      axis,
+      base.domain,
+      scale,
+    );
+    return {
+      domain: base.domain,
+      ticks: axisTicksForVisibleDomain(
+        visibleDomain,
+        metric,
+        scale,
+        this.axisTickTarget(axis),
+      ),
+    };
   }
 
   private scheduleInitialFit(): void {
@@ -583,6 +559,91 @@ export class CitationGraphRenderer {
                 1,
               ) *
                 (PLOT_BOTTOM - PLOT_TOP);
+      }
+    }
+
+    if (this.layout.xMetric !== "free" && this.layout.yMetric !== "free") {
+      this.spreadCoincidentNodes(nodes);
+    }
+  }
+
+  private spreadCoincidentNodes(nodes: CitationGraphNode[]): void {
+    const groups = new Map<string, CitationGraphNode[]>();
+    for (const node of nodes) {
+      const xValue = metricNumber(node, this.layout.xMetric);
+      const yValue = metricNumber(node, this.layout.yMetric);
+      const groupKey = `${xValue ?? "missing"}\u001f${yValue ?? "missing"}`;
+      const group = groups.get(groupKey);
+      if (group) group.push(node);
+      else groups.set(groupKey, [node]);
+    }
+
+    const sizeDomain =
+      this.layout.nodeSizeMetric === "uniform"
+        ? null
+        : metricExtent(nodes, this.layout.nodeSizeMetric);
+
+    for (const group of groups.values()) {
+      if (group.length < 2) continue;
+      group.sort((left, right) => left.key.localeCompare(right.key));
+
+      const anchor = this.positions.get(group[0].key);
+      if (!anchor) continue;
+      const anchorX = anchor.x;
+      const anchorY = anchor.y;
+
+      const maximumRadius = Math.max(
+        ...group.map((node) => this.nodeRadius(node, sizeDomain)),
+      );
+      const spacing = maximumRadius * 2 + COINCIDENT_NODE_GAP;
+      const rotation = ((hash(group[0].key) % 360) * Math.PI) / 180;
+      const offsets = group.map((_node, index) => {
+        const angle = rotation + index * GOLDEN_ANGLE;
+        const radius = spacing * 0.68 * Math.sqrt(index + 0.5);
+        return {
+          x: Math.cos(angle) * radius,
+          y: Math.sin(angle) * radius,
+        };
+      });
+
+      const meanX =
+        offsets.reduce((sum, offset) => sum + offset.x, 0) / offsets.length;
+      const meanY =
+        offsets.reduce((sum, offset) => sum + offset.y, 0) / offsets.length;
+      for (const offset of offsets) {
+        offset.x -= meanX;
+        offset.y -= meanY;
+      }
+
+      const minimumX = Math.min(...offsets.map((offset) => offset.x));
+      const maximumX = Math.max(...offsets.map((offset) => offset.x));
+      const minimumY = Math.min(...offsets.map((offset) => offset.y));
+      const maximumY = Math.max(...offsets.map((offset) => offset.y));
+      let shiftX = 0;
+      let shiftY = 0;
+
+      if (maximumX - minimumX <= PLOT_RIGHT - PLOT_LEFT) {
+        if (anchorX + minimumX < PLOT_LEFT) {
+          shiftX = PLOT_LEFT - anchorX - minimumX;
+        }
+        if (anchorX + maximumX + shiftX > PLOT_RIGHT) {
+          shiftX += PLOT_RIGHT - anchorX - maximumX - shiftX;
+        }
+      }
+      if (maximumY - minimumY <= PLOT_BOTTOM - PLOT_TOP) {
+        if (anchorY + minimumY < PLOT_TOP) {
+          shiftY = PLOT_TOP - anchorY - minimumY;
+        }
+        if (anchorY + maximumY + shiftY > PLOT_BOTTOM) {
+          shiftY += PLOT_BOTTOM - anchorY - maximumY - shiftY;
+        }
+      }
+
+      for (const [index, node] of group.entries()) {
+        const position = this.positions.get(node.key);
+        if (!position) continue;
+        position.x = anchorX + offsets[index].x + shiftX;
+        position.y = anchorY + offsets[index].y + shiftY;
       }
     }
   }
