@@ -3,47 +3,50 @@ import type {
   CitationProviderPreference,
   CitationUpdateBatchResult,
   ProviderLookupFailure,
+  ProviderLookupResult,
+  ProviderLookupSuccess,
+  WorkIdentifiers,
 } from "../domain/citationTypes";
-import type { CitationGraphNode } from "../domain/graphTypes";
-import { getProviderPlan, lookupCitationMetrics } from "../providers/registry";
 import {
   cancelPendingCitationRequests,
   isCitationRequestCancellationRequested,
   resetCitationRequestCancellation,
 } from "../providers/http";
-import { extractWorkIdentifiers } from "./citationIdentifiers";
+import { enrichCitationMetricRecords } from "./batchEnrichmentService";
+import { completeLibraryItemUpdates } from "./libraryItemCompletionService";
 import {
-  getCitationMetricRecord,
   saveCitationMetricFailure,
   saveCitationMetricRecord,
-  shouldRefreshCitationMetrics,
 } from "./citationMetricsStore";
 import {
   getAutomaticUpdatesEnabled,
-  getCacheDays,
+  getCheckStaleOnStartupEnabled,
+  getDebugLoggingEnabled,
   getExactTitleFallbackEnabled,
   getProviderLabel,
   getProviderPreference,
+  getUpdateModifiedItemsEnabled,
   getUpdateNewItemsEnabled,
 } from "./citationPreferences";
-import {
-  refreshExternalRelationships,
-  storeExternalRelationshipSnapshot,
-  type ExternalWork,
-} from "./externalDiscoveryService";
+import { storeExternalRelationshipSnapshot } from "./externalDiscoveryService";
 import {
   maximumKnownCount,
   richestCountAttribution,
 } from "./citationCountPolicy";
 import { refreshCitationColumns } from "./itemTreeColumnService";
-import {
-  getStoredRelationshipEntry,
-  mergeRelatedWorkLists,
-} from "./relationshipStoreService";
+import { mergeRelatedWorkLists } from "./relationshipStoreService";
 import { createMetricNodeForItem } from "./itemMetricContext";
+import {
+  resolveLibraryCoreLookups,
+  type ProviderIdentityHints,
+} from "./libraryCoreBatchService";
 import { refreshCitationItemPanes } from "./itemPaneService";
-import { ensureSourceMetricsForNodes } from "./sourceMetricsService";
 import { refreshOpenCitationMapViews } from "./windowService";
+import {
+  createCitationUpdatePlan,
+  regularCitationItems,
+  type PlannedCitationItem,
+} from "./updatePlanner";
 import {
   closeAllUpdateProgress,
   createUpdateProgress,
@@ -56,9 +59,8 @@ interface UpdateOptions {
   silent?: boolean;
   provider?: CitationProviderPreference;
   /**
-   * Retained for API compatibility. General field-update actions never hydrate
-   * complete cited-by/reference lists; relationship views provide their own
-   * explicit refresh controls.
+   * Retained for API compatibility. Every successful Zotero-item update now
+   * completes both relationship directions and their compact paper summaries.
    */
   includeRelationships?: boolean;
   /** Document in which the modeless progress window should be shown. */
@@ -67,9 +69,11 @@ interface UpdateOptions {
 
 type UpdateOutcome = "updated" | "cached" | "failed" | "skipped";
 
-const ITEM_UPDATE_CONCURRENCY = 2;
-const BATCH_ITEM_DEADLINE_MS = 45000;
-const SINGLE_ITEM_DEADLINE_MS = 120000;
+interface CoreUpdateResult {
+  outcome: UpdateOutcome;
+  record: CitationMetricRecord | null;
+}
+
 const VIEW_REFRESH_DEADLINE_MS = 5000;
 const SHUTDOWN_WAIT_TIMEOUT_MS = 5000;
 
@@ -80,7 +84,6 @@ let startupTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingTimer: ReturnType<typeof setTimeout> | null = null;
 let shuttingDown = false;
 const pendingItemIDs = new Set<number>();
-const initialRelationshipDiscoveryKeys = new Set<string>();
 
 function backgroundError(context: string, error: unknown): Error {
   if (error instanceof Error) return error;
@@ -170,9 +173,7 @@ function refreshViewsAfterUpdate(refreshGraph: boolean): void {
 }
 
 function regularItems(items: Zotero.Item[]): Zotero.Item[] {
-  return items.filter(
-    (item) => Boolean(item) && item.isRegularItem?.() && !item.deleted,
-  );
+  return regularCitationItems(items);
 }
 
 async function wholeLibraryItems(): Promise<Zotero.Item[]> {
@@ -180,18 +181,6 @@ async function wholeLibraryItems(): Promise<Zotero.Item[]> {
     (await Zotero.Items.getAll(
       Zotero.Libraries.userLibraryID,
     )) as Zotero.Item[],
-  );
-}
-
-function itemNeedsRefresh(
-  item: Zotero.Item,
-  provider: CitationProviderPreference,
-): boolean {
-  return shouldRefreshCitationMetrics(
-    Number(item.libraryID),
-    String(item.key),
-    provider,
-    getCacheDays(),
   );
 }
 
@@ -206,11 +195,11 @@ function createProgress(
     message:
       `Preparing ${total} paper${total === 1 ? "" : "s"} with ` +
       getProviderLabel(provider),
-    total,
+    total: Math.max(1, total),
   });
 }
 
-function updateProgress(
+function updateCoreProgress(
   progress: UpdateProgressHandle | null,
   completed: number,
   started: number,
@@ -221,8 +210,8 @@ function updateProgress(
   const active = Math.max(0, started - completed);
   progress.setProgress(
     completed,
-    total,
-    `Updating ${completed}/${total} complete${
+    Math.max(1, total),
+    `Resolving core data · ${completed}/${total} complete${
       active ? ` · ${active} active` : ""
     }: ${title}`,
   );
@@ -231,11 +220,12 @@ function updateProgress(
 function finishProgress(
   progress: UpdateProgressHandle | null,
   result: CitationUpdateBatchResult,
+  enrichmentText = "",
 ): void {
   if (!progress || shuttingDown) return;
   progress.finish(
     `${result.updated} updated · ${result.cached} current · ` +
-      `${result.failed} failed · ${result.skipped} skipped`,
+      `${result.failed} failed · ${result.skipped} skipped${enrichmentText}`,
   );
 }
 
@@ -272,96 +262,12 @@ function nonEmptyYearCounts<T>(
   return current?.length ? current : (previous ?? []);
 }
 
-function relationshipDiscoveryKey(node: CitationGraphNode): string {
-  return `${node.itemID}:${node.itemKey.toLocaleUpperCase()}`;
-}
-
-function scheduleInitialRelationshipDiscovery(
-  node: CitationGraphNode,
-  needsReferences: boolean,
-  needsCitedBy: boolean,
-): void {
-  if (!needsReferences && !needsCitedBy) return;
-  const key = relationshipDiscoveryKey(node);
-  if (initialRelationshipDiscoveryKeys.has(key)) return;
-  initialRelationshipDiscoveryKeys.add(key);
-  runBackgroundUpdate(
-    `initial relationship discovery for ${node.itemKey}`,
-    (async (): Promise<void> => {
-      try {
-        const libraryNodes = [node];
-        const discoveries: Array<Promise<ExternalWork[]>> = [];
-        if (needsReferences) {
-          discoveries.push(
-            refreshExternalRelationships(node, libraryNodes, "references"),
-          );
-        }
-        if (needsCitedBy) {
-          discoveries.push(
-            refreshExternalRelationships(node, libraryNodes, "cited-by"),
-          );
-        }
-        const outcomes = await Promise.allSettled(discoveries);
-        if (!shuttingDown) refreshViewsAfterUpdate(true);
-        const failure = outcomes.find(
-          (outcome): outcome is PromiseRejectedResult =>
-            outcome.status === "rejected",
-        );
-        if (failure) throw failure.reason;
-      } finally {
-        initialRelationshipDiscoveryKeys.delete(key);
-      }
-    })(),
-  );
-}
-
-async function updateOneItem(
+function buildMetricRecord(
   item: Zotero.Item,
-  preference: CitationProviderPreference,
-  force: boolean,
-  includeRelationships: boolean,
-): Promise<UpdateOutcome> {
-  if (shuttingDown || isCitationRequestCancellationRequested()) {
-    return "skipped";
-  }
-  const libraryID = Number(item.libraryID);
-  const itemKey = String(item.key);
-  if (!force && !itemNeedsRefresh(item, preference)) return "cached";
-
-  const previous = getCitationMetricRecord(libraryID, itemKey);
-  const extracted = extractWorkIdentifiers(item);
-  // A user-confirmed fallback match may supply a DOI that is intentionally
-  // kept in Citation Map's private cache rather than written into the Zotero
-  // item. Reuse it for future refreshes.
-  const identifiers = {
-    ...extracted,
-    doi: extracted.doi ?? (previous?.matchConfirmed ? previous.doi : null),
-  };
-  // Every explicit or automatic field update attempts the full scalar-field
-  // enrichment path. First-time relationship retrieval then runs through the
-  // same paginated cache pipeline as the relationship views.
-  const result = await lookupCitationMetrics(
-    preference,
-    identifiers,
-    getExactTitleFallbackEnabled(),
-    true,
-  );
-  if (shuttingDown || isCitationRequestCancellationRequested()) {
-    return "skipped";
-  }
-  if (result.status !== "success") {
-    await saveCitationMetricFailure(
-      libraryID,
-      itemKey,
-      result.provider,
-      result.status,
-      result.message,
-      nextRetryAt(result, previous?.failureCount ?? 0),
-      result.candidates ?? [],
-    );
-    return "failed";
-  }
-
+  previous: CitationMetricRecord | null,
+  identifiers: WorkIdentifiers,
+  result: ProviderLookupSuccess,
+): CitationMetricRecord {
   const now = new Date().toISOString();
   const sameConfirmedIdentity = Boolean(
     previous?.matchConfirmed &&
@@ -405,9 +311,9 @@ async function updateOneItem(
     },
   ]);
 
-  const record: CitationMetricRecord = {
-    libraryID,
-    itemKey,
+  return {
+    libraryID: Number(item.libraryID),
+    itemKey: String(item.key),
     provider: result.provider,
     providerWorkID: result.providerWorkID ?? previous?.providerWorkID ?? null,
     matchedBy: result.matchedBy ?? previous?.matchedBy ?? null,
@@ -475,126 +381,197 @@ async function updateOneItem(
     failureCount: 0,
     nextRetryAt: null,
   };
+}
+
+async function persistOneItemCore(
+  planned: PlannedCitationItem,
+  lookup: ProviderLookupResult,
+): Promise<CoreUpdateResult> {
+  const { item, libraryID, itemKey, previous, identifiers } = planned;
+  if (!planned.needsCoreRefresh && previous?.status === "success") {
+    return { outcome: "updated", record: previous };
+  }
+  if (shuttingDown || isCitationRequestCancellationRequested()) {
+    return { outcome: "skipped", record: null };
+  }
+  if (lookup.status !== "success") {
+    await saveCitationMetricFailure(
+      libraryID,
+      itemKey,
+      lookup.provider,
+      lookup.status,
+      lookup.message,
+      nextRetryAt(lookup, previous?.failureCount ?? 0),
+      lookup.candidates ?? [],
+    );
+    return { outcome: "failed", record: null };
+  }
+
+  const record = buildMetricRecord(item, previous, identifiers, lookup);
   await saveCitationMetricRecord(record);
 
   try {
-    const updatedNode = createMetricNodeForItem(item);
-    const needsReferences = !getStoredRelationshipEntry(
-      updatedNode,
-      "references",
-    );
-    const needsCitedBy = !getStoredRelationshipEntry(updatedNode, "cited-by");
+    const node = createMetricNodeForItem(item);
     await storeExternalRelationshipSnapshot(
-      updatedNode,
+      node,
       "references",
       record.references,
       {
-        provider: result.provider,
-        reportedCount: result.referenceCount,
+        provider: lookup.provider,
+        reportedCount: lookup.referenceCount,
       },
     );
-    if (includeRelationships) {
-      scheduleInitialRelationshipDiscovery(
-        updatedNode,
-        needsReferences,
-        needsCitedBy,
-      );
-    }
-    if (getProviderPlan("source-metrics", preference).providers.length) {
-      await ensureSourceMetricsForNodes([updatedNode]);
-    }
   } catch (error) {
     Zotero.debug(
-      "Citation Map: post-update enrichment failed for " +
-        `${itemKey}: ${String(error)}`,
+      `Citation Map: post-core update processing failed for ${itemKey}: ${String(error)}`,
     );
   }
-  return "updated";
+
+  return { outcome: "updated", record };
 }
 
 async function runUpdate(
   items: Zotero.Item[],
   options: UpdateOptions = {},
 ): Promise<CitationUpdateBatchResult> {
-  const selected = regularItems(items);
+  const operationStartedAt = Date.now();
   const provider = options.provider ?? getProviderPreference();
   const force = Boolean(options.force);
-  const includeRelationships = options.includeRelationships === true;
+  const plan = createCitationUpdatePlan(items, provider, force);
+  const { items: selected, pending } = plan;
   const result: CitationUpdateBatchResult = {
     total: selected.length,
     updated: 0,
-    cached: 0,
+    cached: plan.cached,
     failed: 0,
     skipped: 0,
   };
 
   if (shuttingDown || isCitationRequestCancellationRequested()) {
     result.skipped = selected.length;
+    result.cached = 0;
     return result;
   }
 
-  const pending = force
-    ? selected
-    : selected.filter((item) => itemNeedsRefresh(item, provider));
-  result.cached = selected.length - pending.length;
+  if (!pending.length) return result;
+
   const progress = options.silent
     ? null
     : createProgress(pending.length, provider, options.progressDocument);
 
-  let nextIndex = 0;
-  let started = 0;
+  const updatedRecords: CitationMetricRecord[] = [];
+  const providerIdentitiesByItemKey = new Map<string, ProviderIdentityHints>();
   let completed = 0;
-  const worker = async (): Promise<void> => {
-    while (!shuttingDown && !isCitationRequestCancellationRequested()) {
-      const index = nextIndex;
-      nextIndex += 1;
-      if (index >= pending.length) return;
-      const item = pending[index];
-      started += 1;
-      updateProgress(
+
+  let enrichmentText = "";
+  let enrichmentDurationMs = 0;
+  let enrichedCount = 0;
+  let failedBatches = 0;
+  let sourceMetricsUpdated = 0;
+  let sourceMetricsUnresolved = 0;
+  let relationshipListsUpdated = 0;
+  let relationshipFailures = 0;
+  let completionDurationMs = 0;
+  let coreCompletedAt = operationStartedAt;
+  try {
+    const coreBatch = await resolveLibraryCoreLookups(
+      pending,
+      provider,
+      getExactTitleFallbackEnabled(),
+      ({ completed: resolved, total, message }) => {
+        progress?.setProgress(resolved, Math.max(1, total), message);
+      },
+    );
+    for (const [index, planned] of pending.entries()) {
+      if (shuttingDown || isCitationRequestCancellationRequested()) break;
+      const title = String(planned.item.getField("title") ?? "Untitled");
+      updateCoreProgress(
         progress,
         completed,
-        started,
+        completed + 1,
         pending.length,
-        String(item.getField("title") ?? "Untitled"),
+        title,
       );
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      let outcome: UpdateOutcome;
+      let core: CoreUpdateResult;
       try {
-        const deadline =
-          pending.length === 1
-            ? SINGLE_ITEM_DEADLINE_MS
-            : BATCH_ITEM_DEADLINE_MS;
-        outcome = await withDeadline(
-          updateOneItem(item, provider, force, includeRelationships),
-          deadline,
-          `Field update for ${String(item.getField("title") ?? item.key)}`,
-        );
+        core = await persistOneItemCore(planned, coreBatch.lookups[index]);
       } catch (error) {
         Zotero.logError(
           error instanceof Error ? error : new Error(String(error)),
         );
-        outcome = shuttingDown ? "skipped" : "failed";
+        core = {
+          outcome: shuttingDown ? "skipped" : "failed",
+          record: null,
+        };
       }
-      result[outcome] += 1;
+      result[core.outcome] += 1;
+      if (core.record) updatedRecords.push(core.record);
+      const hints = coreBatch.providerIdentitiesByItemKey.get(planned.itemKey);
+      if (hints) providerIdentitiesByItemKey.set(planned.itemKey, hints);
       completed += 1;
-      updateProgress(
-        progress,
-        completed,
-        started,
-        pending.length,
-        String(item.getField("title") ?? "Untitled"),
-      );
+      updateCoreProgress(progress, completed, completed, pending.length, title);
+      if (completed % 25 === 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
     }
-  };
+    coreCompletedAt = Date.now();
 
-  try {
-    await Promise.all(
-      Array.from(
-        { length: Math.min(ITEM_UPDATE_CONCURRENCY, pending.length) },
-        () => worker(),
-      ),
-    );
+    if (
+      updatedRecords.length &&
+      !shuttingDown &&
+      !isCitationRequestCancellationRequested()
+    ) {
+      // Publish core values while the complete library-item update continues, so
+      // columns and item panes remain responsive during a large update.
+      refreshViewsAfterUpdate(false);
+      const enrichmentStartedAt = Date.now();
+      const enrichment = await enrichCitationMetricRecords(
+        updatedRecords,
+        ({ completed: enriched, total, activeBatches, message }) => {
+          progress?.setProgress(
+            enriched,
+            Math.max(1, total),
+            `${message}${activeBatches ? ` · ${activeBatches} provider batch${activeBatches === 1 ? "" : "es"} active` : ""}`,
+          );
+        },
+      );
+      enrichmentDurationMs = Date.now() - enrichmentStartedAt;
+      enrichedCount = enrichment.enriched;
+      failedBatches = enrichment.failedBatches;
+      for (const [itemKey, hints] of enrichment.providerIdentitiesByItemKey) {
+        providerIdentitiesByItemKey.set(itemKey, {
+          ...(providerIdentitiesByItemKey.get(itemKey) ?? {}),
+          ...hints,
+        });
+      }
+
+      const completionStartedAt = Date.now();
+      const completion = await completeLibraryItemUpdates(
+        pending.map((entry) => entry.item),
+        enrichment.records,
+        ({ completed: phaseCompleted, total, message }) => {
+          progress?.setProgress(phaseCompleted, Math.max(1, total), message);
+        },
+        {
+          force,
+          providerIdentitiesByItemKey,
+        },
+      );
+      completionDurationMs = Date.now() - completionStartedAt;
+      sourceMetricsUpdated = completion.sourceMetricsUpdated;
+      sourceMetricsUnresolved = completion.sourceMetricsUnresolved;
+      relationshipListsUpdated = completion.relationshipListsUpdated;
+      relationshipFailures = completion.relationshipFailures;
+      enrichmentText =
+        ` · ${enrichment.enriched} metric record${enrichment.enriched === 1 ? "" : "s"} completed` +
+        ` · ${completion.relationshipListsUpdated} relationship list${completion.relationshipListsUpdated === 1 ? "" : "s"} updated` +
+        (completion.sourceMetricsUnresolved
+          ? ` · ${completion.sourceMetricsUnresolved} journal metric${completion.sourceMetricsUnresolved === 1 ? "" : "s"} unavailable`
+          : "") +
+        (enrichment.failedBatches || completion.relationshipFailures
+          ? ` · ${enrichment.failedBatches + completion.relationshipFailures} warning${enrichment.failedBatches + completion.relationshipFailures === 1 ? "" : "s"}`
+          : "");
+    }
   } finally {
     const accounted =
       result.updated + result.cached + result.failed + result.skipped;
@@ -603,8 +580,31 @@ async function runUpdate(
     }
 
     if (!shuttingDown && !isCitationRequestCancellationRequested()) {
-      finishProgress(progress, result);
+      finishProgress(progress, result, enrichmentText);
       refreshViewsAfterUpdate(selected.length <= 3);
+      if (getDebugLoggingEnabled()) {
+        Zotero.debug(
+          "Citation Map: batched update completed " +
+            JSON.stringify({
+              items: selected.length,
+              pending: pending.length,
+              updated: result.updated,
+              cached: result.cached,
+              failed: result.failed,
+              executionPolicy: "provider-specific",
+              coreMs: coreCompletedAt - operationStartedAt,
+              enrichmentMs: enrichmentDurationMs,
+              completionMs: completionDurationMs,
+              enriched: enrichedCount,
+              sourceMetricsUpdated,
+              sourceMetricsUnresolved,
+              relationshipListsUpdated,
+              relationshipFailures,
+              failedBatches,
+              totalMs: Date.now() - operationStartedAt,
+            }),
+        );
+      }
     } else {
       progress?.dismiss();
     }
@@ -658,12 +658,13 @@ function schedulePendingItems(): void {
     if (items.length) {
       runBackgroundUpdate(
         "automatic update for modified items",
-        updateCitationDataForItems(items, { silent: true }),
+        updateCitationDataForItems(items, { silent: false }),
       );
     }
   }, 1200);
 }
 
+/** Compatibility registration path. Normal startup uses the visible wrapper. */
 export function registerAutomaticCitationUpdates(): void {
   shuttingDown = false;
   resetCitationRequestCancellation();
@@ -674,13 +675,9 @@ export function registerAutomaticCitationUpdates(): void {
       type: string,
       ids: Array<number | string>,
     ): Promise<void> => {
-      if (
-        type !== "item" ||
-        !getAutomaticUpdatesEnabled() ||
-        (event === "add" && !getUpdateNewItemsEnabled())
-      ) {
-        return;
-      }
+      if (type !== "item" || !getAutomaticUpdatesEnabled()) return;
+      if (event === "add" && !getUpdateNewItemsEnabled()) return;
+      if (event === "modify" && !getUpdateModifiedItemsEnabled()) return;
       if (event !== "add" && event !== "modify") return;
       for (const id of ids) pendingItemIDs.add(Number(id));
       schedulePendingItems();
@@ -691,12 +688,12 @@ export function registerAutomaticCitationUpdates(): void {
     ["item"],
     "citation-map-updates",
   );
-  if (getAutomaticUpdatesEnabled()) {
+  if (getAutomaticUpdatesEnabled() && getCheckStaleOnStartupEnabled()) {
     startupTimer = setTimeout(() => {
       startupTimer = null;
       runBackgroundUpdate(
         "startup stale-item refresh",
-        updateWholeLibraryCitationData({ silent: true }),
+        updateWholeLibraryCitationData({ silent: false }),
       );
     }, 30000);
   }

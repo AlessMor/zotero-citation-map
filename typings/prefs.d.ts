@@ -8,9 +8,20 @@ declare namespace _ZoteroTypes {
   interface Prefs {
     PluginPrefsMap: {
       "provider": string;
+      "providerSelectionVersion": number;
+      "providerAutomatic": boolean;
+      "providerCrossrefEnabled": boolean;
+      "providerSemanticScholarEnabled": boolean;
+      "providerOpenCitationsEnabled": boolean;
+      "providerInspireEnabled": boolean;
+      "providerOpenAlexEnabled": boolean;
       "openAlexAPIKey": string;
+      "semanticScholarAPIKey": string;
+      "showMetricTooltips": boolean;
       "automaticUpdates": boolean;
       "updateNewItems": boolean;
+      "updateModifiedItems": boolean;
+      "checkStaleOnStartup": boolean;
       "cacheDays": number;
       "exactTitleFallback": boolean;
       "localRelations": boolean;

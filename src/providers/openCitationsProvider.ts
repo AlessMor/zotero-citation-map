@@ -8,8 +8,7 @@ import { requestJSON } from "./http";
 import type { CitationProvider } from "./types";
 import { failureStatusFromHTTP, numberOrNull, stringOrNull } from "./types";
 
-const BACKGROUND_REFERENCE_LIMIT = 200;
-const MAX_RELATION_RESULTS = 200;
+const MAX_RELATION_RESULTS = 2500;
 
 interface OCMetadata {
   doi?: string;
@@ -108,11 +107,7 @@ export const openCitationsProvider: CitationProvider = {
         message: response.message || "OpenCitations did not return a work.",
       };
     }
-    const references = await fetchLinks(
-      identifiers.doi,
-      "references",
-      BACKGROUND_REFERENCE_LIMIT,
-    );
+    const references: RelatedWorkMetadata[] = [];
     const year = Number(metadata.year);
     return {
       status: "success",

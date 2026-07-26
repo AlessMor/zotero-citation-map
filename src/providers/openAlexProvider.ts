@@ -18,8 +18,9 @@ import { failureStatusFromHTTP, numberOrNull, stringOrNull } from "./types";
 const OPENALEX_BASE_URL = "https://api.openalex.org";
 const OPENALEX_MAX_PER_PAGE = 100;
 const BACKGROUND_REFERENCE_LIMIT = 200;
-const ON_DEMAND_REFERENCE_LIMIT = 25;
+const ON_DEMAND_REFERENCE_LIMIT = 100;
 const sourceMetricsCache = new Map<string, SourceMetrics | null>();
+const workByIDCache = new Map<string, Promise<OpenAlexWork | null>>();
 
 interface OpenAlexAuthor {
   author?: { id?: string; display_name?: string; orcid?: string | null };
@@ -179,10 +180,14 @@ function toRelated(work: OpenAlexWork): RelatedWorkMetadata | null {
 async function fetchWorkByID(id: string): Promise<OpenAlexWork | null> {
   const normalizedID = shortID(id);
   if (!normalizedID) return null;
-  const response = await requestOpenAlex<OpenAlexWork>(
+  const key = normalizedID.toLocaleUpperCase();
+  const existing = workByIDCache.get(key);
+  if (existing) return existing;
+  const request = requestOpenAlex<OpenAlexWork>(
     `/works/${encodeURIComponent(normalizedID)}`,
-  );
-  return response.ok && response.data ? response.data : null;
+  ).then((response) => (response.ok && response.data ? response.data : null));
+  workByIDCache.set(key, request);
+  return request;
 }
 
 interface OpenAlexBatchIdentifier {
@@ -551,6 +556,7 @@ export async function fetchOpenAlexRelatedWorks(
 
 export function clearOpenAlexProviderCache(): void {
   sourceMetricsCache.clear();
+  workByIDCache.clear();
 }
 
 export const openAlexProvider: CitationProvider = {
@@ -647,16 +653,18 @@ export const openAlexProvider: CitationProvider = {
   fetchReferencedWorks: async (id, maximum, offset = 0) => {
     const work = await fetchWorkByID(id);
     if (!work) return [];
-    const ids = (work.referenced_works ?? []).slice(
-      offset,
-      offset + Math.min(ON_DEMAND_REFERENCE_LIMIT, maximum),
-    );
-    const results: RelatedWorkMetadata[] = [];
-    for (const target of ids) {
-      const related = toRelated((await fetchWorkByID(target)) ?? {});
-      if (related) results.push(related);
-    }
-    return results;
+    return (work.referenced_works ?? [])
+      .slice(offset, offset + Math.min(ON_DEMAND_REFERENCE_LIMIT, maximum))
+      .map(shortID)
+      .filter((target): target is string => Boolean(target))
+      .map((target) => ({
+        provider: "openalex" as const,
+        providerWorkID: target,
+        doi: null,
+        title: null,
+        year: null,
+        authors: [],
+      }));
   },
   fetchSourceMetrics: async (id) => sourceMetrics({ id }),
 };

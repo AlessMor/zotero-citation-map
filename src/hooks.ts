@@ -11,7 +11,7 @@ import {
   registerAutomaticCitationUpdates,
   unregisterAutomaticCitationUpdates,
   waitForCitationUpdates,
-} from "./services/citationUpdateService";
+} from "./services/visibleAutomaticUpdateService";
 import {
   installCitationColumnTooltips,
   registerCitationColumns,
@@ -22,6 +22,7 @@ import {
   registerCitationItemPane,
   unregisterCitationItemPane,
 } from "./services/itemPaneService";
+import { getShowMetricTooltipsEnabled } from "./services/citationPreferences";
 import { registerMenus, unregisterMenus } from "./services/menuService";
 import {
   registerCitationMapPreferencePane,
@@ -52,6 +53,23 @@ function installStyles(win: _ZoteroTypes.MainWindow): void {
     link.setAttribute("rel", "stylesheet");
     link.setAttribute("href", href);
     win.document.documentElement.appendChild(link);
+  }
+}
+
+function syncMetricTooltipVisibility(win: _ZoteroTypes.MainWindow): void {
+  const document = win.document;
+  document.documentElement.dataset.citationMapTooltips =
+    getShowMetricTooltipsEnabled() ? "enabled" : "disabled";
+  const styleID = `${config.addonRef}-tooltip-visibility-style`;
+  if (!document.getElementById(styleID)) {
+    const style = document.createElementNS(
+      "http://www.w3.org/1999/xhtml",
+      "style",
+    );
+    style.id = styleID;
+    style.textContent =
+      '[data-citation-map-tooltips="disabled"] #citation-map-central-tooltip { display: none !important; }';
+    document.documentElement.appendChild(style);
   }
 }
 
@@ -113,6 +131,7 @@ async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
   }
   win.MozXULElement.insertFTLIfNeeded(`${config.addonRef}-mainWindow.ftl`);
   installStyles(win);
+  syncMetricTooltipVisibility(win);
   installCitationColumnTooltips(win);
   const runtime = win as any;
   if (!runtime[TEARDOWN_MARKER]) {

@@ -32,6 +32,7 @@ import {
   SEMANTIC_SCHOLAR_BATCH_LIMIT,
   semanticScholarProvider,
 } from "./semanticScholarProvider";
+import { relationshipAdapterFor } from "./relationshipAdapters";
 import type { CitationProvider } from "./types";
 
 const PROVIDERS: Record<CitationProviderID, CitationProvider> = {
@@ -116,7 +117,7 @@ const AUTOMATIC_PROVIDER_ORDERS: Record<
 
 const sessionUnavailableProviders = new Set<CitationProviderID>();
 const SEMANTIC_SCHOLAR_RESOLUTION_BATCH_SIZE = Math.min(
-  100,
+  relationshipAdapterFor("semantic-scholar").metadataBatchSize,
   SEMANTIC_SCHOLAR_BATCH_LIMIT,
 );
 const METADATA_RESOLUTION_CONCURRENCY = 2;
@@ -259,65 +260,34 @@ function recordProviderFailure(
   }
 }
 
-function referenceIdentity(work: RelatedWorkMetadata): string {
-  const doi = normalizeDOI(work.doi);
-  if (doi) return `doi:${doi}`;
-  const title = normalizeExactTitle(work.title);
-  if (title) return `title:${title}:year:${work.year ?? "unknown"}`;
-  const providerWorkID = String(work.providerWorkID ?? "").trim();
-  if (providerWorkID) {
-    return `${work.provider}:${providerWorkID.toLocaleLowerCase()}`;
-  }
-  return `${work.provider}:unknown:${JSON.stringify([
-    work.authors.slice(0, 2),
-    work.year,
-    work.sourceTitle ?? null,
-  ])}`;
-}
-
-function mergeReferenceLists(
-  ...groups: RelatedWorkMetadata[][]
-): RelatedWorkMetadata[] {
-  const merged = new Map<string, RelatedWorkMetadata>();
-  for (const group of groups) {
-    for (const work of group) {
-      const key = referenceIdentity(work);
-      const previous = merged.get(key);
-      merged.set(
-        key,
-        previous ? mergeRelatedWorkMetadata(previous, work) : { ...work },
-      );
-    }
-  }
-  return [...merged.values()];
-}
-
 function richerReferences(
   left: ProviderLookupSuccess,
   right: ProviderLookupSuccess,
 ): ProviderLookupSuccess {
-  const references = mergeReferenceLists(left.references, right.references);
-  const leftCount = left.referenceCount ?? left.resolvedReferenceCount;
-  const rightCount = right.referenceCount ?? right.resolvedReferenceCount;
-  const richest = richestCountAttribution([
-    { count: leftCount, provider: left.referenceCountProvider },
-    { count: rightCount, provider: right.referenceCountProvider },
-    {
-      count: references.length,
-      provider: left.referenceCountProvider ?? right.referenceCountProvider,
-    },
-  ]);
+  const leftResolved =
+    maximumKnownCount([left.resolvedReferenceCount, left.references.length]) ??
+    0;
+  const rightResolved =
+    maximumKnownCount([
+      right.resolvedReferenceCount,
+      right.references.length,
+    ]) ?? 0;
+  const selected = rightResolved > leftResolved ? right : left;
+  const leftHasReportedCount = left.referenceCount !== null;
   return {
     ...left,
-    referenceCount: richest.count,
-    referenceCountProvider: richest.provider ?? left.referenceCountProvider,
+    referenceCount: leftHasReportedCount
+      ? left.referenceCount
+      : right.referenceCount,
+    referenceCountProvider: leftHasReportedCount
+      ? left.referenceCountProvider
+      : right.referenceCountProvider,
     resolvedReferenceCount:
       maximumKnownCount([
-        left.resolvedReferenceCount,
-        right.resolvedReferenceCount,
-        references.length,
+        selected.resolvedReferenceCount,
+        selected.references.length,
       ]) ?? 0,
-    references,
+    references: selected.references,
   };
 }
 
@@ -410,25 +380,36 @@ async function enrichAutomaticResult(
 ): Promise<ProviderLookupSuccess> {
   let result = canonical;
   const plan = getProviderPlan("field-enrichment", "auto");
-  for (const providerID of plan.providers) {
-    if (providerID === canonical.provider) continue;
-    const provider = PROVIDERS[providerID];
-    try {
-      const candidate = await providerLookup(
-        provider,
-        identifiers,
-        allowTitleFallback,
-      );
-      if (candidate.status === "success") {
-        result = mergeEnrichment(result, candidate);
-      } else {
-        recordProviderFailure("auto", candidate);
-      }
-    } catch (error) {
-      Zotero.debug(
-        "Citation Map: optional " +
-          `${provider.label} enrichment failed: ${String(error)}`,
-      );
+  const enrichments = await Promise.all(
+    plan.providers
+      .filter((providerID) => providerID !== canonical.provider)
+      .map(async (providerID) => {
+        const provider = PROVIDERS[providerID];
+        try {
+          return {
+            provider,
+            candidate: await providerLookup(
+              provider,
+              identifiers,
+              allowTitleFallback,
+            ),
+          };
+        } catch (error) {
+          Zotero.debug(
+            "Citation Map: optional " +
+              `${provider.label} enrichment failed: ${String(error)}`,
+          );
+          return null;
+        }
+      }),
+  );
+  // Merge in provider-plan order so concurrent execution remains deterministic.
+  for (const enrichment of enrichments) {
+    if (!enrichment) continue;
+    if (enrichment.candidate.status === "success") {
+      result = mergeEnrichment(result, enrichment.candidate);
+    } else {
+      recordProviderFailure("auto", enrichment.candidate);
     }
   }
   return result;

@@ -1,5 +1,5 @@
 import type { RelatedWorkMetadata } from "../domain/citationTypes";
-import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
+import { externalWorkCacheIdentity, normalizeDOI } from "./citationIdentifiers";
 
 export interface ExternalWorkCacheEntry {
   identityKey: string;
@@ -96,10 +96,10 @@ function parseRelationshipWorks(
 }
 
 function relationshipIdentity(work: RelatedWorkMetadata): string {
-  const localKey = work.zoteroItemKey?.trim();
+  const sharedIdentity = externalWorkCacheIdentity(work);
+  if (sharedIdentity) return sharedIdentity;
+  const localKey = (work.inLibraryItemKey ?? work.zoteroItemKey)?.trim();
   if (localKey) return `zotero:${localKey.toLocaleUpperCase()}`;
-  const doi = normalizeDOI(work.doi);
-  if (doi) return `doi:${doi}`;
   const pmid = String(work.pmid ?? "")
     .trim()
     .toLocaleLowerCase();
@@ -112,19 +112,163 @@ function relationshipIdentity(work: RelatedWorkMetadata): string {
     .replace(/[-\s]/g, "")
     .toLocaleLowerCase();
   if (isbn) return `isbn:${isbn}`;
-  if (work.providerWorkID?.trim()) {
-    return `${work.provider}:${work.providerWorkID.trim().toLocaleLowerCase()}`;
-  }
-  const title = normalizeExactTitle(work.title);
-  if (title) return `title:${title}:year:${work.year ?? "unknown"}`;
   return `${work.provider}:unknown:${JSON.stringify([work.authors.slice(0, 2), work.year])}`;
+}
+
+function cloneWork(work: RelatedWorkMetadata): RelatedWorkMetadata {
+  return {
+    ...work,
+    authors: [...work.authors],
+    authorIDs: [...(work.authorIDs ?? [])],
+    citationCountsByYear: [...(work.citationCountsByYear ?? [])],
+    references: work.references?.map((reference) => cloneWork(reference)),
+    dataSources: [...(work.dataSources ?? [])],
+  };
+}
+
+function nonEmptyArray<T>(
+  incoming: T[] | null | undefined,
+  existing: T[] | null | undefined,
+): T[] | undefined {
+  if (incoming?.length) return [...incoming];
+  if (existing?.length) return [...existing];
+  return incoming ?? existing ?? undefined;
+}
+
+function mergeCachedMetadata(
+  existing: RelatedWorkMetadata | null | undefined,
+  incoming: RelatedWorkMetadata,
+): RelatedWorkMetadata {
+  if (!existing) return cloneWork(incoming);
+  const incomingTitle = String(incoming.title ?? "").trim();
+  const incomingSource = String(incoming.sourceTitle ?? "").trim();
+  const incomingAbstract = String(incoming.abstract ?? "").trim();
+  const incomingReferences = incoming.references ?? [];
+  const existingReferences = existing.references ?? [];
+  const references =
+    incomingReferences.length >= existingReferences.length
+      ? incomingReferences
+      : existingReferences;
+  return {
+    ...existing,
+    ...incoming,
+    providerWorkID: incoming.providerWorkID ?? existing.providerWorkID,
+    doi: incoming.doi ?? existing.doi,
+    pmid: incoming.pmid ?? existing.pmid,
+    arxiv: incoming.arxiv ?? existing.arxiv,
+    isbn: incoming.isbn ?? existing.isbn,
+    title: incomingTitle ? incoming.title : existing.title,
+    year: incoming.year ?? existing.year,
+    authors: incoming.authors.length
+      ? [...incoming.authors]
+      : [...existing.authors],
+    authorIDs: [
+      ...new Set([
+        ...(existing.authorIDs ?? []),
+        ...(incoming.authorIDs ?? []),
+      ]),
+    ],
+    sourceTitle: incomingSource ? incoming.sourceTitle : existing.sourceTitle,
+    abstract: incomingAbstract ? incoming.abstract : existing.abstract,
+    citationCount: incoming.citationCount ?? existing.citationCount,
+    referenceCount: incoming.referenceCount ?? existing.referenceCount,
+    citationCountsByYear: nonEmptyArray(
+      incoming.citationCountsByYear,
+      existing.citationCountsByYear,
+    ),
+    references: references.map((reference) => cloneWork(reference)),
+    resolvedReferenceCount:
+      incoming.resolvedReferenceCount ?? existing.resolvedReferenceCount,
+    fwci: incoming.fwci ?? existing.fwci,
+    citationPercentile:
+      incoming.citationPercentile ?? existing.citationPercentile,
+    isTop1Percent: incoming.isTop1Percent ?? existing.isTop1Percent,
+    isTop10Percent: incoming.isTop10Percent ?? existing.isTop10Percent,
+    citationsLastYear: incoming.citationsLastYear ?? existing.citationsLastYear,
+    citationVelocity: incoming.citationVelocity ?? existing.citationVelocity,
+    citationAcceleration:
+      incoming.citationAcceleration ?? existing.citationAcceleration,
+    influentialCitationCount:
+      incoming.influentialCitationCount ?? existing.influentialCitationCount,
+    publicationType: incoming.publicationType ?? existing.publicationType,
+    sourceMetrics: incoming.sourceMetrics ?? existing.sourceMetrics,
+    referenceAgeMean: incoming.referenceAgeMean ?? existing.referenceAgeMean,
+    referenceAgeSpread:
+      incoming.referenceAgeSpread ?? existing.referenceAgeSpread,
+    selfCitationEstimate:
+      incoming.selfCitationEstimate ?? existing.selfCitationEstimate,
+    futureReferenceCount:
+      incoming.futureReferenceCount ?? existing.futureReferenceCount,
+    metadataCompleteness:
+      incoming.metadataCompleteness ?? existing.metadataCompleteness,
+    isOpenAccess: incoming.isOpenAccess ?? existing.isOpenAccess,
+    openAccessStatus: incoming.openAccessStatus ?? existing.openAccessStatus,
+    isRetracted: incoming.isRetracted ?? existing.isRetracted,
+    zoteroItemKey: incoming.zoteroItemKey ?? existing.zoteroItemKey,
+    inLibraryItemKey:
+      incoming.inLibraryItemKey ?? existing.inLibraryItemKey ?? null,
+    dataSources: [
+      ...new Set([
+        ...(existing.dataSources ?? []),
+        ...(incoming.dataSources ?? []),
+      ]),
+    ],
+    updatedAt: incoming.updatedAt ?? existing.updatedAt,
+  };
+}
+
+/**
+ * Relationship rows store only the edge identity and a small fallback label.
+ * Complete metadata lives once in external_works and is joined in memory.
+ */
+function compactRelationshipWork(
+  work: RelatedWorkMetadata,
+): RelatedWorkMetadata {
+  return {
+    provider: work.provider,
+    providerWorkID: work.providerWorkID,
+    doi: normalizeDOI(work.doi),
+    pmid: work.pmid ?? null,
+    arxiv: work.arxiv ?? null,
+    isbn: work.isbn ?? null,
+    title: work.title,
+    year: work.year,
+    authors: work.authors.slice(0, 2),
+    zoteroItemKey: work.zoteroItemKey ?? null,
+    inLibraryItemKey: work.inLibraryItemKey ?? null,
+    dataSources: [...(work.dataSources ?? [])],
+    updatedAt: work.updatedAt ?? null,
+  };
+}
+
+function hydrateRelationshipWork(
+  compact: RelatedWorkMetadata,
+): RelatedWorkMetadata {
+  const cached = mirror.get(relationshipIdentity(compact));
+  const metadata = cached?.status === "success" ? cached.metadata : null;
+  if (!metadata) return cloneWork(compact);
+  const merged = mergeCachedMetadata(compact, metadata);
+  return {
+    ...merged,
+    provider: compact.provider,
+    providerWorkID: compact.providerWorkID ?? merged.providerWorkID,
+    dataSources: [
+      ...new Set([
+        ...(compact.dataSources ?? []),
+        ...(merged.dataSources ?? []),
+      ]),
+    ],
+  };
 }
 
 function deduplicateRelationshipWorks(
   works: RelatedWorkMetadata[],
 ): RelatedWorkMetadata[] {
   const unique = new Map<string, RelatedWorkMetadata>();
-  for (const work of works) unique.set(relationshipIdentity(work), { ...work });
+  for (const work of works) {
+    const key = relationshipIdentity(work);
+    unique.set(key, mergeCachedMetadata(unique.get(key), work));
+  }
   return [...unique.values()];
 }
 
@@ -229,30 +373,63 @@ export function getExternalRelationshipCacheEntry(
 ): ExternalRelationshipCacheEntry | null {
   const entry = relationshipMirror.get(relationshipKey);
   return entry
-    ? { ...entry, works: entry.works.map((work) => ({ ...work })) }
+    ? {
+        ...entry,
+        works: entry.works.map((work) => hydrateRelationshipWork(work)),
+      }
     : null;
 }
 
-/** Replace one complete relationship snapshot atomically. */
+/**
+ * Replace one complete relationship snapshot atomically. Full neighbour
+ * metadata is upserted once by identity; the relationship JSON stores only
+ * compact membership records.
+ */
 export async function saveExternalRelationshipCache(
   relationshipKey: string,
   works: RelatedWorkMetadata[],
 ): Promise<void> {
   if (!(await ensureExternalWorkCache())) return;
   const fetchedAt = new Date().toISOString();
-  const storedWorks = deduplicateRelationshipWorks(works);
+  const completeWorks = deduplicateRelationshipWorks(works);
+  const metadataByIdentity = new Map<string, RelatedWorkMetadata>();
+  for (const work of completeWorks) {
+    const identityKey = relationshipIdentity(work);
+    const previous = mirror.get(identityKey)?.metadata;
+    const metadata = mergeCachedMetadata(previous, work);
+    metadataByIdentity.set(identityKey, metadata);
+    mirror.set(identityKey, {
+      identityKey,
+      status: "success",
+      metadata,
+      fetchedAt,
+      nextRetryAt: null,
+    });
+  }
+  const storedWorks = completeWorks.map(compactRelationshipWork);
   relationshipMirror.set(relationshipKey, {
     relationshipKey,
     works: storedWorks,
     fetchedAt,
   });
   await queueWrite(async () => {
-    await requireDB().queryAsync(
-      `INSERT OR REPLACE INTO external_relationships
-       (relationship_key, works_json, fetched_at)
-       VALUES (?, ?, ?)`,
-      [relationshipKey, JSON.stringify(storedWorks), fetchedAt],
-    );
+    const connection = requireDB();
+    await connection.executeTransaction(async () => {
+      for (const [identityKey, metadata] of metadataByIdentity) {
+        await connection.queryAsync(
+          `INSERT OR REPLACE INTO external_works
+           (identity_key, status, metadata_json, fetched_at, next_retry_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [identityKey, "success", JSON.stringify(metadata), fetchedAt, null],
+        );
+      }
+      await connection.queryAsync(
+        `INSERT OR REPLACE INTO external_relationships
+         (relationship_key, works_json, fetched_at)
+         VALUES (?, ?, ?)`,
+        [relationshipKey, JSON.stringify(storedWorks), fetchedAt],
+      );
+    });
   });
 }
 
@@ -297,7 +474,13 @@ export async function saveExternalWorkCacheSuccesses(
   if (entries.length === 0 || !(await ensureExternalWorkCache())) return;
   const fetchedAt = new Date().toISOString();
   const unique = new Map<string, RelatedWorkMetadata>();
-  for (const entry of entries) unique.set(entry.identityKey, entry.metadata);
+  for (const entry of entries) {
+    const previous = mirror.get(entry.identityKey)?.metadata;
+    unique.set(
+      entry.identityKey,
+      mergeCachedMetadata(previous, entry.metadata),
+    );
+  }
   for (const [key, value] of unique) {
     mirror.set(key, {
       identityKey: key,

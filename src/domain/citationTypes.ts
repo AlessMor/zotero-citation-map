@@ -38,6 +38,19 @@ export interface SourceMetrics {
   hIndex: number | null;
   i10Index: number | null;
   updatedAt: string | null;
+  /** Complete-library update policy that attempted these source metrics. */
+  libraryUpdateVersion?: number;
+  /** Independently refreshed parts of a complete Zotero-library update. */
+  libraryUpdateState?: {
+    coreUpdatedAt?: string | null;
+    sourceMetricsUpdatedAt?: string | null;
+    referencesUpdatedAt?: string | null;
+    citedByUpdatedAt?: string | null;
+    referencesComplete?: boolean;
+    citedByComplete?: boolean;
+    /** Provider work IDs discovered during batched enrichment and reused by relationship refreshes. */
+    providerWorkIDs?: Partial<Record<CitationProviderID, string>>;
+  };
 }
 
 export interface RelatedWorkMetadata {

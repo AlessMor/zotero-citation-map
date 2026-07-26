@@ -1,4 +1,5 @@
 import { config } from "../../package.json";
+import { resetCitationRequestCancellation } from "../providers/http";
 import {
   updateCitationDataForItems,
   updateWholeLibraryCitationData,
@@ -32,6 +33,10 @@ function report(error: unknown): void {
   Zotero.logError(error instanceof Error ? error : new Error(String(error)));
 }
 
+function beginManualUpdate(): void {
+  resetCitationRequestCancellation();
+}
+
 export function registerMenus(): void {
   if (registeredMenuIDs.length) return;
   register({
@@ -54,12 +59,14 @@ export function registerMenus(): void {
             menuType: "menuitem",
             l10nID: `${config.addonRef}-update-library-command`,
             icon: ICON,
-            onCommand: () =>
+            onCommand: () => {
+              beginManualUpdate();
               void updateWholeLibraryCitationData({
                 force: true,
                 silent: false,
                 includeRelationships: false,
-              }).catch(report),
+              }).catch(report);
+            },
           },
         ],
       },
@@ -82,6 +89,7 @@ export function registerMenus(): void {
         onCommand: (_event: Event, context: any) => {
           const items = selectedRegularItems(context);
           if (items.length) {
+            beginManualUpdate();
             void updateCitationDataForItems(items, {
               force: true,
               silent: false,

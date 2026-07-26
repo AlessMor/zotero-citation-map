@@ -1,43 +1,60 @@
-pref-data-heading = Citation data
-pref-data-description = Configure how Citation Map retrieves and refreshes citation and reference information.
-
-pref-provider = Citation data provider
-pref-provider-auto =
-    .label = Automatic (recommended)
-pref-provider-openalex =
-    .label = OpenAlex
-pref-provider-semantic-scholar =
-    .label = Semantic Scholar
-pref-provider-crossref =
-    .label = Crossref
-pref-provider-opencitations =
-    .label = OpenCitations
-pref-provider-inspire =
-    .label = INSPIRE-HEP
-
-pref-provider-help = A specific provider is used exclusively for field updates, relationships, Similar, and title resolution. Automatic mode combines providers by capability: Crossref is preferred for the canonical record, Semantic Scholar for relationship metadata, and other providers for missing fields. OpenAlex is used only when an API key is configured. Complete cited-by and reference lists are refreshed separately in their relationship views.
-pref-openalex-api-key = OpenAlex API key
-pref-openalex-api-key-help = Required for OpenAlex requests. The key is stored only in Zotero preferences and is sent to api.openalex.org as the api_key query parameter.
-
-pref-automatic-updates =
-    .label = Update citation data automatically
-pref-update-new-items =
-    .label = Update newly added items automatically
-pref-cache-days = Refresh data after this many days
-pref-refresh-all = Update fields for whole library
-
-pref-advanced-heading = Advanced
-pref-title-fallback =
-    .label = Match items by exact title when no identifier is available
-pref-local-relations =
-    .label = Include Zotero related-item links
-pref-note-extraction =
-    .label = Extract citation relations from notes
-pref-pdf-extraction =
-    .label = Extract citation relations from PDFs
+pref-general-heading = General Settings
+pref-show-metric-tooltips =
+    .label = Show metric explanations and data provenance on hover
+pref-show-metric-tooltips-help = Displays definitions, interpretation, sources, and update information for Citation Map metrics and values.
 pref-debug =
-    .label = Enable diagnostic logging
-pref-advanced-help = Note and PDF extraction are experimental and may produce incomplete relations.
+    .label = Enable debug logging
+pref-general-actions-help = Update all citation data in the current library, or remove all provider metrics, relationship snapshots, and externally retrieved metadata. Zotero items and manually created relationships are not deleted.
+
+pref-field-update-heading = Field Update
+pref-update-behaviour-heading = Update Behaviour
+pref-automatic-updates =
+    .label = Automatically update citation data
+pref-update-new-items =
+    .label = Update newly added entries
+pref-update-modified-items =
+    .label = Update modified entries
+pref-check-stale-startup =
+    .label = Check for stale entries when Zotero starts
+
+pref-refresh-interval-heading = Refresh Interval
+pref-cache-days = Refresh citation data after this many days
+pref-cache-days-help = Entries older than this interval are considered stale and can be refreshed automatically.
+
+
+pref-update-all-heading = Update all entries now
+pref-update-all-help = Refreshes citation fields for every regular item in the current Zotero library. The update remains visible and can be minimized or cancelled.
+pref-refresh-all = Update all entries now
+
+pref-clear-cache-heading = Clear cached citation data
+pref-clear-cache-help = Removes stored provider metrics, relationship snapshots, and externally retrieved metadata. Zotero items and manually created relationships are not deleted.
 pref-clear-cache = Clear all cached data
 
+pref-providers-heading = Citation Data Providers
+pref-selected-providers-heading = Selected Providers
+pref-provider-all = Automatic (combine all providers)
+pref-provider-crossref = Crossref
+pref-provider-semantic-scholar = Semantic Scholar
+pref-provider-opencitations = OpenCitations
+pref-provider-inspire = INSPIRE-HEP
+pref-provider-openalex = OpenAlex
+pref-provider-selection-help = Provider choices apply to new requests. Existing cached values remain available until they are refreshed or the cache is cleared.
+
+pref-openalex-api-key = API key — required
+pref-openalex-api-key-help = Required to use OpenAlex. The key is stored only in Zotero preferences and is sent to api.openalex.org.
+pref-openalex-create-key = Create a free key in your OpenAlex account.
+pref-semantic-scholar-api-key = API key — optional
+pref-semantic-scholar-api-key-help = Optional but recommended for more reliable access. Without a key, Semantic Scholar requests use shared public rate limits.
+
+pref-matching-heading = Matching
+pref-title-fallback =
+    .label = Allow exact-title matching when no stable identifier is available
+pref-title-fallback-help = Used only when no DOI, PMID, arXiv ID, ISBN, or other stable identifier is available. Matches with contradictory metadata are rejected.
+
 pref-reference-count-note = The References column shows the provider's declared bibliography total. The plugin separately stores the structured references it can resolve for network construction, which can be fewer than the references printed in the paper.
+
+# Plain-text variants used by HTML labels in the preference pane.
+pref-automatic-updates-text = Automatically update citation data
+pref-update-new-items-text = Update newly added entries
+pref-update-modified-items-text = Update modified entries
+pref-check-stale-startup-text = Check for stale entries when Zotero starts

@@ -112,9 +112,14 @@ export function calculateSelfCitationEstimate(
 }
 
 export function calculateFutureReferenceCount(
-  _record: CitationMetricRecord,
+  record: CitationMetricRecord,
 ): number | null {
-  return null;
+  if (record.year === null || !sufficientCoverage(record)) return null;
+  const comparableYears = record.references
+    .map((reference) => reference.year)
+    .filter((year): year is number => year !== null && Number.isFinite(year));
+  if (comparableYears.length < MIN_USABLE_REFERENCES) return null;
+  return comparableYears.filter((year) => year > record.year!).length;
 }
 
 function build(libraryID: number): Map<string, CitationDerivedAnalytics> {
@@ -151,7 +156,7 @@ function build(libraryID: number): Map<string, CitationDerivedAnalytics> {
       referenceAgeMean: age.mean,
       referenceAgeSpread: age.spread,
       selfCitationEstimate: calculateSelfCitationEstimate(record),
-      futureReferenceCount: null,
+      futureReferenceCount: calculateFutureReferenceCount(record),
     });
   }
   return result;

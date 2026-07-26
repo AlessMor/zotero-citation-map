@@ -50,7 +50,7 @@ interface S2RecommendationResponse {
 }
 
 const BACKGROUND_REFERENCE_LIMIT = 200;
-const MAX_RELATION_PAGE_SIZE = 200;
+const MAX_RELATION_PAGE_SIZE = 1000;
 const MAX_RECOMMENDATIONS = 500;
 export const SEMANTIC_SCHOLAR_BATCH_LIMIT = 500;
 
@@ -68,6 +68,21 @@ const BASIC_FIELDS = [
   "influentialCitationCount",
   "isOpenAccess",
   "openAccessPdf",
+  "publicationTypes",
+].join(",");
+
+const RELATIONSHIP_FIELDS = [
+  "paperId",
+  "externalIds",
+  "title",
+  "year",
+  "authors",
+  "venue",
+  "publicationVenue",
+  "citationCount",
+  "referenceCount",
+  "influentialCitationCount",
+  "isOpenAccess",
   "publicationTypes",
 ].join(",");
 
@@ -143,7 +158,7 @@ async function fetchRelations(
 ): Promise<RelatedWorkMetadata[]> {
   const response = await requestJSON<S2RelationResponse>(
     "semantic-scholar",
-    `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(paperID)}/${kind}?offset=${Math.max(0, offset)}&limit=${Math.min(MAX_RELATION_PAGE_SIZE, maximum)}&fields=${encodeURIComponent(BASIC_FIELDS)}`,
+    `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(paperID)}/${kind}?offset=${Math.max(0, offset)}&limit=${Math.min(MAX_RELATION_PAGE_SIZE, maximum)}&fields=${encodeURIComponent(RELATIONSHIP_FIELDS)}`,
   );
   if (!response.ok || !response.data) return [];
   return (response.data.data ?? [])
@@ -161,7 +176,7 @@ async function successFromPaper(
   paper: S2Paper,
   matchedBy: "doi" | "pmid" | "arxiv" | "isbn" | "title",
   confidence: number,
-  includeReferences = true,
+  includeReferences = false,
 ): Promise<ProviderLookupSuccess> {
   const related = toRelated(paper);
   const paperID = String(paper.paperId ?? "");
@@ -254,7 +269,7 @@ async function lookupPaper(
 async function lookup(
   identifiers: WorkIdentifiers,
 ): Promise<ProviderLookupResult> {
-  return lookupPaper(identifiers, true);
+  return lookupPaper(identifiers, false);
 }
 
 async function lookupForRelations(

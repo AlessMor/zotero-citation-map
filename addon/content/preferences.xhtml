@@ -6,66 +6,86 @@
   />
 </linkset>
 
-<groupbox class="citation-map-preferences">
-  <label><html:h2 data-l10n-id="pref-data-heading"></html:h2></label>
-  <description data-l10n-id="pref-data-description" />
-  <hbox class="citation-map-pref-row" align="center">
-    <html:label
-      for="zotero-prefpane-citationmap-provider"
-      data-l10n-id="pref-provider"
-    ></html:label>
-    <menulist
-      id="zotero-prefpane-citationmap-provider"
-      preference="provider"
-      native="true"
-    >
-      <menupopup>
-        <menuitem value="auto" data-l10n-id="pref-provider-auto" />
-        <menuitem value="crossref" data-l10n-id="pref-provider-crossref" />
-        <menuitem
-          value="semantic-scholar"
-          data-l10n-id="pref-provider-semantic-scholar"
-        />
-        <menuitem
-          value="opencitations"
-          data-l10n-id="pref-provider-opencitations"
-        />
-        <menuitem value="inspire" data-l10n-id="pref-provider-inspire" />
-        <menuitem value="openalex" data-l10n-id="pref-provider-openalex" />
-      </menupopup>
-    </menulist>
-  </hbox>
+<groupbox class="citation-map-preferences citation-map-settings-section">
+  <label><html:h2 data-l10n-id="pref-general-heading"></html:h2></label>
+  <checkbox
+    id="zotero-prefpane-citationmap-show-metric-tooltips"
+    preference="showMetricTooltips"
+    data-l10n-id="pref-show-metric-tooltips"
+  />
   <description
     class="citation-map-pref-help"
-    data-l10n-id="pref-provider-help"
+    data-l10n-id="pref-show-metric-tooltips-help"
   />
-  <hbox class="citation-map-pref-row" align="center">
-    <html:label
-      for="zotero-prefpane-citationmap-openalex-api-key"
-      data-l10n-id="pref-openalex-api-key"
-    ></html:label>
+  <checkbox
+    id="zotero-prefpane-citationmap-debug"
+    preference="debugLogging"
+    data-l10n-id="pref-debug"
+  />
+
+  <description
+    class="citation-map-pref-help citation-map-pref-help-unindented citation-map-general-actions-help"
+    data-l10n-id="pref-general-actions-help"
+  />
+  <hbox class="citation-map-pref-actions citation-map-general-actions">
+    <html:button
+      class="citation-map-primary-button"
+      type="button"
+      data-l10n-id="pref-refresh-all"
+      onclick="Zotero.CitationMap.api.refreshAll()"
+    ></html:button>
+    <html:button
+      class="citation-map-danger-button"
+      type="button"
+      data-l10n-id="pref-clear-cache"
+      onclick="Zotero.CitationMap.api.clearAllCachedData()"
+    ></html:button>
+  </hbox>
+</groupbox>
+
+<groupbox class="citation-map-preferences citation-map-settings-section">
+  <label><html:h2 data-l10n-id="pref-field-update-heading"></html:h2></label>
+
+  <html:h3 data-l10n-id="pref-update-behaviour-heading"></html:h3>
+  <html:label class="citation-map-parent-option">
     <html:input
-      id="zotero-prefpane-citationmap-openalex-api-key"
-      type="password"
-      preference="openAlexAPIKey"
-      autocomplete="off"
-      spellcheck="false"
+      id="zotero-prefpane-citationmap-automatic-updates"
+      type="checkbox"
+      checked="checked"
     />
-  </hbox>
-  <description
-    class="citation-map-pref-help"
-    data-l10n-id="pref-openalex-api-key-help"
-  />
-  <checkbox
-    id="zotero-prefpane-citationmap-automatic-updates"
-    preference="automaticUpdates"
-    data-l10n-id="pref-automatic-updates"
-  />
-  <checkbox
-    id="zotero-prefpane-citationmap-update-new-items"
-    preference="updateNewItems"
-    data-l10n-id="pref-update-new-items"
-  />
+    <html:span data-l10n-id="pref-automatic-updates-text"></html:span>
+  </html:label>
+  <vbox class="citation-map-pref-children">
+    <html:label class="citation-map-child-option">
+      <html:input
+        id="zotero-prefpane-citationmap-update-new-items"
+        type="checkbox"
+        checked="checked"
+        data-update-pref="updateNewItems"
+      />
+      <html:span data-l10n-id="pref-update-new-items-text"></html:span>
+    </html:label>
+    <html:label class="citation-map-child-option">
+      <html:input
+        id="zotero-prefpane-citationmap-update-modified-items"
+        type="checkbox"
+        checked="checked"
+        data-update-pref="updateModifiedItems"
+      />
+      <html:span data-l10n-id="pref-update-modified-items-text"></html:span>
+    </html:label>
+    <html:label class="citation-map-child-option">
+      <html:input
+        id="zotero-prefpane-citationmap-check-stale-startup"
+        type="checkbox"
+        checked="checked"
+        data-update-pref="checkStaleOnStartup"
+      />
+      <html:span data-l10n-id="pref-check-stale-startup-text"></html:span>
+    </html:label>
+  </vbox>
+
+  <html:h3 data-l10n-id="pref-refresh-interval-heading"></html:h3>
   <hbox class="citation-map-pref-row" align="center">
     <html:label
       for="zotero-prefpane-citationmap-cache-days"
@@ -80,54 +100,158 @@
       preference="cacheDays"
     />
   </hbox>
-  <hbox class="citation-map-pref-actions">
-    <html:button
-      type="button"
-      data-l10n-id="pref-refresh-all"
-      onclick="Zotero.CitationMap.api.refreshAll()"
-    ></html:button>
-  </hbox>
+  <description
+    class="citation-map-pref-help citation-map-pref-help-unindented"
+    data-l10n-id="pref-cache-days-help"
+  />
 </groupbox>
 
-<html:details class="citation-map-advanced">
-  <html:summary data-l10n-id="pref-advanced-heading"></html:summary>
-  <groupbox class="citation-map-preferences">
-    <checkbox
-      id="zotero-prefpane-citationmap-title-fallback"
-      preference="exactTitleFallback"
-      data-l10n-id="pref-title-fallback"
-    />
-    <checkbox
-      id="zotero-prefpane-citationmap-local-relations"
-      preference="localRelations"
-      data-l10n-id="pref-local-relations"
-    />
-    <checkbox
-      id="zotero-prefpane-citationmap-note-extraction"
-      preference="noteExtraction"
-      data-l10n-id="pref-note-extraction"
-    />
-    <checkbox
-      id="zotero-prefpane-citationmap-pdf-extraction"
-      preference="pdfExtraction"
-      data-l10n-id="pref-pdf-extraction"
-    />
-    <checkbox
-      id="zotero-prefpane-citationmap-debug"
-      preference="debugLogging"
-      data-l10n-id="pref-debug"
-    />
+<groupbox class="citation-map-preferences citation-map-settings-section">
+  <label><html:h2 data-l10n-id="pref-providers-heading"></html:h2></label>
+
+  <html:h3 data-l10n-id="pref-selected-providers-heading"></html:h3>
+  <html:div class="citation-map-provider-list">
+    <html:label class="citation-map-provider-option citation-map-provider-all">
+      <html:input
+        id="zotero-prefpane-citationmap-provider-all"
+        type="checkbox"
+        checked="checked"
+      />
+      <html:span data-l10n-id="pref-provider-all"></html:span>
+    </html:label>
+
+    <html:div class="citation-map-provider-children">
+      <html:div class="citation-map-provider-entry">
+        <html:label class="citation-map-provider-option">
+          <html:input
+            id="zotero-prefpane-citationmap-provider-crossref"
+            type="checkbox"
+            checked="checked"
+            data-provider-pref="providerCrossrefEnabled"
+          />
+          <html:span data-l10n-id="pref-provider-crossref"></html:span>
+        </html:label>
+      </html:div>
+
+      <html:div
+        class="citation-map-provider-entry citation-map-provider-entry-with-key"
+      >
+        <html:label class="citation-map-provider-option">
+          <html:input
+            id="zotero-prefpane-citationmap-provider-semantic-scholar"
+            type="checkbox"
+            checked="checked"
+            data-provider-pref="providerSemanticScholarEnabled"
+          />
+          <html:span data-l10n-id="pref-provider-semantic-scholar"></html:span>
+        </html:label>
+        <html:div class="citation-map-provider-credential-row">
+          <html:label
+            class="citation-map-provider-key-label"
+            for="zotero-prefpane-citationmap-semantic-scholar-api-key"
+            data-l10n-id="pref-semantic-scholar-api-key"
+          ></html:label>
+          <html:input
+            class="citation-map-provider-key-input"
+            id="zotero-prefpane-citationmap-semantic-scholar-api-key"
+            type="password"
+            preference="semanticScholarAPIKey"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </html:div>
+        <description
+          class="citation-map-pref-help citation-map-provider-key-help"
+          data-l10n-id="pref-semantic-scholar-api-key-help"
+        />
+      </html:div>
+
+      <html:div class="citation-map-provider-entry">
+        <html:label class="citation-map-provider-option">
+          <html:input
+            id="zotero-prefpane-citationmap-provider-opencitations"
+            type="checkbox"
+            checked="checked"
+            data-provider-pref="providerOpenCitationsEnabled"
+          />
+          <html:span data-l10n-id="pref-provider-opencitations"></html:span>
+        </html:label>
+      </html:div>
+
+      <html:div class="citation-map-provider-entry">
+        <html:label class="citation-map-provider-option">
+          <html:input
+            id="zotero-prefpane-citationmap-provider-inspire"
+            type="checkbox"
+            checked="checked"
+            data-provider-pref="providerInspireEnabled"
+          />
+          <html:span data-l10n-id="pref-provider-inspire"></html:span>
+        </html:label>
+      </html:div>
+
+      <html:div
+        class="citation-map-provider-entry citation-map-provider-entry-with-key"
+      >
+        <html:label class="citation-map-provider-option">
+          <html:input
+            id="zotero-prefpane-citationmap-provider-openalex"
+            type="checkbox"
+            checked="checked"
+            data-provider-pref="providerOpenAlexEnabled"
+          />
+          <html:span data-l10n-id="pref-provider-openalex"></html:span>
+        </html:label>
+        <html:div class="citation-map-provider-credential-row">
+          <html:label
+            class="citation-map-provider-key-label"
+            for="zotero-prefpane-citationmap-openalex-api-key"
+            data-l10n-id="pref-openalex-api-key"
+          ></html:label>
+          <html:input
+            class="citation-map-provider-key-input"
+            id="zotero-prefpane-citationmap-openalex-api-key"
+            type="password"
+            preference="openAlexAPIKey"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </html:div>
+        <description
+          class="citation-map-pref-help citation-map-provider-key-help"
+        >
+          <html:span data-l10n-id="pref-openalex-api-key-help"></html:span>
+          <html:span>&#160;</html:span>
+          <html:a
+            href="https://openalex.org/"
+            data-l10n-id="pref-openalex-create-key"
+            onclick="
+              event.preventDefault();
+              Zotero.CitationMap.api.openOpenAlexAccount();
+            "
+          ></html:a>
+        </description>
+      </html:div>
+    </html:div>
+
+    <html:div
+      id="zotero-prefpane-citationmap-provider-status"
+      class="citation-map-pref-help citation-map-provider-status"
+    ></html:div>
     <description
-      class="citation-map-pref-help"
-      data-l10n-id="pref-advanced-help"
+      class="citation-map-pref-help citation-map-provider-status"
+      data-l10n-id="pref-provider-selection-help"
     />
-    <hbox class="citation-map-pref-actions">
-      <html:button
-        class="citation-map-danger-button"
-        type="button"
-        data-l10n-id="pref-clear-cache"
-        onclick="Zotero.CitationMap.api.clearAllCachedData()"
-      ></html:button>
-    </hbox>
-  </groupbox>
-</html:details>
+  </html:div>
+
+  <html:h3 data-l10n-id="pref-matching-heading"></html:h3>
+  <checkbox
+    id="zotero-prefpane-citationmap-title-fallback"
+    preference="exactTitleFallback"
+    data-l10n-id="pref-title-fallback"
+  />
+  <description
+    class="citation-map-pref-help"
+    data-l10n-id="pref-title-fallback-help"
+  />
+</groupbox>

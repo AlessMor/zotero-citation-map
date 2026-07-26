@@ -2,14 +2,12 @@ import type {
   CitationProviderID,
   RelatedWorkMetadata,
 } from "../domain/citationTypes";
-import { getProviderPlan } from "../providers/registry";
 import {
   externalWorkCacheIdentity,
   normalizeIdentifier,
   normalizeExactTitle,
   relatedWorkStableAliases,
 } from "./citationIdentifiers";
-import { getProviderPreference } from "./citationPreferences";
 import { maximumKnownCount } from "./citationCountPolicy";
 import {
   cachedExternalWorkMetadata,
@@ -44,6 +42,13 @@ export function relationshipStoreKey(
   provider: CitationProviderID,
 ): string {
   return `v3:${direction}:library:${nodeLibraryID(node)}:item:${node.itemKey.toLocaleUpperCase()}:provider:${provider}`;
+}
+
+export function selectedRelationshipStoreKey(
+  node: RelationshipStoreSubject,
+  direction: StoredRelationshipDirection,
+): string {
+  return `v4:${direction}:library:${nodeLibraryID(node)}:item:${node.itemKey.toLocaleUpperCase()}:selected`;
 }
 
 function normalizedSurname(value: string): string {
@@ -309,34 +314,13 @@ export function getStoredProviderRelationshipEntry(
   );
 }
 
-function selectedRelationshipProviders(
-  direction: StoredRelationshipDirection,
-): CitationProviderID[] {
-  const preference = getProviderPreference();
-  return getProviderPlan(
-    direction === "references" ? "references" : "citations",
-    preference,
-  ).providers;
-}
-
 export function getStoredRelationshipEntry(
   node: RelationshipStoreSubject,
   direction: StoredRelationshipDirection,
 ): ExternalRelationshipCacheEntry | null {
-  const entries = selectedRelationshipProviders(direction)
-    .map((provider) =>
-      getStoredProviderRelationshipEntry(node, direction, provider),
-    )
-    .filter((entry): entry is ExternalRelationshipCacheEntry => Boolean(entry));
-  if (!entries.length) return null;
-  return {
-    relationshipKey: `v3:${direction}:library:${nodeLibraryID(node)}:item:${node.itemKey.toLocaleUpperCase()}:selected`,
-    works: mergeRelatedWorkLists(...entries.map((entry) => entry.works)),
-    fetchedAt: entries
-      .map((entry) => entry.fetchedAt)
-      .sort()
-      .at(-1)!,
-  };
+  return getExternalRelationshipCacheEntry(
+    selectedRelationshipStoreKey(node, direction),
+  );
 }
 
 export function getStoredRelationshipWorks(
@@ -344,6 +328,19 @@ export function getStoredRelationshipWorks(
   direction: StoredRelationshipDirection,
 ): RelatedWorkMetadata[] {
   return getStoredRelationshipEntry(node, direction)?.works ?? [];
+}
+
+export async function replaceStoredRelationshipSelection(
+  node: RelationshipStoreSubject,
+  direction: StoredRelationshipDirection,
+  works: RelatedWorkMetadata[],
+): Promise<RelatedWorkMetadata[]> {
+  const snapshot = mergeRelatedWorkLists(works);
+  await saveExternalRelationshipCache(
+    selectedRelationshipStoreKey(node, direction),
+    snapshot,
+  );
+  return snapshot;
 }
 
 export async function replaceStoredProviderRelationships(

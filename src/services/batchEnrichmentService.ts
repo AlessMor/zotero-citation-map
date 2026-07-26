@@ -1,0 +1,604 @@
+import type {
+  CitationMetricRecord,
+  CitationProviderID,
+  RelatedWorkMetadata,
+} from "../domain/citationTypes";
+import { fetchOpenAlexWorksBatch } from "../providers/openAlexProvider";
+import {
+  fetchSemanticScholarPapersBatch,
+  SEMANTIC_SCHOLAR_BATCH_LIMIT,
+} from "../providers/semanticScholarProvider";
+import { mergeRelatedWorkMetadata } from "../providers/registry";
+import { isCitationRequestCancellationRequested } from "../providers/http";
+import { saveCitationMetricRecord } from "./citationMetricsStore";
+import { getOpenAlexAPIKey, isProviderEnabled } from "./citationPreferences";
+import {
+  CITATION_RECORD_WRITE_CHUNK_SIZE,
+  providerExecutionPolicy,
+} from "./providerExecutionPolicy";
+import type { ProviderIdentityHints } from "./libraryCoreBatchService";
+import { mergeRelatedWorkLists } from "./relationshipStoreService";
+
+export interface BatchEnrichmentProgress {
+  completed: number;
+  total: number;
+  activeBatches: number;
+  message: string;
+}
+
+export interface BatchEnrichmentResult {
+  records: CitationMetricRecord[];
+  enriched: number;
+  unchanged: number;
+  failedBatches: number;
+  providerIdentitiesByItemKey: Map<string, ProviderIdentityHints>;
+}
+
+interface UniqueWorkTarget {
+  work: RelatedWorkMetadata;
+  recordIndexes: number[];
+  citationCountProvider: CitationProviderID | null;
+  referenceCountProvider: CitationProviderID | null;
+  providerWorkIDs: ProviderIdentityHints;
+}
+
+interface ProviderBatchTask {
+  provider: CitationProviderID;
+  label: string;
+  run: () => Promise<void>;
+}
+
+interface IndexedIdentifier {
+  targetIndex: number;
+  identifier: string;
+}
+
+function chunked<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let start = 0; start < items.length; start += size) {
+    chunks.push(items.slice(start, start + size));
+  }
+  return chunks;
+}
+
+function recordIdentity(record: CitationMetricRecord): string {
+  const doi = String(record.doi ?? "")
+    .trim()
+    .toLocaleLowerCase();
+  if (doi) return `doi:${doi}`;
+  const providerID = String(record.providerWorkID ?? "").trim();
+  if (providerID) return `${record.provider}:${providerID.toLocaleLowerCase()}`;
+  const title = String(record.normalizedTitle ?? record.title ?? "")
+    .trim()
+    .toLocaleLowerCase();
+  return `title:${title}:year:${record.year ?? "unknown"}:item:${record.itemKey}`;
+}
+
+function recordToRelatedWork(
+  record: CitationMetricRecord,
+): RelatedWorkMetadata {
+  return {
+    provider: record.provider,
+    providerWorkID: record.providerWorkID,
+    doi: record.doi,
+    pmid: null,
+    arxiv: null,
+    isbn: null,
+    title: record.title,
+    year: record.year,
+    authors: [...record.authors],
+    sourceTitle: record.sourceTitle,
+    abstract: record.abstract,
+    citationCount: record.citationCount,
+    referenceCount: record.referenceCount,
+    citationCountsByYear: [...record.citationCountsByYear],
+    references: record.references.map((reference) => ({
+      ...reference,
+      authors: [...reference.authors],
+      authorIDs: [...(reference.authorIDs ?? [])],
+    })),
+    resolvedReferenceCount: record.resolvedReferenceCount,
+    fwci: record.fwci,
+    citationPercentile: record.citationPercentile,
+    isTop1Percent: record.isTop1Percent,
+    isTop10Percent: record.isTop10Percent,
+    citationsLastYear: record.citationsLastYear,
+    citationVelocity: record.citationVelocity,
+    citationAcceleration: record.citationAcceleration,
+    influentialCitationCount: record.influentialCitationCount,
+    publicationType: record.publicationType,
+    sourceMetrics: record.sourceMetrics,
+    isOpenAccess: record.isOpenAccess,
+    openAccessStatus: record.openAccessStatus,
+    isRetracted: record.isRetracted,
+    dataSources: [record.provider],
+    updatedAt: record.fetchedAt,
+  };
+}
+
+function chooseLargerCount(
+  previous: number | null | undefined,
+  candidate: number | null | undefined,
+): boolean {
+  if (candidate == null) return false;
+  return previous == null || candidate > previous;
+}
+
+function mergeTargetRecord(
+  target: UniqueWorkTarget,
+  record: CitationMetricRecord,
+): void {
+  const candidate = recordToRelatedWork(record);
+  if (chooseLargerCount(target.work.citationCount, candidate.citationCount)) {
+    target.citationCountProvider =
+      record.citationCountProvider ?? record.provider;
+  }
+  if (chooseLargerCount(target.work.referenceCount, candidate.referenceCount)) {
+    target.referenceCountProvider =
+      record.referenceCountProvider ?? record.provider;
+  }
+  target.work = mergeRelatedWorkMetadata(target.work, candidate);
+  if (record.providerWorkID) {
+    target.providerWorkIDs[record.provider] = record.providerWorkID;
+  }
+}
+
+function mergeProviderMetadata(
+  target: UniqueWorkTarget,
+  metadata: RelatedWorkMetadata,
+  provider: CitationProviderID,
+): void {
+  if (chooseLargerCount(target.work.citationCount, metadata.citationCount)) {
+    target.citationCountProvider = provider;
+  }
+  if (chooseLargerCount(target.work.referenceCount, metadata.referenceCount)) {
+    target.referenceCountProvider = provider;
+  }
+  target.work = mergeRelatedWorkMetadata(target.work, metadata);
+  if (metadata.providerWorkID) {
+    target.providerWorkIDs[provider] = metadata.providerWorkID;
+  }
+}
+
+function semanticScholarIdentifier(work: RelatedWorkMetadata): string | null {
+  if (work.provider === "semantic-scholar" && work.providerWorkID?.trim()) {
+    return work.providerWorkID.trim();
+  }
+  const doi = String(work.doi ?? "").trim();
+  if (doi) return `DOI:${doi}`;
+  if (work.pmid?.trim()) return `PMID:${work.pmid.trim()}`;
+  if (work.arxiv?.trim()) return `ARXIV:${work.arxiv.trim()}`;
+  if (work.isbn?.trim()) return `ISBN:${work.isbn.trim()}`;
+  return null;
+}
+
+function openAlexIdentifier(work: RelatedWorkMetadata): string | null {
+  if (work.provider === "openalex" && work.providerWorkID?.trim()) {
+    return work.providerWorkID.trim();
+  }
+  const doi = String(work.doi ?? "").trim();
+  return doi ? `DOI:${doi}` : null;
+}
+
+function needsSemanticScholarEnrichment(work: RelatedWorkMetadata): boolean {
+  return (
+    !String(work.title ?? "").trim() ||
+    !work.authors.length ||
+    work.year == null ||
+    !String(work.sourceTitle ?? "").trim() ||
+    work.citationCount == null ||
+    work.referenceCount == null ||
+    work.influentialCitationCount == null ||
+    work.publicationType == null ||
+    work.isOpenAccess == null
+  );
+}
+
+function needsOpenAlexEnrichment(work: RelatedWorkMetadata): boolean {
+  return (
+    !String(work.title ?? "").trim() ||
+    !work.authors.length ||
+    work.year == null ||
+    !String(work.sourceTitle ?? "").trim() ||
+    work.citationCount == null ||
+    work.referenceCount == null ||
+    work.fwci == null ||
+    work.citationPercentile == null ||
+    work.isTop1Percent == null ||
+    work.isTop10Percent == null ||
+    !(work.citationCountsByYear?.length ?? 0) ||
+    work.citationsLastYear == null ||
+    work.citationVelocity == null ||
+    work.citationAcceleration == null ||
+    work.publicationType == null ||
+    work.isOpenAccess == null ||
+    work.isRetracted == null
+  );
+}
+
+function mergeRecordEnrichment(
+  record: CitationMetricRecord,
+  target: UniqueWorkTarget,
+): CitationMetricRecord {
+  const merged = mergeRelatedWorkMetadata(
+    recordToRelatedWork(record),
+    target.work,
+  );
+  const useEnrichedCitationCount = chooseLargerCount(
+    record.citationCount,
+    merged.citationCount,
+  );
+  const useEnrichedReferenceCount = chooseLargerCount(
+    record.referenceCount,
+    merged.referenceCount,
+  );
+  const citationCount = useEnrichedCitationCount
+    ? (merged.citationCount ?? null)
+    : record.citationCount;
+  const referenceCount = useEnrichedReferenceCount
+    ? (merged.referenceCount ?? null)
+    : record.referenceCount;
+  const references = mergeRelatedWorkLists(
+    record.references,
+    merged.references ?? [],
+  );
+  const now = new Date().toISOString();
+
+  return {
+    ...record,
+    doi: record.doi ?? merged.doi,
+    title: record.title ?? merged.title,
+    year: record.year ?? merged.year,
+    authors: record.authors.length ? record.authors : [...merged.authors],
+    sourceTitle: record.sourceTitle ?? merged.sourceTitle ?? null,
+    abstract: record.abstract ?? merged.abstract ?? null,
+    citationCount,
+    citationCountProvider: useEnrichedCitationCount
+      ? (target.citationCountProvider ?? record.citationCountProvider)
+      : record.citationCountProvider,
+    referenceCount,
+    referenceCountProvider: useEnrichedReferenceCount
+      ? (target.referenceCountProvider ?? record.referenceCountProvider)
+      : record.referenceCountProvider,
+    references,
+    resolvedReferenceCount: Math.max(
+      record.resolvedReferenceCount,
+      merged.resolvedReferenceCount ?? 0,
+      references.length,
+    ),
+    fwci: record.fwci ?? merged.fwci ?? null,
+    citationPercentile:
+      record.citationPercentile ?? merged.citationPercentile ?? null,
+    isTop1Percent: record.isTop1Percent ?? merged.isTop1Percent ?? null,
+    isTop10Percent: record.isTop10Percent ?? merged.isTop10Percent ?? null,
+    citationCountsByYear: record.citationCountsByYear.length
+      ? record.citationCountsByYear
+      : [...(merged.citationCountsByYear ?? [])],
+    citationsLastYear:
+      record.citationsLastYear ?? merged.citationsLastYear ?? null,
+    citationVelocity:
+      record.citationVelocity ?? merged.citationVelocity ?? null,
+    citationAcceleration:
+      record.citationAcceleration ?? merged.citationAcceleration ?? null,
+    influentialCitationCount:
+      record.influentialCitationCount ??
+      merged.influentialCitationCount ??
+      null,
+    publicationType: record.publicationType ?? merged.publicationType ?? null,
+    sourceMetrics: record.sourceMetrics ?? merged.sourceMetrics ?? null,
+    isOpenAccess: record.isOpenAccess ?? merged.isOpenAccess ?? null,
+    openAccessStatus:
+      record.openAccessStatus ?? merged.openAccessStatus ?? null,
+    isRetracted: record.isRetracted ?? merged.isRetracted ?? null,
+    fetchedAt: now,
+    lastAttemptAt: now,
+  };
+}
+
+function enrichmentSignature(record: CitationMetricRecord): string {
+  return JSON.stringify([
+    record.doi,
+    record.title,
+    record.year,
+    record.authors,
+    record.sourceTitle,
+    record.abstract,
+    record.citationCount,
+    record.citationCountProvider,
+    record.referenceCount,
+    record.referenceCountProvider,
+    record.resolvedReferenceCount,
+    record.references.length,
+    record.fwci,
+    record.citationPercentile,
+    record.isTop1Percent,
+    record.isTop10Percent,
+    record.citationCountsByYear,
+    record.citationsLastYear,
+    record.citationVelocity,
+    record.citationAcceleration,
+    record.influentialCitationCount,
+    record.publicationType,
+    record.sourceMetrics,
+    record.isOpenAccess,
+    record.openAccessStatus,
+    record.isRetracted,
+  ]);
+}
+
+async function runBounded<T>(
+  tasks: Array<() => Promise<T>>,
+  parallelism: number,
+): Promise<Array<PromiseSettledResult<T>>> {
+  const results: Array<PromiseSettledResult<T>> = new Array(tasks.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < tasks.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      try {
+        results[index] = {
+          status: "fulfilled",
+          value: await tasks[index](),
+        };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(Math.max(1, parallelism), tasks.length) },
+      () => worker(),
+    ),
+  );
+  return results;
+}
+
+function providerTasks(targets: UniqueWorkTarget[]): ProviderBatchTask[] {
+  const tasks: ProviderBatchTask[] = [];
+
+  if (isProviderEnabled("semantic-scholar")) {
+    const candidates: IndexedIdentifier[] = targets
+      .map((target, targetIndex) => ({
+        targetIndex,
+        identifier: semanticScholarIdentifier(target.work),
+      }))
+      .filter(
+        (candidate): candidate is IndexedIdentifier =>
+          Boolean(candidate.identifier) &&
+          needsSemanticScholarEnrichment(targets[candidate.targetIndex].work),
+      );
+    const semanticBatchSize = Math.min(
+      SEMANTIC_SCHOLAR_BATCH_LIMIT,
+      providerExecutionPolicy("semantic-scholar").batchSize,
+    );
+    const batches = chunked(candidates, semanticBatchSize);
+    for (const [batchIndex, batch] of batches.entries()) {
+      tasks.push({
+        provider: "semantic-scholar",
+        label: `Semantic Scholar ${batchIndex + 1}/${batches.length}`,
+        run: async () => {
+          const metadata = await fetchSemanticScholarPapersBatch(
+            batch.map((candidate) => candidate.identifier),
+          );
+          for (const [index, candidate] of batch.entries()) {
+            const entry = metadata[index];
+            if (entry) {
+              mergeProviderMetadata(
+                targets[candidate.targetIndex],
+                entry,
+                "semantic-scholar",
+              );
+            }
+          }
+        },
+      });
+    }
+  }
+
+  if (isProviderEnabled("openalex") && getOpenAlexAPIKey()) {
+    const candidates: IndexedIdentifier[] = targets
+      .map((target, targetIndex) => ({
+        targetIndex,
+        identifier: openAlexIdentifier(target.work),
+      }))
+      .filter(
+        (candidate): candidate is IndexedIdentifier =>
+          Boolean(candidate.identifier) &&
+          needsOpenAlexEnrichment(targets[candidate.targetIndex].work),
+      );
+    const batches = chunked(
+      candidates,
+      providerExecutionPolicy("openalex").batchSize,
+    );
+    for (const [batchIndex, batch] of batches.entries()) {
+      tasks.push({
+        provider: "openalex",
+        label: `OpenAlex ${batchIndex + 1}/${batches.length}`,
+        run: async () => {
+          const metadata = await fetchOpenAlexWorksBatch(
+            batch.map((candidate) => candidate.identifier),
+          );
+          for (const [index, candidate] of batch.entries()) {
+            const entry = metadata[index];
+            if (entry) {
+              mergeProviderMetadata(
+                targets[candidate.targetIndex],
+                entry,
+                "openalex",
+              );
+            }
+          }
+        },
+      });
+    }
+  }
+
+  return tasks;
+}
+
+async function runProviderTaskGroups(
+  tasks: ProviderBatchTask[],
+  execute: (task: ProviderBatchTask) => Promise<void>,
+): Promise<Array<PromiseSettledResult<void>>> {
+  const groups = new Map<CitationProviderID, ProviderBatchTask[]>();
+  for (const task of tasks) {
+    const group = groups.get(task.provider) ?? [];
+    group.push(task);
+    groups.set(task.provider, group);
+  }
+  const groupResults = await Promise.all(
+    [...groups].map(async ([provider, providerTasks]) =>
+      runBounded(
+        providerTasks.map((task) => () => execute(task)),
+        providerExecutionPolicy(provider).requestParallelism,
+      ),
+    ),
+  );
+  return groupResults.flat();
+}
+
+/**
+ * Enrich successful source-item records in provider-sized batches. Stable
+ * identities are deduplicated first, so duplicate Zotero records or repeated
+ * versions of the same paper are resolved only once per update job.
+ */
+export async function enrichCitationMetricRecords(
+  input: CitationMetricRecord[],
+  onProgress?: (progress: BatchEnrichmentProgress) => void,
+): Promise<BatchEnrichmentResult> {
+  if (!input.length || isCitationRequestCancellationRequested()) {
+    return {
+      records: input,
+      enriched: 0,
+      unchanged: input.length,
+      failedBatches: 0,
+      providerIdentitiesByItemKey: new Map(),
+    };
+  }
+
+  const records: CitationMetricRecord[] = input.map((record) => ({
+    ...record,
+    authors: [...record.authors],
+    citationCountsByYear: [...record.citationCountsByYear],
+    references: record.references.map((reference) => ({
+      ...reference,
+      authors: [...reference.authors],
+      authorIDs: [...(reference.authorIDs ?? [])],
+    })),
+  }));
+  const uniqueByIdentity = new Map<string, UniqueWorkTarget>();
+  for (const [recordIndex, record] of records.entries()) {
+    const identity = recordIdentity(record);
+    const current = uniqueByIdentity.get(identity);
+    if (current) {
+      mergeTargetRecord(current, record);
+      current.recordIndexes.push(recordIndex);
+    } else {
+      uniqueByIdentity.set(identity, {
+        work: recordToRelatedWork(record),
+        recordIndexes: [recordIndex],
+        citationCountProvider: record.citationCountProvider,
+        referenceCountProvider: record.referenceCountProvider,
+        providerWorkIDs: record.providerWorkID
+          ? { [record.provider]: record.providerWorkID }
+          : {},
+      });
+    }
+  }
+
+  const uniqueTargets = [...uniqueByIdentity.values()];
+  const tasks = providerTasks(uniqueTargets);
+  const total = tasks.length;
+  let completed = 0;
+  let activeBatches = 0;
+
+  const executableTasks = tasks.map((task) => async (): Promise<void> => {
+    if (isCitationRequestCancellationRequested()) return;
+    activeBatches += 1;
+    onProgress?.({
+      completed,
+      total,
+      activeBatches,
+      message: `${task.label} · ${completed}/${total} provider batches complete`,
+    });
+    try {
+      await task.run();
+    } finally {
+      completed += 1;
+      activeBatches = Math.max(0, activeBatches - 1);
+      onProgress?.({
+        completed,
+        total,
+        activeBatches,
+        message: `${completed}/${total} provider batches complete${activeBatches ? ` · ${activeBatches} active` : ""}`,
+      });
+    }
+  });
+
+  const executableByTask = new Map(
+    tasks.map((task, index) => [task, executableTasks[index]]),
+  );
+  const settled = await runProviderTaskGroups(tasks, async (task) => {
+    await executableByTask.get(task)!();
+  });
+
+  for (const target of uniqueTargets) {
+    for (const recordIndex of target.recordIndexes) {
+      records[recordIndex] = mergeRecordEnrichment(
+        records[recordIndex],
+        target,
+      );
+    }
+  }
+
+  let enriched = 0;
+  let unchanged = 0;
+  const originalByKey = new Map(
+    input.map((record) => [`${record.libraryID}:${record.itemKey}`, record]),
+  );
+  const writeBatchSize = CITATION_RECORD_WRITE_CHUNK_SIZE;
+  for (const writeBatch of chunked(records, writeBatchSize)) {
+    if (isCitationRequestCancellationRequested()) break;
+    const changed: CitationMetricRecord[] = [];
+    for (const record of writeBatch) {
+      const original = originalByKey.get(
+        `${record.libraryID}:${record.itemKey}`,
+      );
+      if (
+        original &&
+        enrichmentSignature(original) === enrichmentSignature(record)
+      ) {
+        unchanged += 1;
+      } else {
+        changed.push(record);
+      }
+    }
+    await Promise.all(
+      changed.map((record) => saveCitationMetricRecord(record)),
+    );
+    enriched += changed.length;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  const providerIdentitiesByItemKey = new Map<string, ProviderIdentityHints>();
+  for (const target of uniqueTargets) {
+    for (const recordIndex of target.recordIndexes) {
+      providerIdentitiesByItemKey.set(records[recordIndex].itemKey, {
+        ...target.providerWorkIDs,
+      });
+    }
+  }
+
+  return {
+    records,
+    enriched,
+    unchanged,
+    failedBatches: settled.filter((result) => result.status === "rejected")
+      .length,
+    providerIdentitiesByItemKey,
+  };
+}

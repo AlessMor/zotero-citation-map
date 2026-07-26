@@ -12,6 +12,7 @@ import {
   nodeFieldDataSourceTooltip,
   uninstallDataSourceHoverTooltips,
 } from "./dataSourceTooltipService";
+import { getShowMetricTooltipsEnabled } from "./citationPreferences";
 
 const registeredDataKeys: string[] = [];
 const descriptions = new Map<string, string>();
@@ -84,7 +85,7 @@ function renderCell(
   const decoded = decodeCell(data);
   if (decoded) {
     span.textContent = decoded.display;
-    span.title = decoded.title;
+    if (decoded.title) span.title = decoded.title;
     if (decoded.className) span.classList.add(decoded.className);
   }
   return span;
@@ -99,7 +100,9 @@ function metricData(spec: MetricDefinition, item: Zotero.Item): string {
   return encodeCell(
     floatSortKey(raw),
     display,
-    nodeFieldDataSourceTooltip(node, spec.id, item),
+    getShowMetricTooltipsEnabled()
+      ? nodeFieldDataSourceTooltip(node, spec.id, item)
+      : "",
   );
 }
 
@@ -121,7 +124,9 @@ function supplementaryData(
   return encodeCell(
     sortKey,
     display,
-    nodeFieldDataSourceTooltip(node, spec.id, item),
+    getShowMetricTooltipsEnabled()
+      ? nodeFieldDataSourceTooltip(node, spec.id, item)
+      : "",
     spec.id === "retractionStatus" && value === true
       ? "citation-map-column-warning"
       : undefined,
@@ -169,6 +174,7 @@ export function installCitationColumnTooltips(
 ): void {
   if (tooltipHandlers.has(win)) return;
   const handler: EventListener = (event) => {
+    if (!getShowMetricTooltipsEnabled()) return;
     const target = event.target as Element | null;
     const cell = target?.closest?.(".virtualized-table-header .cell");
     if (!cell) return;
