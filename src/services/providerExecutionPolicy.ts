@@ -70,7 +70,17 @@ export function providerExecutionPolicy(
 }
 
 export const LIBRARY_CORE_FALLBACK_PARALLELISM = 4;
-export const RELATIONSHIP_ITEM_PARALLELISM = 4;
+/**
+ * Relationship jobs combine network traffic with substantial synchronous
+ * merging and JSON persistence. Keep this lower than ordinary request
+ * parallelism so Zotero's main thread can continue painting during bulk work.
+ */
+export const RELATIONSHIP_ITEM_PARALLELISM = 2;
+/**
+ * Bulk updates hydrate exactly one bounded first hop. The returned neighbours
+ * contain compact summaries only; their own relationships are never expanded.
+ */
+export const RELATIONSHIP_BULK_EAGER_LIMIT = 100;
 export const RELATIONSHIP_SUMMARY_BACKGROUND_FALLBACK_LIMIT = 12;
 export const RELATIONSHIP_SUMMARY_BATCH_SIZE = 200;
 export const CITATION_RECORD_WRITE_CHUNK_SIZE = 100;

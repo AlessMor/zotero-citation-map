@@ -31,6 +31,23 @@ export interface CitationYearCount {
   count: number;
 }
 
+export interface LibraryUpdateState {
+  coreUpdatedAt?: string | null;
+  sourceMetricsUpdatedAt?: string | null;
+  referencesUpdatedAt?: string | null;
+  citedByUpdatedAt?: string | null;
+  referencesComplete?: boolean;
+  citedByComplete?: boolean;
+  /** Number of first-hop relationship summaries currently available locally. */
+  referencesLoadedCount?: number;
+  citedByLoadedCount?: number;
+  /** Provider-reported totals, retained even when only the first page is cached. */
+  referencesReportedCount?: number | null;
+  citedByReportedCount?: number | null;
+  /** Provider work IDs discovered during batched enrichment and reused by relationship refreshes. */
+  providerWorkIDs?: Partial<Record<CitationProviderID, string>>;
+}
+
 export interface SourceMetrics {
   sourceID: string | null;
   sourceTitle: string | null;
@@ -41,16 +58,7 @@ export interface SourceMetrics {
   /** Complete-library update policy that attempted these source metrics. */
   libraryUpdateVersion?: number;
   /** Independently refreshed parts of a complete Zotero-library update. */
-  libraryUpdateState?: {
-    coreUpdatedAt?: string | null;
-    sourceMetricsUpdatedAt?: string | null;
-    referencesUpdatedAt?: string | null;
-    citedByUpdatedAt?: string | null;
-    referencesComplete?: boolean;
-    citedByComplete?: boolean;
-    /** Provider work IDs discovered during batched enrichment and reused by relationship refreshes. */
-    providerWorkIDs?: Partial<Record<CitationProviderID, string>>;
-  };
+  libraryUpdateState?: LibraryUpdateState;
 }
 
 export interface RelatedWorkMetadata {

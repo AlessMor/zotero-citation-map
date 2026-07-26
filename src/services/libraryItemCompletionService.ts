@@ -5,12 +5,16 @@ import {
   getCitationMetricRecord,
   saveCitationMetricRecord,
 } from "./citationMetricsStore";
-import { refreshExternalRelationships } from "./externalDiscoveryService";
+import {
+  refreshExternalRelationships,
+  type RelationshipRefreshResolution,
+} from "./externalDiscoveryService";
 import { createMetricNodeForItem } from "./itemMetricContext";
 import { getCacheDays } from "./citationPreferences";
 import type { ProviderIdentityHints } from "./libraryCoreBatchService";
 import {
   CITATION_RECORD_WRITE_CHUNK_SIZE,
+  RELATIONSHIP_BULK_EAGER_LIMIT,
   RELATIONSHIP_ITEM_PARALLELISM,
 } from "./providerExecutionPolicy";
 import { getStoredRelationshipEntry } from "./relationshipStoreService";
@@ -22,6 +26,10 @@ import {
 
 export type LibraryCompletionPhase =
   "source-metrics" | "relationships" | "finalizing";
+
+export type LibraryRelationshipLoadMode = "first-page" | "complete";
+
+type RelationshipDirection = "references" | "cited-by";
 
 export interface LibraryCompletionProgress {
   phase: LibraryCompletionPhase;
@@ -41,8 +49,17 @@ export interface LibraryCompletionResult {
 
 interface RelationshipTask {
   node: CitationGraphNode;
-  direction: "references" | "cited-by";
+  direction: RelationshipDirection;
   providerWorkIDs: ProviderIdentityHints;
+  maximum: number;
+}
+
+interface StoredRelationshipResolution extends RelationshipRefreshResolution {
+  updatedAt: string;
+}
+
+async function yieldToEventLoop(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
 
 async function runBounded<T>(
@@ -56,6 +73,9 @@ async function runBounded<T>(
       const index = nextIndex;
       nextIndex += 1;
       await task(items[index]);
+      // Relationship processing performs synchronous merging and serialization
+      // after each network response. Yield between roots so Zotero can repaint.
+      await yieldToEventLoop();
     }
   }
   await Promise.all(
@@ -77,17 +97,24 @@ function latestRecords(
 
 function relationshipMaximum(
   node: CitationGraphNode,
-  direction: "references" | "cited-by",
+  direction: RelationshipDirection,
+  mode: LibraryRelationshipLoadMode,
 ): number {
   const reported =
     direction === "references" ? node.referenceCount : node.citationCount;
-  // Unknown totals are endpoint-driven: pagination continues until the provider
-  // returns a terminal page instead of assuming an arbitrary 2,500-paper cap.
+  if (mode === "first-page") {
+    return Math.min(
+      RELATIONSHIP_BULK_EAGER_LIMIT,
+      reported == null ? RELATIONSHIP_BULK_EAGER_LIMIT : Math.max(0, reported),
+    );
+  }
+  // Explicit single-paper completion remains endpoint-driven when the provider
+  // does not report a total.
   return reported == null ? Number.POSITIVE_INFINITY : Math.max(0, reported);
 }
 
 function relationshipStateKey(
-  direction: "references" | "cited-by",
+  direction: RelationshipDirection,
 ): "referencesUpdatedAt" | "citedByUpdatedAt" {
   return direction === "references"
     ? "referencesUpdatedAt"
@@ -95,31 +122,84 @@ function relationshipStateKey(
 }
 
 function relationshipCompleteKey(
-  direction: "references" | "cited-by",
+  direction: RelationshipDirection,
 ): "referencesComplete" | "citedByComplete" {
   return direction === "references" ? "referencesComplete" : "citedByComplete";
 }
 
+function relationshipLoadedCountKey(
+  direction: RelationshipDirection,
+): "referencesLoadedCount" | "citedByLoadedCount" {
+  return direction === "references"
+    ? "referencesLoadedCount"
+    : "citedByLoadedCount";
+}
+
 function relationshipNeedsRefresh(
   node: CitationGraphNode,
-  direction: "references" | "cited-by",
+  direction: RelationshipDirection,
   record: CitationMetricRecord,
   force: boolean,
+  mode: LibraryRelationshipLoadMode,
+  maximum: number,
 ): boolean {
-  if (force || !getStoredRelationshipEntry(node, direction)) return true;
+  const entry = getStoredRelationshipEntry(node, direction);
+  if (force || !entry) return true;
+
   const state = record.sourceMetrics?.libraryUpdateState;
-  if (!state?.[relationshipCompleteKey(direction)]) return true;
-  const timestamp = Date.parse(state[relationshipStateKey(direction)] ?? "");
-  return (
+  const timestamp = Date.parse(state?.[relationshipStateKey(direction)] ?? "");
+  const stale =
     !Number.isFinite(timestamp) ||
-    Date.now() - timestamp >= getCacheDays() * 86400000
+    Date.now() - timestamp >= getCacheDays() * 86400000;
+  if (stale) return true;
+  if (state?.[relationshipCompleteKey(direction)]) return false;
+
+  // A direct single-paper update may explicitly finish an existing partial
+  // cache. Bulk updates only guarantee one display-ready first hop.
+  if (mode === "complete") return true;
+  const loaded =
+    state?.[relationshipLoadedCountKey(direction)] ?? entry.works.length;
+  return loaded < maximum;
+}
+
+function rememberRelationshipResolution(
+  resolutions: Map<
+    string,
+    Map<RelationshipDirection, StoredRelationshipResolution>
+  >,
+  itemKey: string,
+  direction: RelationshipDirection,
+  resolution: RelationshipRefreshResolution,
+): void {
+  const byDirection = resolutions.get(itemKey) ?? new Map();
+  byDirection.set(direction, {
+    ...resolution,
+    updatedAt: new Date().toISOString(),
+  });
+  resolutions.set(itemKey, byDirection);
+}
+
+function isExpectedBoundedResult(
+  mode: LibraryRelationshipLoadMode,
+  maximum: number,
+  resolution: RelationshipRefreshResolution,
+): boolean {
+  if (resolution.complete) return true;
+  if (mode !== "first-page") return false;
+  const expected = Math.min(
+    maximum,
+    resolution.reportedCount == null
+      ? maximum
+      : Math.max(0, resolution.reportedCount),
   );
+  return resolution.identifiedCount >= expected;
 }
 
 /**
- * Finish a Zotero-item update so every library node is graph-ready before the
- * update job completes. External neighbours receive only compact summaries;
- * their advanced fields remain persistently hydrated on demand.
+ * Finish a Zotero-item update so every library root is graph-ready. Bulk jobs
+ * retrieve a bounded first hop with compact summaries; returned neighbours are
+ * never recursively expanded. A direct single-paper update may complete the
+ * entire membership for both directions.
  */
 export async function completeLibraryItemUpdates(
   items: Zotero.Item[],
@@ -128,12 +208,14 @@ export async function completeLibraryItemUpdates(
   options: {
     force?: boolean;
     providerIdentitiesByItemKey?: Map<string, ProviderIdentityHints>;
+    relationshipMode?: LibraryRelationshipLoadMode;
   } = {},
 ): Promise<LibraryCompletionResult> {
   const itemByKey = new Map(items.map((item) => [String(item.key), item]));
   const relevantItems = records
     .map((record) => itemByKey.get(record.itemKey))
     .filter((item): item is Zotero.Item => Boolean(item));
+  const relationshipMode = options.relationshipMode ?? "first-page";
 
   let sourceResult: LibrarySourceMetricResult = {
     records,
@@ -174,68 +256,94 @@ export async function completeLibraryItemUpdates(
       ...(options.providerIdentitiesByItemKey?.get(node.itemKey) ?? {}),
     };
     for (const direction of ["references", "cited-by"] as const) {
+      const maximum = relationshipMaximum(node, direction, relationshipMode);
       if (
         relationshipNeedsRefresh(
           node,
           direction,
           record,
           Boolean(options.force),
+          relationshipMode,
+          maximum,
         )
       ) {
-        relationshipTasks.push({ node, direction, providerWorkIDs });
+        relationshipTasks.push({
+          node,
+          direction,
+          providerWorkIDs,
+          maximum,
+        });
       }
     }
   }
+
   let relationshipListsUpdated = 0;
   let relationshipFailures = 0;
   let completedRelationships = 0;
-  const completedDirections = new Map<string, Set<"references" | "cited-by">>();
+  const relationshipResolutions = new Map<
+    string,
+    Map<RelationshipDirection, StoredRelationshipResolution>
+  >();
 
-  const relationshipConcurrency = RELATIONSHIP_ITEM_PARALLELISM;
   await runBounded(
     relationshipTasks,
-    relationshipConcurrency,
-    async ({ node, direction, providerWorkIDs }) => {
+    RELATIONSHIP_ITEM_PARALLELISM,
+    async ({ node, direction, providerWorkIDs, maximum }) => {
       if (isCitationRequestCancellationRequested()) return;
       const label = direction === "references" ? "references" : "citing papers";
+      const action =
+        relationshipMode === "first-page" ? "Caching first-hop" : "Retrieving";
       onProgress?.({
         phase: "relationships",
         completed: completedRelationships,
         total: relationshipTasks.length,
         message:
-          `Retrieving ${label} and paper summaries · ` +
+          `${action} ${label} and paper summaries · ` +
           `${completedRelationships}/${relationshipTasks.length}`,
       });
+
       try {
-        let membershipComplete = false;
+        let resolution: RelationshipRefreshResolution | null = null;
         await refreshExternalRelationships(node, nodes, direction, {
-          maximum: relationshipMaximum(node, direction),
+          maximum,
           refreshMembership: true,
           silent: true,
           summaryLookupLimit: 0,
           queueBackgroundHydration: true,
           providerWorkIDs,
-          onMembershipResolved: (resolution) => {
-            membershipComplete = resolution.complete;
+          onMembershipResolved: (value) => {
+            resolution = value;
           },
         });
+
+        const finalResolution =
+          resolution as RelationshipRefreshResolution | null;
+        if (!finalResolution) {
+          throw new Error(
+            "Relationship provider returned no resolution state.",
+          );
+        }
         relationshipListsUpdated += 1;
-        if (membershipComplete) {
-          const completedForItem =
-            completedDirections.get(node.itemKey) ??
-            new Set<"references" | "cited-by">();
-          completedForItem.add(direction);
-          completedDirections.set(node.itemKey, completedForItem);
-        } else {
+        rememberRelationshipResolution(
+          relationshipResolutions,
+          node.itemKey,
+          direction,
+          finalResolution,
+        );
+
+        if (
+          !isExpectedBoundedResult(relationshipMode, maximum, finalResolution)
+        ) {
           relationshipFailures += 1;
           Zotero.debug(
-            `Citation Map: ${direction} membership remained incomplete for ${node.itemKey}`,
+            `Citation Map: ${direction} membership remained incomplete for ${node.itemKey} ` +
+              `(${finalResolution.identifiedCount}/${finalResolution.reportedCount ?? "unknown"})`,
           );
         }
       } catch (error) {
         relationshipFailures += 1;
         Zotero.debug(
-          `Citation Map: full ${direction} update failed for ${node.itemKey}: ${String(error)}`,
+          `Citation Map: ${relationshipMode} ${direction} update failed for ${node.itemKey}: ${String(error)}`,
         );
       } finally {
         completedRelationships += 1;
@@ -244,7 +352,7 @@ export async function completeLibraryItemUpdates(
           completed: completedRelationships,
           total: relationshipTasks.length,
           message:
-            `Retrieving relationships and paper summaries · ` +
+            `Caching relationships and paper summaries · ` +
             `${completedRelationships}/${relationshipTasks.length}`,
         });
       }
@@ -256,7 +364,9 @@ export async function completeLibraryItemUpdates(
   for (const record of latestRecords(sourceResult.records)) {
     const current =
       getCitationMetricRecord(record.libraryID, record.itemKey) ?? record;
-    const directions = completedDirections.get(record.itemKey);
+    const resolutions = relationshipResolutions.get(record.itemKey);
+    const referencesResolution = resolutions?.get("references");
+    const citedByResolution = resolutions?.get("cited-by");
     const previousState = current.sourceMetrics?.libraryUpdateState ?? {};
     const sourceMetrics = current.sourceMetrics
       ? {
@@ -267,18 +377,32 @@ export async function completeLibraryItemUpdates(
             coreUpdatedAt: current.fetchedAt ?? finalizedAt,
             sourceMetricsUpdatedAt:
               current.sourceMetrics.updatedAt ?? finalizedAt,
-            referencesUpdatedAt: directions?.has("references")
-              ? finalizedAt
-              : (previousState.referencesUpdatedAt ?? null),
-            citedByUpdatedAt: directions?.has("cited-by")
-              ? finalizedAt
-              : (previousState.citedByUpdatedAt ?? null),
-            referencesComplete: directions?.has("references")
-              ? true
+            referencesUpdatedAt:
+              referencesResolution?.updatedAt ??
+              previousState.referencesUpdatedAt ??
+              null,
+            citedByUpdatedAt:
+              citedByResolution?.updatedAt ??
+              previousState.citedByUpdatedAt ??
+              null,
+            referencesComplete: referencesResolution
+              ? referencesResolution.complete
               : (previousState.referencesComplete ?? false),
-            citedByComplete: directions?.has("cited-by")
-              ? true
+            citedByComplete: citedByResolution
+              ? citedByResolution.complete
               : (previousState.citedByComplete ?? false),
+            referencesLoadedCount: referencesResolution
+              ? referencesResolution.identifiedCount
+              : (previousState.referencesLoadedCount ?? 0),
+            citedByLoadedCount: citedByResolution
+              ? citedByResolution.identifiedCount
+              : (previousState.citedByLoadedCount ?? 0),
+            referencesReportedCount: referencesResolution
+              ? referencesResolution.reportedCount
+              : (previousState.referencesReportedCount ?? null),
+            citedByReportedCount: citedByResolution
+              ? citedByResolution.reportedCount
+              : (previousState.citedByReportedCount ?? null),
             providerWorkIDs: {
               ...(previousState.providerWorkIDs ?? {}),
               ...(options.providerIdentitiesByItemKey?.get(record.itemKey) ??
@@ -289,6 +413,7 @@ export async function completeLibraryItemUpdates(
       : null;
     if (sourceMetrics) finalRecords.push({ ...current, sourceMetrics });
   }
+
   for (
     let start = 0;
     start < finalRecords.length;
@@ -299,13 +424,17 @@ export async function completeLibraryItemUpdates(
         .slice(start, start + CITATION_RECORD_WRITE_CHUNK_SIZE)
         .map((record) => saveCitationMetricRecord(record)),
     );
+    await yieldToEventLoop();
   }
 
   onProgress?.({
     phase: "finalizing",
     completed: records.length,
     total: records.length,
-    message: "Finalizing complete library-item metrics",
+    message:
+      relationshipMode === "first-page"
+        ? "Finalizing bounded first-hop library metrics"
+        : "Finalizing complete library-item metrics",
   });
 
   return {

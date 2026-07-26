@@ -1,6 +1,7 @@
 import type {
   CitationMetricRecord,
   CitationProviderPreference,
+  LibraryUpdateState,
   WorkIdentifiers,
 } from "../domain/citationTypes";
 import { extractWorkIdentifiers } from "./citationIdentifiers";
@@ -12,8 +13,10 @@ import { getCacheDays } from "./citationPreferences";
 import {
   getStoredRelationshipEntry,
   type RelationshipStoreSubject,
+  type StoredRelationshipDirection,
 } from "./relationshipStoreService";
 import { LIBRARY_UPDATE_COMPLETION_VERSION } from "./libraryUpdatePolicy";
+import { RELATIONSHIP_BULK_EAGER_LIMIT } from "./providerExecutionPolicy";
 
 export interface PlannedCitationItem {
   item: Zotero.Item;
@@ -29,6 +32,55 @@ export interface CitationUpdatePlan {
   items: Zotero.Item[];
   pending: PlannedCitationItem[];
   cached: number;
+}
+
+function relationshipStateValues(
+  state: LibraryUpdateState,
+  direction: StoredRelationshipDirection,
+): {
+  updatedAt: string | null | undefined;
+  complete: boolean;
+  loadedCount: number | undefined;
+  reportedCount: number | null | undefined;
+} {
+  return direction === "references"
+    ? {
+        updatedAt: state.referencesUpdatedAt,
+        complete: Boolean(state.referencesComplete),
+        loadedCount: state.referencesLoadedCount,
+        reportedCount: state.referencesReportedCount,
+      }
+    : {
+        updatedAt: state.citedByUpdatedAt,
+        complete: Boolean(state.citedByComplete),
+        loadedCount: state.citedByLoadedCount,
+        reportedCount: state.citedByReportedCount,
+      };
+}
+
+function relationshipFirstHopIsCurrent(
+  subject: RelationshipStoreSubject,
+  state: LibraryUpdateState,
+  direction: StoredRelationshipDirection,
+  maxAgeMs: number,
+): boolean {
+  const entry = getStoredRelationshipEntry(subject, direction);
+  if (!entry) return false;
+  const values = relationshipStateValues(state, direction);
+  const timestamp = Date.parse(values.updatedAt ?? "");
+  if (!Number.isFinite(timestamp) || Date.now() - timestamp >= maxAgeMs) {
+    return false;
+  }
+  if (values.complete) return true;
+
+  const loadedCount = values.loadedCount ?? entry.works.length;
+  const target = Math.min(
+    RELATIONSHIP_BULK_EAGER_LIMIT,
+    values.reportedCount == null
+      ? RELATIONSHIP_BULK_EAGER_LIMIT
+      : Math.max(0, values.reportedCount),
+  );
+  return loadedCount >= target;
 }
 
 function hasCompleteLibraryUpdate(
@@ -53,18 +105,11 @@ function hasCompleteLibraryUpdate(
     year: record.year,
   };
   const state = record.sourceMetrics.libraryUpdateState;
+  if (!state) return false;
   const maxAgeMs = getCacheDays() * 86400000;
-  const fresh = (value: string | null | undefined): boolean => {
-    const timestamp = Date.parse(value ?? "");
-    return Number.isFinite(timestamp) && Date.now() - timestamp < maxAgeMs;
-  };
-  return Boolean(
-    state?.referencesComplete &&
-    state.citedByComplete &&
-    fresh(state.referencesUpdatedAt) &&
-    fresh(state.citedByUpdatedAt) &&
-    getStoredRelationshipEntry(subject, "references") &&
-    getStoredRelationshipEntry(subject, "cited-by"),
+  return (
+    relationshipFirstHopIsCurrent(subject, state, "references", maxAgeMs) &&
+    relationshipFirstHopIsCurrent(subject, state, "cited-by", maxAgeMs)
   );
 }
 
