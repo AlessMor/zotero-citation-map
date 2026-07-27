@@ -13,12 +13,16 @@ import {
   waitForCitationUpdates as waitForCoreCitationUpdates,
 } from "./citationUpdateService";
 
+const CORE_IDLE_POLL_MS = 1000;
+
 let notifierID: string | null = null;
 let startupTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingItemIDs = new Set<number>();
 let shuttingDown = false;
 let unregisterCancellationHandler: (() => void) | null = null;
+let cancellationGeneration = 0;
+let automaticUpdateTail: Promise<void> = Promise.resolve();
 
 function reportBackgroundError(context: string, error: unknown): void {
   const detail = error instanceof Error ? error : new Error(String(error));
@@ -29,17 +33,34 @@ function reportBackgroundError(context: string, error: unknown): void {
   );
 }
 
+async function waitUntilCoreUpdateIsIdle(generation: number): Promise<boolean> {
+  while (!shuttingDown && generation === cancellationGeneration) {
+    if (await waitForCoreCitationUpdates(CORE_IDLE_POLL_MS)) return true;
+  }
+  return false;
+}
+
 function startVisibleUpdate(
   context: string,
   operation: () => Promise<unknown>,
 ): void {
   if (shuttingDown) return;
-  // Closing a previous progress window cancels its provider requests. Every new
-  // user-visible operation starts with a clean cancellation state.
-  resetCitationRequestCancellation();
-  void operation().catch((error: unknown) =>
-    reportBackgroundError(context, error),
-  );
+  const generation = cancellationGeneration;
+  const scheduled = automaticUpdateTail
+    .catch(() => undefined)
+    .then(async () => {
+      if (!(await waitUntilCoreUpdateIsIdle(generation))) return;
+      if (shuttingDown || generation !== cancellationGeneration) return;
+
+      // Reset cancellation only when this operation is actually about to start.
+      // Resetting while another operation is draining allows an older queued task
+      // to reopen the progress window after the user has closed it.
+      resetCitationRequestCancellation();
+      await operation();
+    });
+  automaticUpdateTail = scheduled.catch((error: unknown) => {
+    reportBackgroundError(context, error);
+  });
 }
 
 function schedulePendingItems(): void {
@@ -72,6 +93,7 @@ export function registerAutomaticCitationUpdates(): void {
   resetCitationRequestCancellation();
   if (notifierID) return;
   unregisterCancellationHandler = registerUpdateCancellationHandler(() => {
+    cancellationGeneration += 1;
     if (pendingTimer) clearTimeout(pendingTimer);
     if (startupTimer) clearTimeout(startupTimer);
     pendingTimer = null;
@@ -115,6 +137,7 @@ export function registerAutomaticCitationUpdates(): void {
 
 export function unregisterAutomaticCitationUpdates(): void {
   shuttingDown = true;
+  cancellationGeneration += 1;
   if (notifierID) {
     Zotero.Notifier.unregisterObserver(notifierID);
     notifierID = null;

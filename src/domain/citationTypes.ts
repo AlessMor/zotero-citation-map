@@ -5,6 +5,9 @@ export type CitationProviderID =
 
 export type IdentifierKind = "doi" | "pmid" | "arxiv" | "isbn" | "title";
 
+export type RelationshipUpdateStatus =
+  "complete" | "first-hop-ready" | "empty" | "unavailable";
+
 export type CitationMetricStatus =
   | "success"
   | "not-found"
@@ -44,6 +47,12 @@ export interface LibraryUpdateState {
   /** Provider-reported totals, retained even when only the first page is cached. */
   referencesReportedCount?: number | null;
   citedByReportedCount?: number | null;
+  /** Outcome of the most recent relationship attempt for each direction. */
+  referencesStatus?: RelationshipUpdateStatus;
+  citedByStatus?: RelationshipUpdateStatus;
+  /** Failed or unavailable relationship attempts are not retried before this time. */
+  referencesNextRetryAt?: string | null;
+  citedByNextRetryAt?: string | null;
   /** Provider work IDs discovered during batched enrichment and reused by relationship refreshes. */
   providerWorkIDs?: Partial<Record<CitationProviderID, string>>;
 }
@@ -55,8 +64,6 @@ export interface SourceMetrics {
   hIndex: number | null;
   i10Index: number | null;
   updatedAt: string | null;
-  /** Complete-library update policy that attempted these source metrics. */
-  libraryUpdateVersion?: number;
   /** Independently refreshed parts of a complete Zotero-library update. */
   libraryUpdateState?: LibraryUpdateState;
 }

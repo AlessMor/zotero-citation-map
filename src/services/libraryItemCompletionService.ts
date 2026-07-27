@@ -1,4 +1,8 @@
-import type { CitationMetricRecord } from "../domain/citationTypes";
+import type {
+  CitationMetricRecord,
+  RelationshipUpdateStatus,
+  SourceMetrics,
+} from "../domain/citationTypes";
 import type { CitationGraphNode } from "../domain/graphTypes";
 import { isCitationRequestCancellationRequested } from "../providers/http";
 import {
@@ -18,7 +22,6 @@ import {
   RELATIONSHIP_ITEM_PARALLELISM,
 } from "./providerExecutionPolicy";
 import { getStoredRelationshipEntry } from "./relationshipStoreService";
-import { LIBRARY_UPDATE_COMPLETION_VERSION } from "./libraryUpdatePolicy";
 import {
   enrichLibrarySourceMetrics,
   type LibrarySourceMetricResult,
@@ -56,7 +59,12 @@ interface RelationshipTask {
 
 interface StoredRelationshipResolution extends RelationshipRefreshResolution {
   updatedAt: string;
+  status: RelationshipUpdateStatus;
+  nextRetryAt: string | null;
 }
+
+const RELATIONSHIP_ERROR_RETRY_MS = 24 * 60 * 60 * 1000;
+const RELATIONSHIP_UNAVAILABLE_RETRY_MS = 7 * 24 * 60 * 60 * 1000;
 
 async function yieldToEventLoop(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -135,6 +143,25 @@ function relationshipLoadedCountKey(
     : "citedByLoadedCount";
 }
 
+function relationshipStatusKey(
+  direction: RelationshipDirection,
+): "referencesStatus" | "citedByStatus" {
+  return direction === "references" ? "referencesStatus" : "citedByStatus";
+}
+
+function relationshipNextRetryKey(
+  direction: RelationshipDirection,
+): "referencesNextRetryAt" | "citedByNextRetryAt" {
+  return direction === "references"
+    ? "referencesNextRetryAt"
+    : "citedByNextRetryAt";
+}
+
+function retryIsDeferred(value: string | null | undefined): boolean {
+  const timestamp = Date.parse(value ?? "");
+  return Number.isFinite(timestamp) && timestamp > Date.now();
+}
+
 function relationshipNeedsRefresh(
   node: CitationGraphNode,
   direction: RelationshipDirection,
@@ -143,23 +170,51 @@ function relationshipNeedsRefresh(
   mode: LibraryRelationshipLoadMode,
   maximum: number,
 ): boolean {
-  const entry = getStoredRelationshipEntry(node, direction);
-  if (force || !entry) return true;
+  if (force) return true;
 
   const state = record.sourceMetrics?.libraryUpdateState;
-  const timestamp = Date.parse(state?.[relationshipStateKey(direction)] ?? "");
+  const status = state?.[relationshipStatusKey(direction)];
+  if (
+    status === "unavailable" &&
+    retryIsDeferred(state?.[relationshipNextRetryKey(direction)])
+  ) {
+    return false;
+  }
+
+  const entry = getStoredRelationshipEntry(node, direction);
+  if (!entry) return true;
+
+  const timestamp = Date.parse(
+    state?.[relationshipStateKey(direction)] ?? entry.fetchedAt,
+  );
   const stale =
     !Number.isFinite(timestamp) ||
     Date.now() - timestamp >= getCacheDays() * 86400000;
   if (stale) return true;
-  if (state?.[relationshipCompleteKey(direction)]) return false;
+
+  if (status === "empty" || state?.[relationshipCompleteKey(direction)]) {
+    return false;
+  }
 
   // A direct single-paper update may explicitly finish an existing partial
-  // cache. Bulk updates only guarantee one display-ready first hop.
+  // cache. Bulk updates only guarantee a display-ready first hop.
   if (mode === "complete") return true;
+  if (status === "first-hop-ready") return false;
+
   const loaded =
     state?.[relationshipLoadedCountKey(direction)] ?? entry.works.length;
-  return loaded < maximum;
+  return loaded <= 0 && maximum > 0;
+}
+
+function statusForResolution(
+  resolution: RelationshipRefreshResolution,
+): RelationshipUpdateStatus {
+  if (resolution.reportedCount === 0 && resolution.identifiedCount === 0) {
+    return "empty";
+  }
+  if (resolution.complete) return "complete";
+  if (resolution.identifiedCount > 0) return "first-hop-ready";
+  return "unavailable";
 }
 
 function rememberRelationshipResolution(
@@ -170,29 +225,57 @@ function rememberRelationshipResolution(
   itemKey: string,
   direction: RelationshipDirection,
   resolution: RelationshipRefreshResolution,
-): void {
-  const byDirection = resolutions.get(itemKey) ?? new Map();
-  byDirection.set(direction, {
+): StoredRelationshipResolution {
+  const now = Date.now();
+  const status = statusForResolution(resolution);
+  const stored: StoredRelationshipResolution = {
     ...resolution,
-    updatedAt: new Date().toISOString(),
-  });
+    updatedAt: new Date(now).toISOString(),
+    status,
+    nextRetryAt:
+      status === "unavailable"
+        ? new Date(now + RELATIONSHIP_UNAVAILABLE_RETRY_MS).toISOString()
+        : null,
+  };
+  const byDirection = resolutions.get(itemKey) ?? new Map();
+  byDirection.set(direction, stored);
   resolutions.set(itemKey, byDirection);
+  return stored;
+}
+
+function rememberRelationshipFailure(
+  resolutions: Map<
+    string,
+    Map<RelationshipDirection, StoredRelationshipResolution>
+  >,
+  node: CitationGraphNode,
+  direction: RelationshipDirection,
+): void {
+  const now = Date.now();
+  const existing = getStoredRelationshipEntry(node, direction);
+  const reportedCount =
+    direction === "references" ? node.referenceCount : node.citationCount;
+  const byDirection = resolutions.get(node.itemKey) ?? new Map();
+  byDirection.set(direction, {
+    complete: false,
+    provider: null,
+    reportedCount,
+    identifiedCount: existing?.works.length ?? 0,
+    updatedAt: new Date(now).toISOString(),
+    status: "unavailable",
+    nextRetryAt: new Date(now + RELATIONSHIP_ERROR_RETRY_MS).toISOString(),
+  });
+  resolutions.set(node.itemKey, byDirection);
 }
 
 function isExpectedBoundedResult(
   mode: LibraryRelationshipLoadMode,
-  maximum: number,
-  resolution: RelationshipRefreshResolution,
+  resolution: StoredRelationshipResolution,
 ): boolean {
-  if (resolution.complete) return true;
-  if (mode !== "first-page") return false;
-  const expected = Math.min(
-    maximum,
-    resolution.reportedCount == null
-      ? maximum
-      : Math.max(0, resolution.reportedCount),
-  );
-  return resolution.identifiedCount >= expected;
+  if (resolution.status === "complete" || resolution.status === "empty") {
+    return true;
+  }
+  return mode === "first-page" && resolution.status === "first-hop-ready";
 }
 
 /**
@@ -324,16 +407,14 @@ export async function completeLibraryItemUpdates(
           );
         }
         relationshipListsUpdated += 1;
-        rememberRelationshipResolution(
+        const storedResolution = rememberRelationshipResolution(
           relationshipResolutions,
           node.itemKey,
           direction,
           finalResolution,
         );
 
-        if (
-          !isExpectedBoundedResult(relationshipMode, maximum, finalResolution)
-        ) {
+        if (!isExpectedBoundedResult(relationshipMode, storedResolution)) {
           relationshipFailures += 1;
           Zotero.debug(
             `Citation Map: ${direction} membership remained incomplete for ${node.itemKey} ` +
@@ -342,6 +423,7 @@ export async function completeLibraryItemUpdates(
         }
       } catch (error) {
         relationshipFailures += 1;
+        rememberRelationshipFailure(relationshipResolutions, node, direction);
         Zotero.debug(
           `Citation Map: ${relationshipMode} ${direction} update failed for ${node.itemKey}: ${String(error)}`,
         );
@@ -368,50 +450,62 @@ export async function completeLibraryItemUpdates(
     const referencesResolution = resolutions?.get("references");
     const citedByResolution = resolutions?.get("cited-by");
     const previousState = current.sourceMetrics?.libraryUpdateState ?? {};
-    const sourceMetrics = current.sourceMetrics
-      ? {
-          ...current.sourceMetrics,
-          libraryUpdateVersion: LIBRARY_UPDATE_COMPLETION_VERSION,
-          libraryUpdateState: {
-            ...previousState,
-            coreUpdatedAt: current.fetchedAt ?? finalizedAt,
-            sourceMetricsUpdatedAt:
-              current.sourceMetrics.updatedAt ?? finalizedAt,
-            referencesUpdatedAt:
-              referencesResolution?.updatedAt ??
-              previousState.referencesUpdatedAt ??
-              null,
-            citedByUpdatedAt:
-              citedByResolution?.updatedAt ??
-              previousState.citedByUpdatedAt ??
-              null,
-            referencesComplete: referencesResolution
-              ? referencesResolution.complete
-              : (previousState.referencesComplete ?? false),
-            citedByComplete: citedByResolution
-              ? citedByResolution.complete
-              : (previousState.citedByComplete ?? false),
-            referencesLoadedCount: referencesResolution
-              ? referencesResolution.identifiedCount
-              : (previousState.referencesLoadedCount ?? 0),
-            citedByLoadedCount: citedByResolution
-              ? citedByResolution.identifiedCount
-              : (previousState.citedByLoadedCount ?? 0),
-            referencesReportedCount: referencesResolution
-              ? referencesResolution.reportedCount
-              : (previousState.referencesReportedCount ?? null),
-            citedByReportedCount: citedByResolution
-              ? citedByResolution.reportedCount
-              : (previousState.citedByReportedCount ?? null),
-            providerWorkIDs: {
-              ...(previousState.providerWorkIDs ?? {}),
-              ...(options.providerIdentitiesByItemKey?.get(record.itemKey) ??
-                {}),
-            },
-          },
-        }
-      : null;
-    if (sourceMetrics) finalRecords.push({ ...current, sourceMetrics });
+    const baseSourceMetrics: SourceMetrics = current.sourceMetrics ?? {
+      sourceID: null,
+      sourceTitle: current.sourceTitle,
+      twoYearMeanCitedness: null,
+      hIndex: null,
+      i10Index: null,
+      updatedAt: finalizedAt,
+    };
+    const sourceMetrics: SourceMetrics = {
+      ...baseSourceMetrics,
+      libraryUpdateState: {
+        ...previousState,
+        coreUpdatedAt: current.fetchedAt ?? finalizedAt,
+        sourceMetricsUpdatedAt: baseSourceMetrics.updatedAt ?? finalizedAt,
+        referencesUpdatedAt:
+          referencesResolution?.updatedAt ??
+          previousState.referencesUpdatedAt ??
+          null,
+        citedByUpdatedAt:
+          citedByResolution?.updatedAt ??
+          previousState.citedByUpdatedAt ??
+          null,
+        referencesComplete: referencesResolution
+          ? referencesResolution.complete
+          : (previousState.referencesComplete ?? false),
+        citedByComplete: citedByResolution
+          ? citedByResolution.complete
+          : (previousState.citedByComplete ?? false),
+        referencesLoadedCount: referencesResolution
+          ? referencesResolution.identifiedCount
+          : (previousState.referencesLoadedCount ?? 0),
+        citedByLoadedCount: citedByResolution
+          ? citedByResolution.identifiedCount
+          : (previousState.citedByLoadedCount ?? 0),
+        referencesReportedCount: referencesResolution
+          ? referencesResolution.reportedCount
+          : (previousState.referencesReportedCount ?? null),
+        citedByReportedCount: citedByResolution
+          ? citedByResolution.reportedCount
+          : (previousState.citedByReportedCount ?? null),
+        referencesStatus:
+          referencesResolution?.status ?? previousState.referencesStatus,
+        citedByStatus: citedByResolution?.status ?? previousState.citedByStatus,
+        referencesNextRetryAt: referencesResolution
+          ? referencesResolution.nextRetryAt
+          : (previousState.referencesNextRetryAt ?? null),
+        citedByNextRetryAt: citedByResolution
+          ? citedByResolution.nextRetryAt
+          : (previousState.citedByNextRetryAt ?? null),
+        providerWorkIDs: {
+          ...(previousState.providerWorkIDs ?? {}),
+          ...(options.providerIdentitiesByItemKey?.get(record.itemKey) ?? {}),
+        },
+      },
+    };
+    finalRecords.push({ ...current, sourceMetrics });
   }
 
   for (

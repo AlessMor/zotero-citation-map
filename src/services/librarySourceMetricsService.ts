@@ -7,14 +7,17 @@ import {
   requestJSON,
 } from "../providers/http";
 import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
-import { getOpenAlexAPIKey, isProviderEnabled } from "./citationPreferences";
+import {
+  getCacheDays,
+  getOpenAlexAPIKey,
+  isProviderEnabled,
+} from "./citationPreferences";
 import { cachedExternalWorkMetadata } from "./externalWorkCacheService";
 import {
   providerExecutionPolicy,
   SOURCE_RECORD_WRITE_CHUNK_SIZE,
 } from "./providerExecutionPolicy";
 import { saveCitationMetricRecord } from "./citationMetricsStore";
-import { LIBRARY_UPDATE_COMPLETION_VERSION } from "./libraryUpdatePolicy";
 
 interface OpenAlexSource {
   id?: string;
@@ -134,7 +137,6 @@ function metricsFromSource(
     hIndex: numberOrNull(stats?.h_index),
     i10Index: numberOrNull(stats?.i10_index),
     updatedAt: new Date().toISOString(),
-    libraryUpdateVersion: LIBRARY_UPDATE_COMPLETION_VERSION,
   };
   return metrics.twoYearMeanCitedness !== null ||
     metrics.hIndex !== null ||
@@ -185,6 +187,16 @@ function hasSourceMetrics(metrics: SourceMetrics | null | undefined): boolean {
     (metrics.twoYearMeanCitedness !== null ||
       metrics.hIndex !== null ||
       metrics.i10Index !== null),
+  );
+}
+
+function sourceMetricsAreCurrent(
+  metrics: SourceMetrics | null | undefined,
+): boolean {
+  const timestamp = Date.parse(metrics?.updatedAt ?? "");
+  return (
+    Number.isFinite(timestamp) &&
+    Date.now() - timestamp < getCacheDays() * 86400000
   );
 }
 
@@ -279,6 +291,20 @@ async function fetchSourceByTitle(
   return selected ? metricsFromSource(selected) : null;
 }
 
+function fallbackSourceMetrics(target: SourceTarget): SourceMetrics {
+  const existing = target.record.sourceMetrics;
+  return existing
+    ? { ...existing, updatedAt: new Date().toISOString() }
+    : {
+        sourceID: target.sourceID,
+        sourceTitle: target.sourceTitle,
+        twoYearMeanCitedness: null,
+        hIndex: null,
+        i10Index: null,
+        updatedAt: new Date().toISOString(),
+      };
+}
+
 /**
  * Resolve journal/source metrics for Zotero library items as an update phase.
  * Work and source identities are deduplicated across the complete update job,
@@ -294,14 +320,13 @@ export async function enrichLibrarySourceMetrics(
   const itemByKey = new Map(items.map((item) => [String(item.key), item]));
   const targets: SourceTarget[] = [];
   let cachedResolved = 0;
+
   for (const [recordIndex, record] of records.entries()) {
-    if (
-      !options.force &&
-      record.sourceMetrics?.libraryUpdateVersion ===
-        LIBRARY_UPDATE_COMPLETION_VERSION
-    ) {
+    if (!options.force && sourceMetricsAreCurrent(record.sourceMetrics)) {
+      if (hasSourceMetrics(record.sourceMetrics)) cachedResolved += 1;
       continue;
     }
+
     const doi = normalizeDOI(record.doi);
     const openAlexID =
       record.provider === "openalex"
@@ -313,17 +338,24 @@ export async function enrichLibrarySourceMetrics(
         ? cachedExternalWorkMetadata(`openalex:${openAlexID}`)
         : null);
     const cachedSourceMetrics = cachedWork?.sourceMetrics;
-    if (cachedSourceMetrics && hasSourceMetrics(cachedSourceMetrics)) {
+    if (
+      !options.force &&
+      cachedSourceMetrics &&
+      sourceMetricsAreCurrent(cachedSourceMetrics)
+    ) {
       records[recordIndex] = {
         ...record,
         sourceMetrics: {
           ...cachedSourceMetrics,
-          libraryUpdateVersion: LIBRARY_UPDATE_COMPLETION_VERSION,
+          libraryUpdateState:
+            record.sourceMetrics?.libraryUpdateState ??
+            cachedSourceMetrics.libraryUpdateState,
         },
       };
-      cachedResolved += 1;
+      if (hasSourceMetrics(cachedSourceMetrics)) cachedResolved += 1;
       continue;
     }
+
     const item = itemByKey.get(record.itemKey);
     if (!item) continue;
     targets.push({
@@ -354,22 +386,7 @@ export async function enrichLibrarySourceMetrics(
   if (!getOpenAlexAPIKey() || !isProviderEnabled("openalex")) {
     for (const batch of chunked(targets, SOURCE_RECORD_WRITE_CHUNK_SIZE)) {
       const changed = batch.map((target) => {
-        const existing = target.record.sourceMetrics;
-        const sourceMetrics: SourceMetrics = existing
-          ? {
-              ...existing,
-              updatedAt: new Date().toISOString(),
-              libraryUpdateVersion: LIBRARY_UPDATE_COMPLETION_VERSION,
-            }
-          : {
-              sourceID: null,
-              sourceTitle: target.sourceTitle,
-              twoYearMeanCitedness: null,
-              hIndex: null,
-              i10Index: null,
-              updatedAt: new Date().toISOString(),
-              libraryUpdateVersion: LIBRARY_UPDATE_COMPLETION_VERSION,
-            };
+        const sourceMetrics = fallbackSourceMetrics(target);
         const updatedRecord: CitationMetricRecord = {
           ...target.record,
           sourceMetrics,
@@ -398,14 +415,6 @@ export async function enrichLibrarySourceMetrics(
   const metricsByTarget = new Map<number, SourceMetrics>();
   const sourceIDByTarget = new Map<number, string>();
   for (const [targetIndex, target] of targets.entries()) {
-    const existingMetrics = target.record.sourceMetrics;
-    if (existingMetrics && hasSourceMetrics(existingMetrics)) {
-      metricsByTarget.set(targetIndex, {
-        ...existingMetrics,
-        updatedAt: new Date().toISOString(),
-        libraryUpdateVersion: LIBRARY_UPDATE_COMPLETION_VERSION,
-      });
-    }
     if (target.sourceID) sourceIDByTarget.set(targetIndex, target.sourceID);
   }
 
@@ -420,9 +429,7 @@ export async function enrichLibrarySourceMetrics(
       ): candidate is {
         targetIndex: number;
         identifier: { kind: "openalex" | "doi"; key: string };
-      } =>
-        Boolean(candidate.identifier) &&
-        !metricsByTarget.has(candidate.targetIndex),
+      } => Boolean(candidate.identifier),
     );
   const openAlexPolicy = providerExecutionPolicy("openalex");
   const workBatchSize = Math.min(100, openAlexPolicy.batchSize);
@@ -451,8 +458,9 @@ export async function enrichLibrarySourceMetrics(
         }
         const workByIdentity = new Map<string, OpenAlexWork>();
         for (const work of response.data.results ?? []) {
-          for (const key of workIdentityKeys(work))
+          for (const key of workIdentityKeys(work)) {
             workByIdentity.set(key, work);
+          }
         }
         for (const candidate of batch) {
           const key = `${candidate.identifier.kind}:${candidate.identifier.key}`;
@@ -536,17 +544,9 @@ export async function enrichLibrarySourceMetrics(
       const metrics: SourceMetrics = resolvedMetrics
         ? {
             ...resolvedMetrics,
-            libraryUpdateVersion: LIBRARY_UPDATE_COMPLETION_VERSION,
+            libraryUpdateState: target.record.sourceMetrics?.libraryUpdateState,
           }
-        : {
-            sourceID: target.sourceID,
-            sourceTitle: target.sourceTitle,
-            twoYearMeanCitedness: null,
-            hIndex: null,
-            i10Index: null,
-            updatedAt: new Date().toISOString(),
-            libraryUpdateVersion: LIBRARY_UPDATE_COMPLETION_VERSION,
-          };
+        : fallbackSourceMetrics(target);
       completed += 1;
       const current = records[target.recordIndex];
       const updatedRecord: CitationMetricRecord = {

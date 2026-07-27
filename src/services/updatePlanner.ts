@@ -2,6 +2,7 @@ import type {
   CitationMetricRecord,
   CitationProviderPreference,
   LibraryUpdateState,
+  RelationshipUpdateStatus,
   WorkIdentifiers,
 } from "../domain/citationTypes";
 import { extractWorkIdentifiers } from "./citationIdentifiers";
@@ -15,8 +16,6 @@ import {
   type RelationshipStoreSubject,
   type StoredRelationshipDirection,
 } from "./relationshipStoreService";
-import { LIBRARY_UPDATE_COMPLETION_VERSION } from "./libraryUpdatePolicy";
-import { RELATIONSHIP_BULK_EAGER_LIMIT } from "./providerExecutionPolicy";
 
 export interface PlannedCitationItem {
   item: Zotero.Item;
@@ -34,28 +33,41 @@ export interface CitationUpdatePlan {
   cached: number;
 }
 
-function relationshipStateValues(
-  state: LibraryUpdateState,
-  direction: StoredRelationshipDirection,
-): {
+interface RelationshipStateValues {
   updatedAt: string | null | undefined;
   complete: boolean;
   loadedCount: number | undefined;
   reportedCount: number | null | undefined;
-} {
+  status: RelationshipUpdateStatus | undefined;
+  nextRetryAt: string | null | undefined;
+}
+
+function relationshipStateValues(
+  state: LibraryUpdateState,
+  direction: StoredRelationshipDirection,
+): RelationshipStateValues {
   return direction === "references"
     ? {
         updatedAt: state.referencesUpdatedAt,
         complete: Boolean(state.referencesComplete),
         loadedCount: state.referencesLoadedCount,
         reportedCount: state.referencesReportedCount,
+        status: state.referencesStatus,
+        nextRetryAt: state.referencesNextRetryAt,
       }
     : {
         updatedAt: state.citedByUpdatedAt,
         complete: Boolean(state.citedByComplete),
         loadedCount: state.citedByLoadedCount,
         reportedCount: state.citedByReportedCount,
+        status: state.citedByStatus,
+        nextRetryAt: state.citedByNextRetryAt,
       };
+}
+
+function retryIsDeferred(value: string | null | undefined): boolean {
+  const timestamp = Date.parse(value ?? "");
+  return Number.isFinite(timestamp) && timestamp > Date.now();
 }
 
 function relationshipFirstHopIsCurrent(
@@ -64,37 +76,49 @@ function relationshipFirstHopIsCurrent(
   direction: StoredRelationshipDirection,
   maxAgeMs: number,
 ): boolean {
-  const entry = getStoredRelationshipEntry(subject, direction);
-  if (!entry) return false;
   const values = relationshipStateValues(state, direction);
-  const timestamp = Date.parse(values.updatedAt ?? "");
+
+  // Absence of relationship state is not a migration trigger. Existing citation
+  // records remain current and relationship summaries are populated the next
+  // time their core record is genuinely refreshed or the user opens the list.
+  if (
+    values.status === undefined &&
+    values.updatedAt == null &&
+    values.nextRetryAt == null
+  ) {
+    return true;
+  }
+
+  if (values.status === "unavailable") {
+    return retryIsDeferred(values.nextRetryAt);
+  }
+
+  const entry = getStoredRelationshipEntry(subject, direction);
+  const timestamp = Date.parse(values.updatedAt ?? entry?.fetchedAt ?? "");
   if (!Number.isFinite(timestamp) || Date.now() - timestamp >= maxAgeMs) {
     return false;
   }
-  if (values.complete) return true;
 
-  const loadedCount = values.loadedCount ?? entry.works.length;
-  const target = Math.min(
-    RELATIONSHIP_BULK_EAGER_LIMIT,
-    values.reportedCount == null
-      ? RELATIONSHIP_BULK_EAGER_LIMIT
-      : Math.max(0, values.reportedCount),
-  );
-  return loadedCount >= target;
+  if (values.status === "empty") return true;
+  if (values.status === "complete" || values.complete) return Boolean(entry);
+  if (values.status === "first-hop-ready") return Boolean(entry);
+
+  // Legacy state from the first one-hop implementation: any fresh attempted
+  // result is accepted even when no selected cache row was written or provider
+  // deduplication returned fewer than the nominal page size. It can be retried
+  // after the normal cache interval instead of at every startup.
+  return true;
 }
 
-function hasCompleteLibraryUpdate(
+function hasCurrentLibraryUpdate(
   item: Zotero.Item,
   record: CitationMetricRecord | null,
 ): boolean {
-  if (
-    !record ||
-    record.status !== "success" ||
-    record.sourceMetrics?.libraryUpdateVersion !==
-      LIBRARY_UPDATE_COMPLETION_VERSION
-  ) {
-    return false;
-  }
+  if (!record || record.status !== "success") return false;
+
+  const state = record.sourceMetrics?.libraryUpdateState;
+  if (!state) return true;
+
   const subject: RelationshipStoreSubject = {
     itemID: Number(item.id),
     itemKey: String(item.key),
@@ -104,8 +128,6 @@ function hasCompleteLibraryUpdate(
     title: record.title ?? String(item.getField?.("title") ?? ""),
     year: record.year,
   };
-  const state = record.sourceMetrics.libraryUpdateState;
-  if (!state) return false;
   const maxAgeMs = getCacheDays() * 86400000;
   return (
     relationshipFirstHopIsCurrent(subject, state, "references", maxAgeMs) &&
@@ -148,7 +170,7 @@ export function createCitationUpdatePlan(
         provider,
         getCacheDays(),
       );
-    const needsCompletionRefresh = !hasCompleteLibraryUpdate(item, previous);
+    const needsCompletionRefresh = !hasCurrentLibraryUpdate(item, previous);
     if (!needsCoreRefresh && !needsCompletionRefresh) {
       cached += 1;
       continue;
