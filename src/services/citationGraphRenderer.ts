@@ -35,6 +35,7 @@ export interface GhostPreview {
   citationCount: number | null;
   referenceCount: number | null;
   sourceKeys: string[];
+  contextLabel?: string;
 }
 
 export interface CitationGraphRendererOptions {
@@ -294,6 +295,7 @@ export class CitationGraphRenderer {
   private selectedKey: string | null = null;
   private hoverKey: string | null = null;
   private ghostPreview: GhostPreview | null = null;
+  private transientPreview: GhostPreview | null = null;
   private transform = { x: 0, y: 0, scale: 1 };
   private pointer = {
     down: false,
@@ -1176,18 +1178,18 @@ export class CitationGraphRenderer {
     );
   }
 
-  private drawGhost(): void {
-    if (!this.ghostPreview) return;
-    const sources = this.ghostPreview.sourceKeys
+  private drawGhost(preview: GhostPreview): void {
+    const sources = preview.sourceKeys
       .map((key) => this.positions.get(key))
       .filter((position): position is Position => Boolean(position));
-    if (!sources.length) return;
 
-    const centroidX =
-      sources.reduce((sum, source) => sum + source.x, 0) / sources.length;
-    const centroidY =
-      sources.reduce((sum, source) => sum + source.y, 0) / sources.length;
-    const seed = hash(this.ghostPreview.key);
+    const centroidX = sources.length
+      ? sources.reduce((sum, source) => sum + source.x, 0) / sources.length
+      : (PLOT_LEFT + PLOT_RIGHT) / 2;
+    const centroidY = sources.length
+      ? sources.reduce((sum, source) => sum + source.y, 0) / sources.length
+      : (PLOT_TOP + PLOT_BOTTOM) / 2;
+    const seed = hash(preview.key);
     const angle = ((seed % 360) * Math.PI) / 180;
     const radius = 70 + (seed % 31);
     let x = clamp(centroidX + Math.cos(angle) * radius, PLOT_LEFT, PLOT_RIGHT);
@@ -1196,8 +1198,8 @@ export class CitationGraphRenderer {
     const nodes = this.visibleNodes();
     const xScale = this.axisScale(nodes, "x");
     const yScale = this.axisScale(nodes, "y");
-    const xValue = ghostMetricNumber(this.ghostPreview, this.layout.xMetric);
-    const yValue = ghostMetricNumber(this.ghostPreview, this.layout.yMetric);
+    const xValue = ghostMetricNumber(preview, this.layout.xMetric);
+    const yValue = ghostMetricNumber(preview, this.layout.yMetric);
     if (xScale && this.layout.xMetric !== "free") {
       const positionedValue = xValue ?? 0;
       x =
@@ -1249,13 +1251,27 @@ export class CitationGraphRenderer {
     context.arc(x, y, 12, 0, Math.PI * 2);
     context.fillStyle = "rgba(148, 163, 184, .45)";
     context.fill();
+    if (preview.contextLabel) {
+      context.beginPath();
+      context.arc(x, y, 16, 0, Math.PI * 2);
+      context.lineWidth = 2.4;
+      context.strokeStyle = "rgba(37, 99, 235, .92)";
+      context.stroke();
+    }
     context.setLineDash([]);
     context.fillStyle = this.isDarkMode()
       ? "rgba(248,250,252,.94)"
       : "rgba(30,41,59,.9)";
     context.font = "11px sans-serif";
     context.textAlign = "center";
-    context.fillText(this.ghostPreview.title.slice(0, 50), x, y + 25);
+    context.fillText(preview.title.slice(0, 50), x, y + 25);
+    if (preview.contextLabel) {
+      context.fillStyle = this.isDarkMode()
+        ? "rgba(191, 219, 254, .95)"
+        : "rgba(30, 64, 175, .95)";
+      context.font = "600 10px sans-serif";
+      context.fillText(preview.contextLabel, x, y + 39);
+    }
     context.restore();
   }
 
@@ -1327,7 +1343,8 @@ export class CitationGraphRenderer {
       }
       this.drawLabels(nodes, radii);
       this.drawLegend(colorDomain);
-      this.drawGhost();
+      if (this.transientPreview) this.drawGhost(this.transientPreview);
+      if (this.ghostPreview) this.drawGhost(this.ghostPreview);
       context.restore();
       this.drawAxes(nodes);
     } catch (error) {
@@ -1428,6 +1445,11 @@ export class CitationGraphRenderer {
 
   public setGhostPreview(preview: GhostPreview | null): void {
     this.ghostPreview = preview;
+    this.draw();
+  }
+
+  public setTransientPreview(preview: GhostPreview | null): void {
+    this.transientPreview = preview;
     this.draw();
   }
 

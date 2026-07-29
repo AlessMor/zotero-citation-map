@@ -27,13 +27,7 @@
     class="citation-map-pref-help citation-map-pref-help-unindented citation-map-general-actions-help"
     data-l10n-id="pref-general-actions-help"
   />
-  <hbox class="citation-map-pref-actions citation-map-general-actions">
-    <html:button
-      class="citation-map-primary-button"
-      type="button"
-      data-l10n-id="pref-refresh-all"
-      onclick="Zotero.CitationMap.api.refreshAll()"
-    ></html:button>
+  <hbox class="citation-map-pref-actions">
     <html:button
       class="citation-map-danger-button"
       type="button"
@@ -45,6 +39,39 @@
 
 <groupbox class="citation-map-preferences citation-map-settings-section">
   <label><html:h2 data-l10n-id="pref-field-update-heading"></html:h2></label>
+
+  <html:h3 data-l10n-id="pref-update-libraries-heading"></html:h3>
+  <html:div
+    id="zotero-prefpane-citationmap-update-libraries"
+    class="citation-map-update-libraries"
+  >
+    <html:div class="citation-map-update-library-header">
+      <html:div class="citation-map-update-library-actions">
+        <html:button
+          id="zotero-prefpane-citationmap-update-select-all"
+          type="button"
+          data-l10n-id="pref-update-libraries-select-all"
+        ></html:button>
+        <html:button
+          id="zotero-prefpane-citationmap-update-clear-all"
+          type="button"
+          data-l10n-id="pref-update-libraries-clear-all"
+        ></html:button>
+      </html:div>
+    </html:div>
+    <html:div
+      id="zotero-prefpane-citationmap-update-library-list"
+      class="citation-map-update-library-list"
+    ></html:div>
+    <html:div
+      id="zotero-prefpane-citationmap-update-library-status"
+      class="citation-map-pref-help citation-map-update-library-status"
+    ></html:div>
+    <description
+      class="citation-map-pref-help citation-map-update-library-help"
+      data-l10n-id="pref-update-libraries-help"
+    />
+  </html:div>
 
   <html:h3 data-l10n-id="pref-update-behaviour-heading"></html:h3>
   <html:label class="citation-map-parent-option">
@@ -104,6 +131,20 @@
     class="citation-map-pref-help citation-map-pref-help-unindented"
     data-l10n-id="pref-cache-days-help"
   />
+
+  <description
+    class="citation-map-pref-help citation-map-pref-help-unindented citation-map-update-action-help"
+    data-l10n-id="pref-update-all-help"
+  />
+  <hbox class="citation-map-pref-actions">
+    <html:button
+      id="zotero-prefpane-citationmap-refresh-selected"
+      class="citation-map-primary-button"
+      type="button"
+      data-l10n-id="pref-refresh-all"
+      onclick="Zotero.CitationMap.api.refreshAll()"
+    ></html:button>
+  </hbox>
 </groupbox>
 
 <groupbox class="citation-map-preferences citation-map-settings-section">

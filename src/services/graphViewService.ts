@@ -105,8 +105,21 @@ import {
   setGraphAppearance,
 } from "./citationPreferences";
 
+export type CitationMapFocusResult = "selected" | "revealed" | "not-found";
+
+export interface CitationMapViewController {
+  focusItem(itemID: number): CitationMapFocusResult;
+}
+
 const HTML_NS = "http://www.w3.org/1999/xhtml";
 const cleanupByMount = new WeakMap<Element, () => void>();
+const controllerByMount = new WeakMap<Element, CitationMapViewController>();
+
+export function getCitationMapViewController(
+  mount: Element,
+): CitationMapViewController | null {
+  return controllerByMount.get(mount) ?? null;
+}
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.max(minimum, Math.min(maximum, value));
@@ -985,6 +998,7 @@ function createCollectionChooser(
 export function destroyCitationMapView(mount: Element): void {
   cleanupByMount.get(mount)?.();
   cleanupByMount.delete(mount);
+  controllerByMount.delete(mount);
 }
 
 export function renderCitationMapView(
@@ -1001,6 +1015,7 @@ export function renderCitationMapView(
   const visuals = buildCollectionVisuals(snapshot, model.nodes);
   let visibleKeys = new Set(model.nodes.map((node) => node.key));
   let selectedNode: CitationGraphNode | null = null;
+  let transientFocusNode: CitationGraphNode | null = null;
   let activeRelationshipView: {
     itemKey: string;
     direction: "references" | "cited-by";
@@ -1939,9 +1954,42 @@ export function renderCitationMapView(
     renderList();
   }
 
+  function transientSourceKeys(node: CitationGraphNode): string[] {
+    const connected = new Set<string>();
+    for (const edge of model.edges) {
+      if (edge.source === node.key && visibleKeys.has(edge.target)) {
+        connected.add(edge.target);
+      } else if (edge.target === node.key && visibleKeys.has(edge.source)) {
+        connected.add(edge.source);
+      }
+    }
+    return [...connected];
+  }
+
+  function showTransientPreview(node: CitationGraphNode): void {
+    renderer?.setTransientPreview({
+      key: `filtered:${node.key}`,
+      title: node.title,
+      year: node.year,
+      citationCount: node.citationCount,
+      referenceCount: node.referenceCount,
+      sourceKeys: transientSourceKeys(node),
+      contextLabel: "Outside current filters",
+    });
+  }
+
   function renderOverview(node: CitationGraphNode | null): void {
     activeRelationshipView = null;
+    const preserveTransient = Boolean(
+      node &&
+      transientFocusNode?.key === node.key &&
+      !visibleKeys.has(node.key),
+    );
     renderer?.setGhostPreview(null);
+    if (!preserveTransient) {
+      transientFocusNode = null;
+      renderer?.setTransientPreview(null);
+    }
     similarRequestGeneration += 1;
     inlineSimilarResults = null;
     clear(detail);
@@ -2041,6 +2089,7 @@ export function renderCitationMapView(
     );
     inlineSimilarResults.style.marginTop = "10px";
     detail.appendChild(inlineSimilarResults);
+    if (preserveTransient && node) showTransientPreview(node);
   }
 
   renderer = new CitationGraphRenderer({
@@ -2086,6 +2135,20 @@ export function renderCitationMapView(
     renderer?.setVisibleKeys(visibleKeys);
     const matches = tokens.length ? new Set(visibleKeys) : null;
     renderer?.setSearchMatches(matches);
+    if (transientFocusNode) {
+      const currentNode =
+        model.nodes.find(
+          (candidate) => candidate.key === transientFocusNode?.key,
+        ) ?? transientFocusNode;
+      transientFocusNode = currentNode;
+      if (visibleKeys.has(currentNode.key)) {
+        transientFocusNode = null;
+        renderer?.setTransientPreview(null);
+        renderer?.selectNode(currentNode.key, false);
+      } else {
+        showTransientPreview(currentNode);
+      }
+    }
     updateSummary();
   };
   search.addEventListener("input", applyFilters);
@@ -2234,6 +2297,34 @@ export function renderCitationMapView(
     },
   );
 
+  const controller: CitationMapViewController = {
+    focusItem(itemID) {
+      if (!renderer) return "not-found";
+      let node = model.nodes.find((candidate) => candidate.itemID === itemID);
+      if (!node) {
+        const item = Zotero.Items.get(itemID) as Zotero.Item | null;
+        if (
+          !item ||
+          Number(item.libraryID) !== snapshot.libraryID ||
+          !item.isRegularItem?.()
+        ) {
+          return "not-found";
+        }
+        node = createMetricNodeForItem(item);
+      }
+      if (visibleKeys.has(node.key)) {
+        transientFocusNode = null;
+        renderer.setTransientPreview(null);
+        return renderer.selectNode(node.key) ? "selected" : "not-found";
+      }
+      renderer.clearSelection();
+      transientFocusNode = node;
+      renderOverview(node);
+      return "revealed";
+    },
+  };
+  controllerByMount.set(mount, controller);
+
   if (options.initialItemID) {
     const initial = model.nodes.find(
       (node) => node.itemID === options.initialItemID,
@@ -2243,6 +2334,7 @@ export function renderCitationMapView(
   updateSummary();
   const cleanup = (): void => {
     cleaned = true;
+    controllerByMount.delete(mount);
     unsubscribeRelationshipMutations();
     graphFilter.destroy();
     graphArea.removeEventListener("pointerdown", onGraphAreaPointerDown, true);

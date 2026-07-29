@@ -1,15 +1,19 @@
-import { resetCitationRequestCancellation } from "../providers/http";
+import {
+  isCitationRequestCancellationRequested,
+  resetCitationRequestCancellation,
+} from "../providers/http";
+import { getAvailableCitationLibraries } from "./citationLibraryService";
 import { registerUpdateCancellationHandler } from "./updateProgressService";
 import {
   getAutomaticUpdatesEnabled,
   getCheckStaleOnStartupEnabled,
+  getUpdateLibraryIDs,
   getUpdateModifiedItemsEnabled,
   getUpdateNewItemsEnabled,
 } from "./citationPreferences";
 import {
   unregisterAutomaticCitationUpdates as unregisterCoreAutomaticCitationUpdates,
   updateCitationDataForItems,
-  updateWholeLibraryCitationData,
   waitForCitationUpdates as waitForCoreCitationUpdates,
 } from "./citationUpdateService";
 
@@ -23,6 +27,11 @@ let shuttingDown = false;
 let unregisterCancellationHandler: (() => void) | null = null;
 let cancellationGeneration = 0;
 let automaticUpdateTail: Promise<void> = Promise.resolve();
+
+function positiveInteger(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : null;
+}
 
 function reportBackgroundError(context: string, error: unknown): void {
   const detail = error instanceof Error ? error : new Error(String(error));
@@ -63,6 +72,65 @@ function startVisibleUpdate(
   });
 }
 
+function regularItems(
+  items: Array<Zotero.Item | null | undefined>,
+): Zotero.Item[] {
+  return items.filter((item): item is Zotero.Item =>
+    Boolean(item?.isRegularItem?.() && !item.deleted),
+  );
+}
+
+function groupItemsByLibrary(items: Zotero.Item[]): Zotero.Item[][] {
+  const groups = new Map<number, Zotero.Item[]>();
+  for (const item of items) {
+    const libraryID = positiveInteger(item.libraryID);
+    if (!libraryID) continue;
+    const group = groups.get(libraryID) ?? [];
+    group.push(item);
+    groups.set(libraryID, group);
+  }
+  return [...groups.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, group]) => group);
+}
+
+function selectedUpdateLibraryIDs(): number[] {
+  const available = new Set(
+    getAvailableCitationLibraries().map((library) => library.libraryID),
+  );
+  return getUpdateLibraryIDs().filter((libraryID) => available.has(libraryID));
+}
+
+async function updateLibraryGroups(groups: Zotero.Item[][]): Promise<void> {
+  for (const items of groups) {
+    if (
+      shuttingDown ||
+      isCitationRequestCancellationRequested() ||
+      !items.length
+    ) {
+      break;
+    }
+    await updateCitationDataForItems(items, {
+      silent: false,
+      includeRelationships: false,
+    });
+  }
+}
+
+async function updateSelectedLibrariesAtStartup(): Promise<void> {
+  for (const libraryID of selectedUpdateLibraryIDs()) {
+    if (shuttingDown || isCitationRequestCancellationRequested()) break;
+    const items = regularItems(
+      (await Zotero.Items.getAll(libraryID)) as Zotero.Item[],
+    );
+    if (!items.length) continue;
+    await updateCitationDataForItems(items, {
+      silent: false,
+      includeRelationships: false,
+    });
+  }
+}
+
 function schedulePendingItems(): void {
   if (pendingTimer) clearTimeout(pendingTimer);
   pendingTimer = setTimeout(() => {
@@ -70,23 +138,25 @@ function schedulePendingItems(): void {
     if (shuttingDown) return;
     const ids = [...pendingItemIDs];
     pendingItemIDs.clear();
-    const items = ids
-      .map((id) => Zotero.Items.get(id))
-      .filter((item): item is Zotero.Item => Boolean(item));
+    const selectedLibraryIDs = new Set(selectedUpdateLibraryIDs());
+    if (!selectedLibraryIDs.size) return;
+    const items = regularItems(ids.map((id) => Zotero.Items.get(id))).filter(
+      (item) => selectedLibraryIDs.has(Number(item.libraryID)),
+    );
     if (!items.length) return;
+    const groups = groupItemsByLibrary(items);
     startVisibleUpdate("automatic update for modified items", () =>
-      updateCitationDataForItems(items, {
-        silent: false,
-        includeRelationships: false,
-      }),
+      updateLibraryGroups(groups),
     );
   }, 1200);
 }
 
 /**
  * Register automatic updates without any silent execution path. Zotero item
- * notifications are coalesced into one visible update, and the startup stale
- * item sweep also uses the normal cancellable progress window.
+ * notifications are coalesced and then processed one library at a time. All
+ * automatic work is limited to the libraries selected in Citation Map
+ * settings. Each library is processed separately through the normal cancellable
+ * progress window.
  */
 export function registerAutomaticCitationUpdates(): void {
   shuttingDown = false;
@@ -126,10 +196,7 @@ export function registerAutomaticCitationUpdates(): void {
     startupTimer = setTimeout(() => {
       startupTimer = null;
       startVisibleUpdate("startup stale-item refresh", () =>
-        updateWholeLibraryCitationData({
-          silent: false,
-          includeRelationships: false,
-        }),
+        updateSelectedLibrariesAtStartup(),
       );
     }, 30000);
   }

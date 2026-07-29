@@ -1,4 +1,5 @@
 import { config } from "../package.json";
+import "./services/transientGhostRendererService";
 import {
   closeCitationMetricsStore,
   initCitationMetricsStore,
@@ -29,6 +30,7 @@ import {
   unregisterCitationMapPreferenceObservers,
 } from "./services/preferencePaneService";
 import {
+  closeCitationMapForWindow,
   closeCitationMapWindow,
   installCitationMapTabHooks,
 } from "./services/windowService";
@@ -144,7 +146,7 @@ async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
             candidate !== win && !(candidate as any).closed,
         );
         if (!others.length) beginTeardown(false);
-        else closeCitationMapWindow();
+        else closeCitationMapForWindow(win);
       },
       { once: true },
     );
@@ -157,7 +159,7 @@ async function onMainWindowUnload(win: _ZoteroTypes.MainWindow): Promise<void> {
       candidate !== win && !(candidate as any).closed,
   );
   if (!others.length) beginTeardown(false);
-  else closeCitationMapWindow();
+  else closeCitationMapForWindow(win);
   uninstallCitationColumnTooltips(win);
   win.document.getElementById(MAIN_STYLESHEET_ID)?.remove();
   win.document.getElementById(TAB_ICON_STYLESHEET_ID)?.remove();
