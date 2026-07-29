@@ -2,6 +2,7 @@ import { config } from "../../package.json";
 import type { LibrarySnapshot } from "../domain/types";
 import {
   destroyCitationMapView,
+  getCitationMapViewController,
   renderCitationMapView,
 } from "./graphViewService";
 import { loadWholeLibrary } from "./zoteroLibraryService";
@@ -15,16 +16,51 @@ const TAB_STATE_FILTER_MARKER = "__citationMapStateFilterInstalled";
 const TAB_HOOK_MARKER = "__citationMapTabHooksInstalled";
 const NETWORK_ICON_TYPE = "citation-map-network";
 const CONTEXT_HANDLER_MARKER = "__citationMapContextHandlerInstalled";
+const LIBRARY_FILTER_MARKER = "citationMapLibraryFilterInstalled";
 const DETACHED_WINDOW_URL = `chrome://${config.addonRef}/content/citationMapWindow.xhtml`;
-let pendingSelectionItemID: number | null = null;
-let detachedWindow: Window | null = null;
-let detachedMount: HTMLElement | null = null;
-let detachedHostWindow: _ZoteroTypes.MainWindow | null = null;
+interface GraphWindowState {
+  tabID: string | null;
+  libraryID: number | null;
+  pendingSelectionItemID: number | null;
+  detachedWindow: Window | null;
+  detachedMount: HTMLElement | null;
+}
+
+const graphStateByWindow = new Map<_ZoteroTypes.MainWindow, GraphWindowState>();
+function graphState(win: _ZoteroTypes.MainWindow): GraphWindowState {
+  const existing = graphStateByWindow.get(win);
+  if (existing) return existing;
+  const created: GraphWindowState = {
+    tabID: null,
+    libraryID: null,
+    pendingSelectionItemID: null,
+    detachedWindow: null,
+    detachedMount: null,
+  };
+  graphStateByWindow.set(win, created);
+  return created;
+}
+
+function refreshLegacyGraphTabID(): void {
+  addon.data.graphTabID =
+    [...graphStateByWindow.values()].find((state) => Boolean(state.tabID))
+      ?.tabID ?? null;
+}
+
+function positiveInteger(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : null;
+}
 
 function defaultMainWindow(): _ZoteroTypes.MainWindow {
-  const win = Zotero.getMainWindows().find(
-    (candidate: any) => candidate?.ZoteroPane,
+  const windows = Zotero.getMainWindows().filter(
+    (candidate: any) => candidate?.ZoteroPane && !candidate.closed,
   );
+  const activePane = Zotero.getActiveZoteroPane?.();
+  const activeWindow = activePane
+    ? windows.find((candidate: any) => candidate.ZoteroPane === activePane)
+    : null;
+  const win = activeWindow ?? windows[0];
   if (!win) throw new Error("No Zotero main window is available.");
   return win;
 }
@@ -40,6 +76,204 @@ function liveHostWindow(
 ): _ZoteroTypes.MainWindow {
   if (preferred && !(preferred as any).closed) return preferred;
   return defaultMainWindow();
+}
+
+function selectedLibraryID(win: _ZoteroTypes.MainWindow): number {
+  const panes = [Zotero.getActiveZoteroPane?.(), win.ZoteroPane].filter(
+    (pane, index, values) => pane && values.indexOf(pane) === index,
+  );
+  for (const pane of panes as any[]) {
+    const direct = positiveInteger(pane.getSelectedLibraryID?.());
+    if (direct) return direct;
+    const selectedItems = pane.getSelectedItems?.() ?? [];
+    const fromItem = positiveInteger(selectedItems[0]?.libraryID);
+    if (fromItem) return fromItem;
+  }
+  return Zotero.Libraries.userLibraryID;
+}
+
+function requestedLibraryID(
+  win: _ZoteroTypes.MainWindow,
+  libraryID?: number | null,
+): number {
+  return positiveInteger(libraryID) ?? selectedLibraryID(win);
+}
+
+interface GraphLibraryOption {
+  libraryID: number;
+  name: string;
+}
+
+function availableGraphLibraries(
+  selectedLibrary: number,
+): GraphLibraryOption[] {
+  const libraries = new Map<number, GraphLibraryOption>();
+  const add = (value: unknown): void => {
+    const candidate = value as any;
+    const libraryID = positiveInteger(
+      typeof value === "number"
+        ? value
+        : (candidate?.libraryID ?? candidate?.id),
+    );
+    if (!libraryID) return;
+    const libraryType = String(
+      candidate?.libraryType ?? candidate?.type ?? "",
+    ).toLocaleLowerCase();
+    if (libraryType === "feed" || libraryType === "publications") return;
+    const name =
+      String(
+        candidate?.name ??
+          candidate?.libraryName ??
+          Zotero.Libraries.getName?.(libraryID) ??
+          "",
+      ).trim() || `Library ${libraryID}`;
+    libraries.set(libraryID, { libraryID, name });
+  };
+
+  add(Zotero.Libraries.userLibraryID);
+  try {
+    for (const library of (Zotero.Libraries as any).getAll?.() ?? []) {
+      add(library);
+    }
+  } catch {
+    // Fall back to the user library and groups below.
+  }
+  try {
+    for (const group of (Zotero.Groups as any)?.getAll?.() ?? []) {
+      add({
+        libraryID: group?.libraryID,
+        name: group?.name,
+        libraryType: "group",
+      });
+    }
+  } catch {
+    // Group enumeration is optional in some Zotero contexts.
+  }
+  add({
+    libraryID: selectedLibrary,
+    name: Zotero.Libraries.getName?.(selectedLibrary),
+  });
+
+  const userLibraryID = Zotero.Libraries.userLibraryID;
+  return [...libraries.values()].sort((left, right) => {
+    if (left.libraryID === userLibraryID) return -1;
+    if (right.libraryID === userLibraryID) return 1;
+    return left.name.localeCompare(right.name, undefined, {
+      sensitivity: "base",
+    });
+  });
+}
+
+function graphFilterMenu(document: Document): HTMLElement | null {
+  const menus = document.querySelectorAll('div[role="menu"]');
+  for (let menuIndex = 0; menuIndex < menus.length; menuIndex += 1) {
+    const menu = menus.item(menuIndex) as HTMLElement | null;
+    if (!menu || menu.style.display === "none") continue;
+    const options = menu.querySelectorAll("option");
+    let hasCollectionFilter = false;
+    for (let optionIndex = 0; optionIndex < options.length; optionIndex += 1) {
+      const option = options.item(optionIndex) as HTMLOptionElement | null;
+      if (option?.textContent === "Whole library") {
+        hasCollectionFilter = true;
+        break;
+      }
+    }
+    if (hasCollectionFilter) return menu;
+  }
+  return null;
+}
+
+function injectGraphLibraryFilter(
+  document: Document,
+  currentLibraryID: number,
+  onSelectLibrary: (libraryID: number) => Promise<void>,
+): void {
+  const menu = graphFilterMenu(document);
+  if (
+    !menu ||
+    menu.querySelector('[data-citation-map-library-filter="true"]')
+  ) {
+    return;
+  }
+
+  const wrapper = document.createElementNS(
+    "http://www.w3.org/1999/xhtml",
+    "label",
+  );
+  wrapper.dataset.citationMapLibraryFilter = "true";
+  Object.assign(wrapper.style, {
+    display: "grid",
+    gridTemplateColumns: "105px minmax(0, 1fr)",
+    gap: "8px",
+    alignItems: "center",
+    padding: "3px 3px 7px",
+    marginBottom: "2px",
+    borderBottom: "1px solid color-mix(in srgb, CanvasText 14%, transparent)",
+  });
+
+  const label = document.createElementNS(
+    "http://www.w3.org/1999/xhtml",
+    "span",
+  );
+  label.textContent = "Library";
+  label.style.fontSize = "11px";
+
+  const select = document.createElementNS(
+    "http://www.w3.org/1999/xhtml",
+    "select",
+  ) as HTMLSelectElement;
+  select.dataset.citationMapFilterSelect = "true";
+  select.setAttribute("aria-label", "Graph library");
+  for (const library of availableGraphLibraries(currentLibraryID)) {
+    const option = document.createElementNS(
+      "http://www.w3.org/1999/xhtml",
+      "option",
+    ) as HTMLOptionElement;
+    option.value = String(library.libraryID);
+    option.textContent = library.name;
+    select.appendChild(option);
+  }
+  select.value = String(currentLibraryID);
+  select.addEventListener("change", () => {
+    const libraryID = positiveInteger(select.value);
+    if (!libraryID || libraryID === currentLibraryID) return;
+    select.disabled = true;
+    void onSelectLibrary(libraryID).catch((error) => {
+      select.disabled = false;
+      select.value = String(currentLibraryID);
+      reportAsyncError("Citation Map: library selection failed", error);
+    });
+  });
+
+  wrapper.append(label, select);
+  menu.prepend(wrapper);
+}
+
+function installGraphLibraryFilter(
+  document: Document,
+  mount: Element,
+  currentLibraryID: number,
+  onSelectLibrary: (libraryID: number) => Promise<void>,
+): void {
+  const buttons = mount.querySelectorAll(".cm-header-toolbar button");
+  let button: HTMLButtonElement | null = null;
+  for (let index = 0; index < buttons.length; index += 1) {
+    const candidate = buttons.item(index) as HTMLButtonElement | null;
+    if (!candidate) continue;
+    const label = String(
+      candidate.getAttribute("aria-label") ?? candidate.title,
+    );
+    if (label.startsWith("Filter papers")) {
+      button = candidate;
+      break;
+    }
+  }
+  if (!button || button.dataset[LIBRARY_FILTER_MARKER] === "true") return;
+  button.dataset[LIBRARY_FILTER_MARKER] = "true";
+  const inject = (): void =>
+    injectGraphLibraryFilter(document, currentLibraryID, onSelectLibrary);
+  button.addEventListener("click", inject);
+  if (button.getAttribute("aria-expanded") === "true") inject();
 }
 
 function reportAsyncError(context: string, error: unknown): void {
@@ -74,12 +308,17 @@ async function selectPaper(
 }
 
 function renderDetachedWindow(
+  hostWindow: _ZoteroTypes.MainWindow,
   snapshot: LibrarySnapshot,
   initialItemID: number | null = null,
 ): void {
-  if (!detachedWindow || detachedWindow.closed || !detachedMount) return;
-  const host = liveHostWindow(detachedHostWindow);
-  renderCitationMapView(detachedWindow.document, detachedMount, snapshot, {
+  const state = graphState(hostWindow);
+  const popup = state.detachedWindow;
+  const mount = state.detachedMount;
+  if (!popup || popup.closed || !mount) return;
+  state.libraryID = snapshot.libraryID;
+  const host = liveHostWindow(hostWindow);
+  renderCitationMapView(popup.document, mount, snapshot, {
     mode: "window",
     onSelectPaper: (itemID) => {
       void selectPaper(host, itemID).catch((error) =>
@@ -88,6 +327,12 @@ function renderDetachedWindow(
     },
     initialItemID,
   });
+  installGraphLibraryFilter(
+    popup.document,
+    mount,
+    snapshot.libraryID,
+    (libraryID) => openCitationMapWindow(host, libraryID),
+  );
 }
 
 async function openDetachedCitationMapWindow(
@@ -95,10 +340,14 @@ async function openDetachedCitationMapWindow(
   snapshot: LibrarySnapshot,
   initialItemID: number | null = null,
 ): Promise<void> {
-  detachedHostWindow = hostWindow;
-  if (detachedWindow && !detachedWindow.closed && detachedMount) {
-    renderDetachedWindow(snapshot, initialItemID);
-    detachedWindow.focus();
+  const state = graphState(hostWindow);
+  if (
+    state.detachedWindow &&
+    !state.detachedWindow.closed &&
+    state.detachedMount
+  ) {
+    renderDetachedWindow(hostWindow, snapshot, initialItemID);
+    state.detachedWindow.focus();
     return;
   }
 
@@ -118,23 +367,43 @@ async function openDetachedCitationMapWindow(
     throw new Error("Citation Map window mount point is unavailable.");
   }
 
-  detachedWindow = popup;
-  detachedMount = mount;
+  state.detachedWindow = popup;
+  state.detachedMount = mount;
+  state.libraryID = snapshot.libraryID;
   installDataSourceHoverTooltips(popup.document);
   popup.addEventListener(
     "unload",
     () => {
-      if (detachedWindow !== popup) return;
+      if (state.detachedWindow !== popup) return;
       destroyCitationMapView(mount);
       uninstallDataSourceHoverTooltips(popup.document);
-      detachedWindow = null;
-      detachedMount = null;
-      detachedHostWindow = null;
+      state.detachedWindow = null;
+      state.detachedMount = null;
+      if (!state.tabID) state.libraryID = null;
     },
     { once: true },
   );
-  renderDetachedWindow(snapshot, initialItemID);
+  renderDetachedWindow(hostWindow, snapshot, initialItemID);
   popup.focus();
+}
+
+function tabLibraryID(tab: any, win: _ZoteroTypes.MainWindow): number {
+  return (
+    graphState(win).libraryID ??
+    positiveInteger(tab?.data?.libraryID) ??
+    selectedLibraryID(win)
+  );
+}
+
+function updateTabData(
+  tab: any,
+  snapshot: LibrarySnapshot,
+  itemID: number | null,
+): void {
+  if (!tab || typeof tab !== "object") return;
+  tab.data ??= {};
+  tab.data.libraryID = snapshot.libraryID;
+  tab.data.itemID = itemID ?? snapshot.papers[0]?.itemID ?? null;
 }
 
 /**
@@ -171,7 +440,8 @@ export function installCitationMapTabHooks(win: _ZoteroTypes.MainWindow): void {
   manager.tabHooks.refocus[TAB_TYPE] = focus;
   manager.tabHooks.moveToNewWindow[TAB_TYPE] = async (tab: any) => {
     try {
-      const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
+      const libraryID = tabLibraryID(tab, win);
+      const snapshot = await loadWholeLibrary(libraryID);
       await openDetachedCitationMapWindow(
         win,
         snapshot,
@@ -243,6 +513,8 @@ function renderTab(
   container: HTMLElement,
   snapshot: LibrarySnapshot,
 ): void {
+  const state = graphState(win);
+  state.libraryID = snapshot.libraryID;
   prepareContainer(win, container);
   installDataSourceHoverTooltips(win.document);
   let attempts = 10;
@@ -253,8 +525,8 @@ function renderTab(
       win.setTimeout(() => win.requestAnimationFrame(render), 50);
       return;
     }
-    const initialItemID = pendingSelectionItemID;
-    pendingSelectionItemID = null;
+    const initialItemID = state.pendingSelectionItemID;
+    state.pendingSelectionItemID = null;
     renderCitationMapView(win.document, container, snapshot, {
       mode: "tab",
       onSelectPaper: (itemID) => {
@@ -264,44 +536,99 @@ function renderTab(
       },
       initialItemID,
     });
+    installGraphLibraryFilter(
+      win.document,
+      container,
+      snapshot.libraryID,
+      (libraryID) => openCitationMapWindow(win, libraryID),
+    );
   };
   win.requestAnimationFrame(render);
 }
 
-function existingGraphTab(manager: any): any | null {
-  if (addon.data.graphTabID) {
+function existingGraphTab(
+  manager: any,
+  win: _ZoteroTypes.MainWindow,
+): any | null {
+  const state = graphState(win);
+  if (state.tabID) {
     try {
-      const info = manager.getTabInfo(addon.data.graphTabID);
+      const info = manager.getTabInfo(state.tabID);
       if (info) return info;
     } catch {
-      addon.data.graphTabID = null;
+      state.tabID = null;
+      refreshLegacyGraphTabID();
     }
   }
   const existing = manager._tabs?.find(
     (tab: any) => String(tab.type).replace(/-unloaded$/, "") === TAB_TYPE,
   );
-  if (existing) addon.data.graphTabID = existing.id;
+  if (existing) {
+    state.tabID = existing.id;
+    state.libraryID = positiveInteger(existing?.data?.libraryID);
+    refreshLegacyGraphTabID();
+  }
   return existing ?? null;
+}
+
+function focusExistingCitationMapItem(
+  win: _ZoteroTypes.MainWindow,
+  itemID: number,
+  libraryID: number,
+): boolean {
+  const state = graphState(win);
+  const manager = tabs(win);
+  const existing = existingGraphTab(manager, win);
+  if (state.libraryID !== libraryID) return false;
+
+  if (
+    state.detachedWindow &&
+    !state.detachedWindow.closed &&
+    state.detachedMount
+  ) {
+    const result = getCitationMapViewController(state.detachedMount)?.focusItem(
+      itemID,
+    );
+    if (result && result !== "not-found") {
+      state.detachedWindow.focus();
+      return true;
+    }
+  }
+
+  if (!existing) return false;
+  const mount = manager.getTabContent(existing.id) as HTMLElement | null;
+  if (!mount) return false;
+  const result = getCitationMapViewController(mount)?.focusItem(itemID);
+  if (!result || result === "not-found") return false;
+  manager.select(existing.id);
+  win.focus();
+  return true;
 }
 
 export async function openCitationMapWindow(
   hostWindow?: _ZoteroTypes.MainWindow,
+  libraryID?: number | null,
 ): Promise<void> {
   const win = hostWindow ?? defaultMainWindow();
+  const state = graphState(win);
   installCitationMapTabHooks(win);
-  const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
+  const targetLibraryID = requestedLibraryID(win, libraryID);
+  const snapshot = await loadWholeLibrary(targetLibraryID);
   if (!snapshot.papers.length) {
-    throw new Error("Citation Map requires at least one regular Zotero item.");
+    throw new Error(
+      `${snapshot.libraryName} contains no regular Zotero items for Citation Map.`,
+    );
   }
-  if (detachedWindow && !detachedWindow.closed) {
-    const initialItemID = pendingSelectionItemID;
-    pendingSelectionItemID = null;
+  if (state.detachedWindow && !state.detachedWindow.closed) {
+    const initialItemID = state.pendingSelectionItemID;
+    state.pendingSelectionItemID = null;
     await openDetachedCitationMapWindow(win, snapshot, initialItemID);
     return;
   }
   const manager = tabs(win);
-  const existing = existingGraphTab(manager);
+  const existing = existingGraphTab(manager, win);
   if (existing) {
+    updateTabData(existing, snapshot, state.pendingSelectionItemID);
     renderTab(win, manager.getTabContent(existing.id), snapshot);
     manager.select(existing.id);
     return;
@@ -310,7 +637,7 @@ export async function openCitationMapWindow(
     type: TAB_TYPE,
     title: "Citation Map",
     data: {
-      itemID: snapshot.papers[0].itemID,
+      itemID: state.pendingSelectionItemID ?? snapshot.papers[0].itemID,
       libraryID: snapshot.libraryID,
       citationMap: true,
       icon: NETWORK_ICON_TYPE,
@@ -318,72 +645,112 @@ export async function openCitationMapWindow(
     select: true,
     onClose: () => {
       destroyCitationMapView(result.container);
-      if (addon.data.graphTabID === result.id) addon.data.graphTabID = null;
+      if (state.tabID === result.id) state.tabID = null;
+      if (!state.detachedWindow || state.detachedWindow.closed) {
+        state.libraryID = null;
+      }
+      state.pendingSelectionItemID = null;
+      refreshLegacyGraphTabID();
     },
   });
-  addon.data.graphTabID = result.id;
+  state.tabID = result.id;
+  state.libraryID = snapshot.libraryID;
+  refreshLegacyGraphTabID();
   renderTab(win, result.container, snapshot);
 }
 
 export async function openCitationMapAndSelectItem(
   itemID: number,
+  hostWindow?: _ZoteroTypes.MainWindow,
 ): Promise<void> {
-  pendingSelectionItemID = itemID;
-  await openCitationMapWindow();
+  const win = hostWindow ?? defaultMainWindow();
+  const item = Zotero.Items.get(itemID) as Zotero.Item | null;
+  const libraryID = positiveInteger(item?.libraryID) ?? selectedLibraryID(win);
+  if (focusExistingCitationMapItem(win, itemID, libraryID)) return;
+  graphState(win).pendingSelectionItemID = itemID;
+  await openCitationMapWindow(win, libraryID);
 }
 
 export async function refreshOpenCitationMapViews(): Promise<void> {
-  const snapshot = await loadWholeLibrary(Zotero.Libraries.userLibraryID);
-  if (detachedWindow && !detachedWindow.closed && detachedMount) {
-    renderDetachedWindow(snapshot);
-  }
+  for (const [win, state] of [...graphStateByWindow.entries()]) {
+    if ((win as any).closed) {
+      graphStateByWindow.delete(win);
+      continue;
+    }
+    const hasDetached = Boolean(
+      state.detachedWindow &&
+      !state.detachedWindow.closed &&
+      state.detachedMount,
+    );
+    const tabID = state.tabID;
+    if (!hasDetached && !tabID) continue;
 
-  const tabID = addon.data.graphTabID;
-  if (!tabID) return;
-  for (const win of Zotero.getMainWindows()) {
     try {
-      const manager = tabs(win);
-      if (!manager.getTabInfo(tabID)) continue;
-      renderTab(win, manager.getTabContent(tabID), snapshot);
-      return;
-    } catch {
-      // Try the next window.
+      let tabInfo: any | null = null;
+      if (tabID) {
+        const manager = tabs(win);
+        tabInfo = manager.getTabInfo(tabID);
+        if (!tabInfo) {
+          state.tabID = null;
+        }
+      }
+      const libraryID =
+        state.libraryID ??
+        positiveInteger(tabInfo?.data?.libraryID) ??
+        selectedLibraryID(win);
+      const snapshot = await loadWholeLibrary(libraryID);
+      if (hasDetached) renderDetachedWindow(win, snapshot);
+      if (state.tabID && tabInfo) {
+        const manager = tabs(win);
+        updateTabData(tabInfo, snapshot, null);
+        renderTab(win, manager.getTabContent(state.tabID), snapshot);
+      }
+    } catch (error) {
+      reportAsyncError("Citation Map: graph refresh failed", error);
     }
   }
+  refreshLegacyGraphTabID();
+}
+
+export function closeCitationMapForWindow(
+  win: _ZoteroTypes.MainWindow,
+  closeTab = true,
+): void {
+  const state = graphStateByWindow.get(win);
+  if (!state) return;
+
+  if (state.detachedWindow && !state.detachedWindow.closed) {
+    if (state.detachedMount) destroyCitationMapView(state.detachedMount);
+    state.detachedWindow.close();
+  }
+  state.detachedWindow = null;
+  state.detachedMount = null;
+
+  const tabID = state.tabID;
+  if (tabID) {
+    try {
+      const manager = tabs(win);
+      if (!closeTab) {
+        const container = manager.getTabContent(tabID);
+        if (container) destroyCitationMapView(container);
+      } else if (manager.getTabInfo(tabID)) {
+        manager.close(tabID);
+      }
+    } catch {
+      // Window or tab may already be closed.
+    }
+  }
+  state.tabID = null;
+  state.libraryID = null;
+  state.pendingSelectionItemID = null;
+  graphStateByWindow.delete(win);
+  refreshLegacyGraphTabID();
 }
 
 export function closeCitationMapWindow(closeTab = true): void {
-  if (detachedWindow && !detachedWindow.closed) {
-    if (detachedMount) destroyCitationMapView(detachedMount);
-    detachedWindow.close();
+  for (const win of [...graphStateByWindow.keys()]) {
+    closeCitationMapForWindow(win, closeTab);
   }
-  detachedWindow = null;
-  detachedMount = null;
-  detachedHostWindow = null;
-
-  const tabID = addon.data.graphTabID;
-  if (!tabID) return;
-  if (!closeTab) {
-    for (const win of Zotero.getMainWindows()) {
-      try {
-        const container = tabs(win).getTabContent(tabID);
-        if (container) destroyCitationMapView(container);
-      } catch {
-        // Window may be unloading.
-      }
-    }
-    addon.data.graphTabID = null;
-    return;
-  }
-  for (const win of Zotero.getMainWindows()) {
-    try {
-      const manager = tabs(win);
-      if (manager.getTabInfo(tabID)) manager.close(tabID);
-    } catch {
-      // Tab may already be closed.
-    }
-  }
-  addon.data.graphTabID = null;
 }
 
 export function getDefaultHostWindow(): _ZoteroTypes.MainWindow {

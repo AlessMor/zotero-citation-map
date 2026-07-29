@@ -21,6 +21,7 @@ export const CITATION_PROVIDER_IDS: readonly CitationProviderID[] = [
   "openalex",
 ];
 const PROVIDER_SELECTION_VERSION = 5;
+const UPDATE_LIBRARY_SELECTION_VERSION = 1;
 const PROVIDER_PREF_NAMES: Record<CitationProviderID, string> = {
   crossref: "providerCrossrefEnabled",
   "semantic-scholar": "providerSemanticScholarEnabled",
@@ -32,6 +33,25 @@ const PROVIDER_PREF_NAMES: Record<CitationProviderID, string> = {
 function boolPref(name: string, fallback: boolean): boolean {
   const value = Zotero.Prefs.get(key(name), true);
   return value === undefined || value === null ? fallback : Boolean(value);
+}
+
+function positiveLibraryIDs(values: unknown[]): number[] {
+  return [
+    ...new Set(
+      values
+        .map(Number)
+        .filter((value) => Number.isInteger(value) && value > 0),
+    ),
+  ].sort((left, right) => left - right);
+}
+
+function parseLibraryIDs(value: unknown): number[] | null {
+  try {
+    const parsed = JSON.parse(String(value ?? "")) as unknown;
+    return Array.isArray(parsed) ? positiveLibraryIDs(parsed) : null;
+  } catch {
+    return null;
+  }
 }
 
 function migrateProviderSelection(): void {
@@ -51,6 +71,37 @@ function migrateProviderSelection(): void {
   Zotero.Prefs.set(
     key("providerSelectionVersion"),
     PROVIDER_SELECTION_VERSION,
+    true,
+  );
+}
+
+function migrateUpdateLibrarySelection(): void {
+  const version = Number(
+    Zotero.Prefs.get(key("updateLibrarySelectionVersion"), true) ?? 0,
+  );
+  if (version >= UPDATE_LIBRARY_SELECTION_VERSION) return;
+
+  // Preserve the earlier startup-only library selection when upgrading from
+  // that implementation. Fresh and older installations default to My Library
+  // so enabling this feature cannot unexpectedly update every group library.
+  const legacyVersion = Number(
+    Zotero.Prefs.get(key("startupLibrarySelectionVersion"), true) ?? 0,
+  );
+  const legacySelection = parseLibraryIDs(
+    Zotero.Prefs.get(key("startupLibraryIDs"), true),
+  );
+  const userLibraryID = Number(Zotero.Libraries.userLibraryID);
+  const defaults =
+    legacyVersion >= 1 && legacySelection !== null
+      ? legacySelection
+      : Number.isInteger(userLibraryID) && userLibraryID > 0
+        ? [userLibraryID]
+        : [];
+
+  Zotero.Prefs.set(key("updateLibraryIDs"), JSON.stringify(defaults), true);
+  Zotero.Prefs.set(
+    key("updateLibrarySelectionVersion"),
+    UPDATE_LIBRARY_SELECTION_VERSION,
     true,
   );
 }
@@ -194,6 +245,40 @@ export function getCheckStaleOnStartupEnabled(): boolean {
   return (
     getAutomaticUpdateModeEnabled() || boolPref("checkStaleOnStartup", true)
   );
+}
+
+export function getUpdateLibraryIDs(): number[] {
+  migrateUpdateLibrarySelection();
+  const parsed = parseLibraryIDs(
+    Zotero.Prefs.get(key("updateLibraryIDs"), true),
+  );
+  if (parsed) return parsed;
+
+  const userLibraryID = Number(Zotero.Libraries.userLibraryID);
+  const fallback =
+    Number.isInteger(userLibraryID) && userLibraryID > 0 ? [userLibraryID] : [];
+  setUpdateLibraryIDs(fallback);
+  return fallback;
+}
+
+export function setUpdateLibraryIDs(libraryIDs: number[]): void {
+  const normalized = positiveLibraryIDs(libraryIDs);
+  Zotero.Prefs.set(key("updateLibraryIDs"), JSON.stringify(normalized), true);
+  Zotero.Prefs.set(
+    key("updateLibrarySelectionVersion"),
+    UPDATE_LIBRARY_SELECTION_VERSION,
+    true,
+  );
+}
+
+// Compatibility aliases for an already-open preference pane during a
+// development reload from the startup-only selector implementation.
+export function getStartupLibraryIDs(): number[] {
+  return getUpdateLibraryIDs();
+}
+
+export function setStartupLibraryIDs(libraryIDs: number[]): void {
+  setUpdateLibraryIDs(libraryIDs);
 }
 
 export function getCacheDays(): number {

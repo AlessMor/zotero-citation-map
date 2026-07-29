@@ -1,6 +1,7 @@
 import { config } from "../../package.json";
 import {
   cancelPendingCitationRequests,
+  isCitationRequestCancellationRequested,
   resetCitationRequestCancellation,
 } from "../providers/http";
 import { clearOpenAlexProviderCache } from "../providers/openAlexProvider";
@@ -12,7 +13,10 @@ import {
 import {
   getEnabledProviders,
   getShowMetricTooltipsEnabled,
+  getUpdateLibraryIDs,
+  setUpdateLibraryIDs,
 } from "./citationPreferences";
+import { getAvailableCitationLibraries } from "./citationLibraryService";
 import { clearExternalWorkCache } from "./externalWorkCacheService";
 import {
   installCitationColumnTooltips,
@@ -20,7 +24,7 @@ import {
 } from "./itemTreeColumnService";
 import { refreshCitationItemPanes } from "./itemPaneService";
 import {
-  updateWholeLibraryCitationData,
+  updateCitationDataForItems,
   waitForCitationUpdates,
 } from "./citationUpdateService";
 import { refreshOpenCitationMapViews } from "./windowService";
@@ -30,6 +34,25 @@ const observerIDs: Array<string | symbol> = [];
 let refreshAllRequestedGeneration = 0;
 let refreshAllHandledGeneration = 0;
 let refreshAllLoop: Promise<void> | null = null;
+
+function positiveInteger(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : null;
+}
+
+function selectedUpdateLibraryIDs(): number[] {
+  const available = new Set(
+    getAvailableCitationLibraries().map((library) => library.libraryID),
+  );
+  return getUpdateLibraryIDs().filter((libraryID) => available.has(libraryID));
+}
+
+async function regularItemsInLibrary(
+  libraryID: number,
+): Promise<Zotero.Item[]> {
+  const items = (await Zotero.Items.getAll(libraryID)) as Zotero.Item[];
+  return items.filter((item) => item?.isRegularItem?.() && !item.deleted);
+}
 
 function preferenceError(context: string, error: unknown): Error {
   if (error instanceof Error) return error;
@@ -67,18 +90,28 @@ async function runRefreshAllLoop(): Promise<void> {
 
     resetCitationRequestCancellation();
     refreshAllHandledGeneration = requestedGeneration;
-    await updateWholeLibraryCitationData({
-      force: true,
-      silent: false,
-      includeRelationships: false,
-    });
+    for (const libraryID of selectedUpdateLibraryIDs()) {
+      if (
+        requestedGeneration !== refreshAllRequestedGeneration ||
+        isCitationRequestCancellationRequested()
+      ) {
+        break;
+      }
+      const items = await regularItemsInLibrary(libraryID);
+      if (!items.length) continue;
+      await updateCitationDataForItems(items, {
+        force: true,
+        silent: false,
+        includeRelationships: false,
+      });
+    }
   }
 }
 
 function ensureRefreshAllLoop(): void {
   if (refreshAllLoop) return;
   const running = runPreferenceAction(
-    "updating fields for the whole library",
+    "updating fields for selected libraries",
     runRefreshAllLoop,
   );
   refreshAllLoop = running.finally(() => {
@@ -120,6 +153,17 @@ function syncMetricTooltipPreference(): void {
   refreshCitationColumns();
 }
 
+function normalizedLibraryIDs(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(
+      value
+        .map(positiveInteger)
+        .filter((libraryID): libraryID is number => libraryID !== null),
+    ),
+  ];
+}
+
 function exposePreferenceActions(): void {
   Object.assign(addon.api, {
     refreshAll: restartWholeLibraryUpdate,
@@ -135,6 +179,19 @@ function exposePreferenceActions(): void {
     openOpenAlexAccount: (): void => Zotero.launchURL("https://openalex.org/"),
     cacheStatus: (): ReturnType<typeof getCitationCacheStatus> =>
       getCitationCacheStatus(),
+    updateLibraries: (): ReturnType<typeof getAvailableCitationLibraries> =>
+      getAvailableCitationLibraries(),
+    updateLibraryIDs: (): number[] => getUpdateLibraryIDs(),
+    setUpdateLibraryIDs: (libraryIDs: unknown): void => {
+      setUpdateLibraryIDs(normalizedLibraryIDs(libraryIDs));
+    },
+    // Compatibility aliases for a preference pane left open during reload.
+    startupLibraries: (): ReturnType<typeof getAvailableCitationLibraries> =>
+      getAvailableCitationLibraries(),
+    startupLibraryIDs: (): number[] => getUpdateLibraryIDs(),
+    setStartupLibraryIDs: (libraryIDs: unknown): void => {
+      setUpdateLibraryIDs(normalizedLibraryIDs(libraryIDs));
+    },
   });
 }
 
@@ -142,8 +199,10 @@ export async function registerCitationMapPreferencePane(): Promise<void> {
   if (registered) return;
   exposePreferenceActions();
   getEnabledProviders();
+  getUpdateLibraryIDs();
   await Zotero.PreferencePanes.register({
     pluginID: config.addonID,
+    id: `${config.addonRef}-preferences`,
     src: rootURI + "content/preferences.xhtml",
     scripts: [rootURI + "content/preferences.js"],
     label: "Citation Map",

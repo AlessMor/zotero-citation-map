@@ -2,10 +2,16 @@ tools-submenu =
     .label = Citation Map
 
 open-command =
-    .label = Open Citation Map
+    .label = Open Citation Map (Current Library)
 
 update-library-command =
-    .label = Update fields for whole library
+    .label = Update Fields (Current Library)
+
+show-update-progress-command =
+    .label = Show Update Progress
+
+settings-command =
+    .label = Settings
 
 update-items-command =
     .label = Update fields

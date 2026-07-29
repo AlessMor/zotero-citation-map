@@ -1,9 +1,6 @@
 import { config } from "../../package.json";
 import { resetCitationRequestCancellation } from "../providers/http";
-import {
-  updateCitationDataForItems,
-  updateWholeLibraryCitationData,
-} from "./citationUpdateService";
+import { updateCitationDataForItems } from "./citationUpdateService";
 import {
   openCitationMapAndSelectItem,
   openCitationMapWindow,
@@ -21,6 +18,25 @@ function register(definition: Record<string, unknown>): void {
   if (id) registeredMenuIDs.push(id);
 }
 
+function positiveInteger(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : null;
+}
+
+function activeLibraryID(): number {
+  const pane = Zotero.getActiveZoteroPane?.() as any;
+  const direct = positiveInteger(pane?.getSelectedLibraryID?.());
+  if (direct) return direct;
+
+  const row = pane?.getCollectionTreeRow?.() as any;
+  const fromRow = positiveInteger(row?.libraryID ?? row?.ref?.libraryID);
+  if (fromRow) return fromRow;
+
+  const selected = pane?.getSelectedItems?.() ?? [];
+  const fromItem = positiveInteger(selected[0]?.libraryID);
+  return fromItem ?? Zotero.Libraries.userLibraryID;
+}
+
 function selectedRegularItems(context: any): Zotero.Item[] {
   const contextual = Array.isArray(context?.items) ? context.items : [];
   const selected = Zotero.getActiveZoteroPane?.()?.getSelectedItems?.() ?? [];
@@ -29,12 +45,57 @@ function selectedRegularItems(context: any): Zotero.Item[] {
   );
 }
 
+async function activeLibraryRegularItems(): Promise<Zotero.Item[]> {
+  const items = (await Zotero.Items.getAll(activeLibraryID())) as Zotero.Item[];
+  return items.filter((item) => item?.isRegularItem?.() && !item.deleted);
+}
+
 function report(error: unknown): void {
   Zotero.logError(error instanceof Error ? error : new Error(String(error)));
 }
 
 function beginManualUpdate(): void {
   resetCitationRequestCancellation();
+}
+
+function activeUpdateProgressRoot(): HTMLElement | null {
+  for (const win of Zotero.getMainWindows()) {
+    const root = win.document.querySelector(
+      ".citation-map-progress-window",
+    ) as HTMLElement | null;
+    const progress = root?.querySelector(
+      "progress",
+    ) as HTMLProgressElement | null;
+    if (!root || !progress) continue;
+    if (!progress.hasAttribute("value") || progress.value < progress.max) {
+      return root;
+    }
+  }
+  return null;
+}
+
+function showUpdateProgress(): void {
+  const root = activeUpdateProgressRoot();
+  if (!root) return;
+  const buttons = root.querySelectorAll("button");
+  for (let index = 0; index < buttons.length; index += 1) {
+    const button = buttons.item(index) as HTMLButtonElement | null;
+    if (button?.textContent?.trim() !== "▲") continue;
+    button.click();
+    break;
+  }
+  root.ownerDocument.defaultView?.focus();
+}
+
+function openCitationMapSettings(): void {
+  const internalUtilities = Zotero.Utilities.Internal as any;
+  if (typeof internalUtilities?.openPreferences !== "function") {
+    throw new Error("Zotero preferences could not be opened.");
+  }
+  const preferenceWindow = internalUtilities.openPreferences(
+    `${config.addonRef}-preferences`,
+  );
+  preferenceWindow?.focus?.();
 }
 
 export function registerMenus(): void {
@@ -58,14 +119,38 @@ export function registerMenus(): void {
           {
             menuType: "menuitem",
             l10nID: `${config.addonRef}-update-library-command`,
-            icon: ICON,
             onCommand: () => {
               beginManualUpdate();
-              void updateWholeLibraryCitationData({
-                force: true,
-                silent: false,
-                includeRelationships: false,
-              }).catch(report);
+              void activeLibraryRegularItems()
+                .then((items) =>
+                  updateCitationDataForItems(items, {
+                    force: true,
+                    silent: false,
+                    includeRelationships: false,
+                  }),
+                )
+                .catch(report);
+            },
+          },
+          {
+            menuType: "menuitem",
+            l10nID: `${config.addonRef}-show-update-progress-command`,
+            onShowing: (_event: Event, context: any) => {
+              const active = activeUpdateProgressRoot() !== null;
+              context.setVisible(active);
+              context.setEnabled(active);
+            },
+            onCommand: showUpdateProgress,
+          },
+          {
+            menuType: "menuitem",
+            l10nID: `${config.addonRef}-settings-command`,
+            onCommand: () => {
+              try {
+                openCitationMapSettings();
+              } catch (error) {
+                report(error);
+              }
             },
           },
         ],

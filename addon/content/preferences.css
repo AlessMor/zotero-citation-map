@@ -217,7 +217,67 @@
   cursor: pointer;
 }
 
-.citation-map-pref-children.citation-map-options-locked,
+.citation-map-update-libraries {
+  width: min(100%, 640px);
+  margin: 8px 0 4px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+  border-radius: 7px;
+  box-sizing: border-box;
+}
+
+.citation-map-update-library-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.citation-map-update-library-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.citation-map-update-library-actions html|button {
+  min-height: 26px;
+  padding: 3px 8px;
+}
+
+.citation-map-update-library-list {
+  display: grid;
+  gap: 3px;
+  max-height: 180px;
+  margin-top: 8px;
+  overflow: auto;
+}
+
+.citation-map-update-library-option {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: center;
+  min-height: 26px;
+  cursor: pointer;
+}
+
+.citation-map-update-library-option html|small {
+  opacity: 0.65;
+  white-space: nowrap;
+}
+
+.citation-map-update-library-status,
+.citation-map-update-library-help {
+  margin-left: 0;
+}
+
+.citation-map-update-library-status {
+  margin-top: 7px;
+  margin-bottom: 2px;
+}
+
+.citation-map-pref-children.citation-map-options-locked
+  .citation-map-child-option,
 .citation-map-provider-children.citation-map-options-locked
   .citation-map-provider-option {
   opacity: 0.55;
@@ -247,5 +307,13 @@
   .citation-map-general-actions html|button {
     flex: 1 1 220px;
     justify-content: center;
+  }
+
+  .citation-map-update-library-option {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+
+  .citation-map-update-library-option html|small {
+    grid-column: 2;
   }
 }
