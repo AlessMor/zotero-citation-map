@@ -3,9 +3,10 @@ import type {
   RelatedWorkMetadata,
   WorkIdentifiers,
 } from "../domain/citationTypes";
-import { normalizeDOI } from "../services/citationIdentifiers";
+import { publicationYearOrNull } from "../domain/valueNormalization";
+import { normalizeDOI } from "../domain/workIdentity";
 import { requestJSON } from "./http";
-import type { CitationProvider } from "./types";
+import type { CitationProvider, ProviderRequestOptions } from "./types";
 import { failureStatusFromHTTP, numberOrNull, stringOrNull } from "./types";
 
 const MAX_RELATION_RESULTS = 2500;
@@ -40,9 +41,12 @@ function relatedFromLink(
     providerWorkID: doi,
     doi,
     title: null,
-    year: link.creation
-      ? Number(String(link.creation).slice(0, 4)) || null
-      : null,
+    year:
+      direction === "citations" && link.creation
+        ? Number(String(link.creation).slice(0, 4)) || null
+        : null,
+    publicationDate:
+      direction === "citations" ? stringOrNull(link.creation) : null,
     authors: [],
   };
 }
@@ -52,10 +56,12 @@ async function fetchLinks(
   direction: "citations" | "references",
   maximum: number,
   offset = 0,
+  options?: ProviderRequestOptions,
 ): Promise<RelatedWorkMetadata[]> {
   const response = await requestJSON<OCLink[]>(
     "opencitations",
     `https://opencitations.net/index/coci/api/v1/${direction}/${encodeURIComponent(doi)}`,
+    { signal: options?.signal },
   );
   if (!response.ok || !Array.isArray(response.data)) return [];
   return response.data
@@ -87,6 +93,7 @@ export const openCitationsProvider: CitationProvider = {
   supports: (identifiers) => Boolean(identifiers.doi),
   lookup: async (
     identifiers: WorkIdentifiers,
+    options,
   ): Promise<ProviderLookupResult> => {
     if (!identifiers.doi) {
       return {
@@ -98,6 +105,7 @@ export const openCitationsProvider: CitationProvider = {
     const response = await requestJSON<OCMetadata[]>(
       "opencitations",
       `https://opencitations.net/index/coci/api/v1/metadata/${encodeURIComponent(identifiers.doi)}`,
+      { signal: options?.signal },
     );
     const metadata = Array.isArray(response.data) ? response.data[0] : null;
     if (!response.ok || !metadata) {
@@ -108,7 +116,6 @@ export const openCitationsProvider: CitationProvider = {
       };
     }
     const references: RelatedWorkMetadata[] = [];
-    const year = Number(metadata.year);
     return {
       status: "success",
       provider: "opencitations",
@@ -117,7 +124,7 @@ export const openCitationsProvider: CitationProvider = {
       providerWorkID: identifiers.doi,
       doi: identifiers.doi,
       title: stringOrNull(metadata.title),
-      year: Number.isFinite(year) ? year : null,
+      year: publicationYearOrNull(metadata.year),
       authors: metadata.author
         ? metadata.author
             .split(";")
@@ -136,8 +143,8 @@ export const openCitationsProvider: CitationProvider = {
       sourceMetrics: null,
     };
   },
-  fetchCitingWorks: (doi, maximum, offset) =>
-    fetchLinks(doi, "citations", maximum, offset),
-  fetchReferencedWorks: (doi, maximum, offset) =>
-    fetchLinks(doi, "references", maximum, offset),
+  fetchCitingWorks: (doi, maximum, offset, options) =>
+    fetchLinks(doi, "citations", maximum, offset, options),
+  fetchReferencedWorks: (doi, maximum, offset, options) =>
+    fetchLinks(doi, "references", maximum, offset, options),
 };

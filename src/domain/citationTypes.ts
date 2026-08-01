@@ -3,6 +3,14 @@ export type CitationProviderPreference = "auto" | CitationProviderID;
 export type CitationProviderID =
   "crossref" | "semantic-scholar" | "opencitations" | "inspire" | "openalex";
 
+export const CITATION_PROVIDER_IDS: readonly CitationProviderID[] = [
+  "crossref",
+  "semantic-scholar",
+  "opencitations",
+  "inspire",
+  "openalex",
+];
+
 export type IdentifierKind = "doi" | "pmid" | "arxiv" | "isbn" | "title";
 
 export type RelationshipUpdateStatus =
@@ -10,6 +18,7 @@ export type RelationshipUpdateStatus =
 
 export type CitationMetricStatus =
   | "success"
+  | "identity-conflict"
   | "not-found"
   | "ambiguous-match"
   | "no-identifier"
@@ -68,6 +77,62 @@ export interface SourceMetrics {
   libraryUpdateState?: LibraryUpdateState;
 }
 
+export type WorkIdentityStatus =
+  "resolved" | "ambiguous" | "possible-version" | "conflict";
+
+export type RelatedWorkPropertyName =
+  | "doi"
+  | "pmid"
+  | "arxiv"
+  | "isbn"
+  | "title"
+  | "year"
+  | "publicationDate"
+  | "authors"
+  | "authorIDs"
+  | "sourceTitle"
+  | "abstract"
+  | "citationCount"
+  | "referenceCount"
+  | "citationCountsByYear"
+  | "references"
+  | "resolvedReferenceCount"
+  | "fwci"
+  | "citationPercentile"
+  | "isTop1Percent"
+  | "isTop10Percent"
+  | "citationsLastYear"
+  | "citationVelocity"
+  | "citationAcceleration"
+  | "influentialCitationCount"
+  | "publicationType"
+  | "sourceMetrics"
+  | "referenceAgeMean"
+  | "referenceAgeSpread"
+  | "selfCitationEstimate"
+  | "futureReferenceCount"
+  | "metadataCompleteness"
+  | "isOpenAccess"
+  | "openAccessStatus"
+  | "isRetracted";
+
+export type RelatedWorkPropertySource =
+  CitationProviderID | "citation-map" | "manual" | "zotero";
+
+export interface RelatedWorkPropertyConflict {
+  property: RelatedWorkPropertyName;
+  existingValue: string;
+  incomingValue: string;
+  existingSources: RelatedWorkPropertySource[];
+  incomingSources: RelatedWorkPropertySource[];
+}
+
+export interface WorkIdentityConflict {
+  reason: string;
+  existingAliases: string[];
+  incomingAliases: string[];
+}
+
 export interface RelatedWorkMetadata {
   provider: CitationProviderID | "manual" | "zotero";
   providerWorkID: string | null;
@@ -77,6 +142,8 @@ export interface RelatedWorkMetadata {
   isbn?: string | null;
   title: string | null;
   year: number | null;
+  /** Most precise known publication date, preferably ISO-8601. */
+  publicationDate?: string | null;
   authors: string[];
   /** Stable provider author identifiers when available (ORCID/provider IDs). */
   authorIDs?: string[];
@@ -107,8 +174,18 @@ export interface RelatedWorkMetadata {
   isRetracted?: boolean | null;
   zoteroItemKey?: string | null;
   inLibraryItemKey?: string | null;
+  /** Library scope for Zotero item keys, which are not globally unique. */
+  zoteroLibraryID?: number | null;
   /** Providers that contributed one or more values to this merged record. */
   dataSources?: CitationProviderID[];
+  /** Provider provenance retained independently for every canonical property. */
+  propertySources?: Partial<
+    Record<RelatedWorkPropertyName, RelatedWorkPropertySource[]>
+  >;
+  /** Alternative observations retained when providers disagree. */
+  propertyConflicts?: RelatedWorkPropertyConflict[];
+  identityStatus?: WorkIdentityStatus;
+  identityConflict?: WorkIdentityConflict | null;
   /** Most recent provider fetch involved in this merged record. */
   updatedAt?: string | null;
 }
@@ -122,6 +199,7 @@ export interface ProviderLookupSuccess {
   doi: string | null;
   title: string | null;
   year: number | null;
+  publicationDate?: string | null;
   authors: string[];
   sourceTitle: string | null;
   abstract: string | null;
@@ -165,6 +243,7 @@ export interface CitationMetricRecord {
   matchedBy: IdentifierKind | null;
   matchConfidence: number | null;
   matchConfirmed: boolean;
+  identityConflict: boolean;
   doi: string | null;
   title: string | null;
   normalizedTitle: string | null;
@@ -193,6 +272,10 @@ export interface CitationMetricRecord {
   isOpenAccess: boolean | null;
   publicationType: string | null;
   sourceMetrics: SourceMetrics | null;
+  propertySources: Partial<
+    Record<RelatedWorkPropertyName, RelatedWorkPropertySource[]>
+  >;
+  propertyConflicts: RelatedWorkPropertyConflict[];
   status: CitationMetricStatus;
   fetchedAt: string | null;
   lastAttemptAt: string;
@@ -211,6 +294,7 @@ export interface CitationMetricSummary {
   matchedBy: IdentifierKind | null;
   matchConfidence: number | null;
   matchConfirmed: boolean;
+  identityConflict: boolean;
   fwci: number | null;
   citationPercentile: number | null;
   isTop1Percent: boolean | null;

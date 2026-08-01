@@ -1,6 +1,6 @@
 # Zotero Citation Map:
 
-Zotero Citation Map is a plugin for visualizing the citation and reference relationships between papers in your Zotero library.
+Zotero Citation Map is a plugin for Zotero 9 that brings citation networks,bibliometric data, and paper discovery directly into your Zotero library.
 
 The project began as a weekend experiment. I wanted to test how far I could take ChatGPT 5.6 SOL while solving a minor annoyance in my own research workflow.
 
@@ -12,57 +12,67 @@ So I decided to see if something along those lines could be integrated directly 
 
 ## Installation:
 
-1. Open the repository’s [Releases](https://github.com/AlessMor/zotero-citation-map/releases/latest) page.
+1. Open the last [release](https://github.com/AlessMor/zotero-citation-map/releases/latest) page.
 
 2. Under **Assets**, download the latest `.xpi` file.
 
    > Do not download the automatically generated **Source code** `.zip` or `.tar.gz` archives.
 
-3. Open Zotero.
+3. in Zotero, open **Tools → Plugins**.
 
-4. Go to **Tools → Plugins**.
-
-5. Drag the downloaded `.xpi` file into the Plugins window.
-
-6. Confirm the installation when prompted.
+5. Drag the downloaded `.xpi` file into the Plugins window and confirm the installation when prompted.
 
 7. Restart Zotero if required.
 
-The plugin should now be available in Zotero.
-
-### Updating
-
-Download the newest `.xpi` file from the [Releases](https://github.com/AlessMor/zotero-citation-map/releases/latest) page and repeat the installation procedure. Zotero will replace the existing version.
+To **update** the plugin, install the newer `.xpi` in the same way. Zotero willreplace the existing version.
 
 ## Main Features
 
 - **See how papers in your library are connected**
-  Visualize which papers cite each other and which references they share.
-  Generate a graph from your library or from a collection, with every library paper linked back to its Zotero item, notes and PDF. Use filters to change what you want to see.
-  Papers already present in Zotero are matched to their library items, so you can quickly return to their metadata, notes and PDFs.
+  Build an interactive citation map for a library, collection, or selectedpapers. Search and filter the graph, inspect a paper, and return directly toits Zotero item, notes, or PDF.
   ![graph](docs/assets/FreeGraph.png)
 
-- **Customize and export your citation map view**
-  Arrange papers by properties such as publication year and citation count, or secondary properties such as journal h-index.
-  Use nodes colour and size to visualize other properties.
-  You can export the map view as an image, CSV or JSON.
-  ![axes](docs/assets/OrderedGraph.png)
+- **Focus on one or more papers**
+  Explore references, citing papers, or both around one or more "seed" papers. Add or remove seeds, include papers outside Zotero, rank and limit neighbours, and move backward or forward through previous focus states.
+  ![FocusView](docs/assets/FocusView.png)
 
-- **Find missing papers from several data providers**
-  External papers discovered through the graph can be imported directly into Zotero when sufficient metadata are available.
-  Add a paper to Zotero by either the graph view or from the properties panel in the main Zotero page.
-  You can see a preview on the graph before adding any paper.
-  Combine Crossref, Semantic Scholar, OpenCitations and INSPIRE and OpenAlex.
-  ![add](docs/assets/AddToZotero.png)
+- **Inspect citation data inside Zotero**
+  Show citation and reference counts as library columns. Use the item pane to review overview metrics, references, and citing papers; search, sort, and filter long lists; refresh stale data and correct or add custom relationships.
+  ![MainLibrary](docs/assets/MainLibrary.png)
 
-- **Update citation data**
-  Refresh the citation and reference relationships when provider data changes or when new papers are added to your library. You can also do it manually if you want to create custom maps.
+- **Customize and export the map**
+  Arrange papers by publication year, citation sequence, citation count, and other available metrics. Map values to axes, node size, and colour; filter by metadata and data quality; and export the visible graph as PNG, CSV, or JSON.
+
+- **Discover and add missing papers**
+  Explore external references, citing works, and similar papers alongside your Zotero items. Preview their metadata, open the DOI, mark incorrect matches, or add the paper directly to Zotero.
+
+- **Work with multiple independent views**
+  Open several Citation Map and Focus View tabs at once. Rename views and use `Open in ›` to create a new view or add a paper to an existing one. Each view keeps its own scope, filters, selection, camera, and navigation history.
+
+- **Control providers and updates**
+  Choose which scholarly-data providers to use, which Zotero libraries shouldupdate automatically, and when cached data become stale. Refresh data manually when needed; long updates show progress and can be cancelled.
+  ![settings](docs/assets/Settings.png)
+
+
+## Data sources
+
+Citation and bibliographic data can be retrieved from:
+
+- [Crossref](https://www.crossref.org/)
+- [Semantic Scholar](https://www.semanticscholar.org/)
+- [OpenCitations](https://opencitations.net/)
+- [INSPIRE-HEP](https://inspirehep.net/)
+- [OpenAlex](https://openalex.org/) (requires API key)
+
+These services are independent of this project. Their terms, coverage, rate
+limits, and data-quality limitations apply. Counts and relationship lists may
+differ between providers. The plugin will try to integrate their data, preferring largest citation count.
 
 ## Acknowledgements:
 
 The project was mainly inspired by other Zotero plugins:
 
-- [windingwind/zotero-plugin-template](https://github.com/windingwind/zotero-plugin-template)
+- [windingwind/zotero-plugin-template](https://github.com/windingwind/zotero-plugin-template): initial template for the plugin.
 
 - [zotero-cita/zotero-cita](https://github.com/zotero-cita/zotero-cita)
 
@@ -74,4 +84,4 @@ The project was mainly inspired by other Zotero plugins:
 
 - [danieleongari/zotero-openalex](https://github.com/danieleongari/zotero-openalex)
 
-Citation and bibliographic data are retrieved from the public APIs provided by [Crossref](https://www.crossref.org/), [Semantic Scholar](https://www.semanticscholar.org/), [OpenCitations](https://opencitations.net/), [INSPIRE-HEP](https://inspirehep.net/), and [OpenAlex](https://openalex.org/). These services are independent of this project, and their respective terms, coverage, and data-quality limitations apply.
+- [zotero-INSPIRE](https://github.com/fkguo/zotero-inspire)

@@ -6,7 +6,9 @@ import {
   isCitationRequestCancellationRequested,
   requestJSON,
 } from "../providers/http";
-import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
+import { shortOpenAlexID } from "../providers/providerIdentifiers";
+import { normalizeDOI, normalizeExactTitle } from "../domain/workIdentity";
+import { settleBounded } from "./backgroundTaskService";
 import {
   getCacheDays,
   getOpenAlexAPIKey,
@@ -72,32 +74,19 @@ function chunked<T>(items: T[], size: number): T[][] {
   return result;
 }
 
-async function runBounded(
+async function runSourceMetricTasks(
   tasks: Array<() => Promise<void>>,
   concurrency: number,
 ): Promise<number> {
-  let nextIndex = 0;
   let failed = 0;
-  async function worker(): Promise<void> {
-    while (nextIndex < tasks.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      try {
-        await tasks[index]();
-      } catch (error) {
-        failed += 1;
-        Zotero.debug(
-          `Citation Map: source-metric batch failed: ${String(error)}`,
-        );
-      }
-    }
+  const results = await settleBounded(tasks, concurrency, (task) => task());
+  for (const result of results) {
+    if (result.status !== "rejected") continue;
+    failed += 1;
+    Zotero.debug(
+      `Citation Map: source-metric batch failed: ${String(result.reason)}`,
+    );
   }
-  await Promise.all(
-    Array.from(
-      { length: Math.min(Math.max(1, concurrency), tasks.length) },
-      () => worker(),
-    ),
-  );
   return failed;
 }
 
@@ -113,11 +102,6 @@ function openAlexURL(
   const apiKey = getOpenAlexAPIKey();
   if (apiKey) url.searchParams.set("api_key", apiKey);
   return url.toString();
-}
-
-function shortOpenAlexID(value: unknown): string | null {
-  const text = String(value ?? "").trim();
-  return text ? text.replace(/^https:\/\/openalex\.org\//i, "") : null;
 }
 
 function numberOrNull(value: unknown): number | null {
@@ -237,6 +221,7 @@ async function fetchSourcesByIDs(
           per_page: batch.length,
           select: "id,display_name,issn_l,issn,summary_stats",
         }),
+        {},
       );
       if (!response.ok || !response.data) {
         throw new Error(response.message || "OpenAlex source batch failed.");
@@ -248,7 +233,7 @@ async function fetchSourcesByIDs(
       }
     },
   );
-  await runBounded(tasks, policy.requestParallelism);
+  await runSourceMetricTasks(tasks, policy.requestParallelism);
   return resolved;
 }
 
@@ -260,6 +245,7 @@ async function fetchSourceByISSN(issn: string): Promise<SourceMetrics | null> {
       per_page: 5,
       select: "id,display_name,issn_l,issn,summary_stats",
     }),
+    {},
   );
   if (!response.ok || !response.data) return null;
   for (const source of response.data.results ?? []) {
@@ -281,6 +267,7 @@ async function fetchSourceByTitle(
       per_page: 20,
       select: "id,display_name,issn_l,issn,summary_stats",
     }),
+    {},
   );
   if (!response.ok || !response.data) return null;
   const candidates = response.data.results ?? [];
@@ -450,6 +437,7 @@ export async function enrichLibrarySourceMetrics(
             per_page: batch.length,
             select: "id,doi,primary_location,locations",
           }),
+          {},
         );
         if (!response.ok || !response.data) {
           throw new Error(
@@ -475,7 +463,7 @@ export async function enrichLibrarySourceMetrics(
     }
   }
 
-  let failedRequests = await runBounded(
+  let failedRequests = await runSourceMetricTasks(
     workTasks,
     openAlexPolicy.requestParallelism,
   );
@@ -524,7 +512,7 @@ export async function enrichLibrarySourceMetrics(
       }
     },
   );
-  failedRequests += await runBounded(
+  failedRequests += await runSourceMetricTasks(
     fallbackTasks,
     openAlexPolicy.requestParallelism,
   );

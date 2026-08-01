@@ -7,8 +7,6 @@
 declare namespace _ZoteroTypes {
   interface Prefs {
     PluginPrefsMap: {
-      "provider": string;
-      "providerSelectionVersion": number;
       "providerAutomatic": boolean;
       "providerCrossrefEnabled": boolean;
       "providerSemanticScholarEnabled": boolean;
@@ -22,15 +20,9 @@ declare namespace _ZoteroTypes {
       "updateNewItems": boolean;
       "updateModifiedItems": boolean;
       "checkStaleOnStartup": boolean;
-      "startupLibraryIDs": string;
-      "startupLibrarySelectionVersion": number;
       "updateLibraryIDs": string;
-      "updateLibrarySelectionVersion": number;
       "cacheDays": number;
       "exactTitleFallback": boolean;
-      "localRelations": boolean;
-      "noteExtraction": boolean;
-      "pdfExtraction": boolean;
       "debugLogging": boolean;
       "detailPanelWidth": number;
       "detailPanelCollapsed": boolean;

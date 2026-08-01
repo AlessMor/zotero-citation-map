@@ -1,9 +1,11 @@
 import { config } from "../../package.json";
-import type {
-  CitationProviderID,
-  CitationProviderPreference,
+import {
+  CITATION_PROVIDER_IDS,
+  type CitationProviderID,
+  type CitationProviderPreference,
 } from "../domain/citationTypes";
 import type { GraphLayoutOptions } from "../domain/graphTypes";
+import { uniquePositiveIntegers } from "../domain/valueNormalization";
 import { citationDataSourceLabel } from "./providerPresentation";
 
 const key = (name: string): string => `${config.prefsPrefix}.${name}`;
@@ -13,15 +15,6 @@ const PROVIDER_LABELS: Pick<
 > = {
   auto: "Automatic — combine selected providers",
 };
-export const CITATION_PROVIDER_IDS: readonly CitationProviderID[] = [
-  "crossref",
-  "semantic-scholar",
-  "opencitations",
-  "inspire",
-  "openalex",
-];
-const PROVIDER_SELECTION_VERSION = 5;
-const UPDATE_LIBRARY_SELECTION_VERSION = 1;
 const PROVIDER_PREF_NAMES: Record<CitationProviderID, string> = {
   crossref: "providerCrossrefEnabled",
   "semantic-scholar": "providerSemanticScholarEnabled",
@@ -35,14 +28,12 @@ function boolPref(name: string, fallback: boolean): boolean {
   return value === undefined || value === null ? fallback : Boolean(value);
 }
 
+function setBoolPref(name: string, value: boolean): void {
+  Zotero.Prefs.set(key(name), value, true);
+}
+
 function positiveLibraryIDs(values: unknown[]): number[] {
-  return [
-    ...new Set(
-      values
-        .map(Number)
-        .filter((value) => Number.isInteger(value) && value > 0),
-    ),
-  ].sort((left, right) => left - right);
+  return uniquePositiveIntegers(values).sort((left, right) => left - right);
 }
 
 function parseLibraryIDs(value: unknown): number[] | null {
@@ -54,70 +45,8 @@ function parseLibraryIDs(value: unknown): number[] | null {
   }
 }
 
-function migrateProviderSelection(): void {
-  const version = Number(
-    Zotero.Prefs.get(key("providerSelectionVersion"), true) ?? 0,
-  );
-  if (version >= PROVIDER_SELECTION_VERSION) return;
-
-  // Version 5 activates an explicit Automatic mode. Reset earlier development
-  // states once so existing profiles start from the intended all-provider
-  // default instead of retaining an inconsistent partial selection.
-  Zotero.Prefs.set(key("providerAutomatic"), true, true);
-  for (const provider of CITATION_PROVIDER_IDS) {
-    Zotero.Prefs.set(key(PROVIDER_PREF_NAMES[provider]), true, true);
-  }
-  Zotero.Prefs.set(key("provider"), "auto", true);
-  Zotero.Prefs.set(
-    key("providerSelectionVersion"),
-    PROVIDER_SELECTION_VERSION,
-    true,
-  );
-}
-
-function migrateUpdateLibrarySelection(): void {
-  const version = Number(
-    Zotero.Prefs.get(key("updateLibrarySelectionVersion"), true) ?? 0,
-  );
-  if (version >= UPDATE_LIBRARY_SELECTION_VERSION) return;
-
-  // Preserve the earlier startup-only library selection when upgrading from
-  // that implementation. Fresh and older installations default to My Library
-  // so enabling this feature cannot unexpectedly update every group library.
-  const legacyVersion = Number(
-    Zotero.Prefs.get(key("startupLibrarySelectionVersion"), true) ?? 0,
-  );
-  const legacySelection = parseLibraryIDs(
-    Zotero.Prefs.get(key("startupLibraryIDs"), true),
-  );
-  const userLibraryID = Number(Zotero.Libraries.userLibraryID);
-  const defaults =
-    legacyVersion >= 1 && legacySelection !== null
-      ? legacySelection
-      : Number.isInteger(userLibraryID) && userLibraryID > 0
-        ? [userLibraryID]
-        : [];
-
-  Zotero.Prefs.set(key("updateLibraryIDs"), JSON.stringify(defaults), true);
-  Zotero.Prefs.set(
-    key("updateLibrarySelectionVersion"),
-    UPDATE_LIBRARY_SELECTION_VERSION,
-    true,
-  );
-}
-
 export function getProviderAutomaticEnabled(): boolean {
-  migrateProviderSelection();
   return boolPref("providerAutomatic", true);
-}
-
-export function setProviderAutomaticEnabled(enabled: boolean): void {
-  migrateProviderSelection();
-  Zotero.Prefs.set(key("providerAutomatic"), enabled, true);
-  if (!enabled) return;
-  for (const provider of CITATION_PROVIDER_IDS) {
-    Zotero.Prefs.set(key(PROVIDER_PREF_NAMES[provider]), true, true);
-  }
 }
 
 export function getProviderLabel(provider: CitationProviderPreference): string {
@@ -129,38 +58,8 @@ export function getProviderLabel(provider: CitationProviderPreference): string {
     : `${selected.length} selected providers`;
 }
 
-/**
- * Provider combinations are represented by individual boolean preferences.
- * The legacy single-provider preference is retained only for migration and API
- * compatibility; normal lookups always use automatic capability routing.
- */
-export function getProviderPreference(): CitationProviderPreference {
-  migrateProviderSelection();
-  return "auto";
-}
-
-export function setProviderPreference(
-  provider: CitationProviderPreference,
-): void {
-  migrateProviderSelection();
-  const automatic = provider === "auto";
-  Zotero.Prefs.set(key("providerAutomatic"), automatic, true);
-  for (const candidate of CITATION_PROVIDER_IDS) {
-    Zotero.Prefs.set(
-      key(PROVIDER_PREF_NAMES[candidate]),
-      automatic || provider === candidate,
-      true,
-    );
-  }
-  Zotero.Prefs.set(key("provider"), "auto", true);
-}
-
 export function getEnabledProviders(): CitationProviderID[] {
-  migrateProviderSelection();
   if (getProviderAutomaticEnabled()) {
-    for (const provider of CITATION_PROVIDER_IDS) {
-      Zotero.Prefs.set(key(PROVIDER_PREF_NAMES[provider]), true, true);
-    }
     return [...CITATION_PROVIDER_IDS];
   }
 
@@ -169,39 +68,35 @@ export function getEnabledProviders(): CitationProviderID[] {
   );
   if (selected.length) return selected;
 
-  // A provider-less dispatcher cannot perform any update. Recover corrupted
-  // custom settings to Automatic rather than silently returning no results.
-  setProviderAutomaticEnabled(true);
+  // Older or externally edited preferences can leave custom mode with no
+  // provider selected. Recover to the documented safe default instead of
+  // aborting startup before the preference pane can be opened.
+  setBoolPref("providerAutomatic", true);
+  for (const name of Object.values(PROVIDER_PREF_NAMES))
+    setBoolPref(name, true);
+  Zotero.debug(
+    "Citation Map: repaired an invalid empty provider selection by enabling automatic mode.",
+  );
   return [...CITATION_PROVIDER_IDS];
+}
+
+export function normalizeCitationPreferences(): void {
+  getEnabledProviders();
+  getUpdateLibraryIDs();
 }
 
 export function isProviderEnabled(provider: CitationProviderID): boolean {
   return getEnabledProviders().includes(provider);
 }
 
-export function setProviderEnabled(
-  provider: CitationProviderID,
-  enabled: boolean,
-): void {
-  migrateProviderSelection();
-  if (!enabled) Zotero.Prefs.set(key("providerAutomatic"), false, true);
-  Zotero.Prefs.set(key(PROVIDER_PREF_NAMES[provider]), enabled, true);
-}
-
 export function getOpenAlexAPIKey(): string {
   return String(Zotero.Prefs.get(key("openAlexAPIKey"), true) ?? "").trim();
-}
-export function setOpenAlexAPIKey(apiKey: string): void {
-  Zotero.Prefs.set(key("openAlexAPIKey"), apiKey.trim(), true);
 }
 
 export function getSemanticScholarAPIKey(): string {
   return String(
     Zotero.Prefs.get(key("semanticScholarAPIKey"), true) ?? "",
   ).trim();
-}
-export function setSemanticScholarAPIKey(apiKey: string): void {
-  Zotero.Prefs.set(key("semanticScholarAPIKey"), apiKey.trim(), true);
 }
 
 export function getShowMetricTooltipsEnabled(): boolean {
@@ -220,19 +115,9 @@ export function getAutomaticUpdatesEnabled(): boolean {
     boolPref("checkStaleOnStartup", true)
   );
 }
-export function setAutomaticUpdatesEnabled(enabled: boolean): void {
-  Zotero.Prefs.set(key("automaticUpdates"), enabled, true);
-  if (!enabled) return;
-  Zotero.Prefs.set(key("updateNewItems"), true, true);
-  Zotero.Prefs.set(key("updateModifiedItems"), true, true);
-  Zotero.Prefs.set(key("checkStaleOnStartup"), true, true);
-}
 
 export function getUpdateNewItemsEnabled(): boolean {
   return getAutomaticUpdateModeEnabled() || boolPref("updateNewItems", true);
-}
-export function setUpdateNewItemsEnabled(enabled: boolean): void {
-  Zotero.Prefs.set(key("updateNewItems"), enabled, true);
 }
 
 export function getUpdateModifiedItemsEnabled(): boolean {
@@ -248,7 +133,6 @@ export function getCheckStaleOnStartupEnabled(): boolean {
 }
 
 export function getUpdateLibraryIDs(): number[] {
-  migrateUpdateLibrarySelection();
   const parsed = parseLibraryIDs(
     Zotero.Prefs.get(key("updateLibraryIDs"), true),
   );
@@ -264,21 +148,6 @@ export function getUpdateLibraryIDs(): number[] {
 export function setUpdateLibraryIDs(libraryIDs: number[]): void {
   const normalized = positiveLibraryIDs(libraryIDs);
   Zotero.Prefs.set(key("updateLibraryIDs"), JSON.stringify(normalized), true);
-  Zotero.Prefs.set(
-    key("updateLibrarySelectionVersion"),
-    UPDATE_LIBRARY_SELECTION_VERSION,
-    true,
-  );
-}
-
-// Compatibility aliases for an already-open preference pane during a
-// development reload from the startup-only selector implementation.
-export function getStartupLibraryIDs(): number[] {
-  return getUpdateLibraryIDs();
-}
-
-export function setStartupLibraryIDs(libraryIDs: number[]): void {
-  setUpdateLibraryIDs(libraryIDs);
 }
 
 export function getCacheDays(): number {
@@ -287,29 +156,11 @@ export function getCacheDays(): number {
     ? Math.min(3650, Math.floor(value))
     : 30;
 }
-export function setCacheDays(days: number): void {
-  Zotero.Prefs.set(key("cacheDays"), Math.max(1, Math.floor(days)), true);
-}
 
 export function getExactTitleFallbackEnabled(): boolean {
   return boolPref("exactTitleFallback", true);
 }
-export function setExactTitleFallbackEnabled(enabled: boolean): void {
-  Zotero.Prefs.set(key("exactTitleFallback"), enabled, true);
-}
 
-// These are core Citation Map data sources rather than optional features.
-// Keep the legacy preferences readable for profile compatibility, but do not
-// allow them to disable relationship construction.
-export function getLocalRelationsEnabled(): boolean {
-  return true;
-}
-export function getNoteExtractionEnabled(): boolean {
-  return true;
-}
-export function getPDFExtractionEnabled(): boolean {
-  return true;
-}
 export function getDebugLoggingEnabled(): boolean {
   return boolPref("debugLogging", false);
 }
@@ -333,28 +184,17 @@ export function setDetailPanelCollapsed(collapsed: boolean): void {
 }
 
 const GRAPH_APPEARANCE_SCHEMA_VERSION = 4;
+const FOCUS_GRAPH_APPEARANCE_SCHEMA_VERSION = 1;
 
-const PREVIOUS_DEFAULT_GRAPH_LAYOUT: GraphLayoutOptions = {
+const DEFAULT_GRAPH_LAYOUT: GraphLayoutOptions = {
   xMetric: "year",
   xScale: "linear",
   yMetric: "citations",
   yScale: "linear",
   nodeSizeMetric: "citations",
   nodeColorMetric: "collection",
-  nodeLabelMode: "title",
-};
-
-const DEFAULT_GRAPH_LAYOUT: GraphLayoutOptions = {
-  ...PREVIOUS_DEFAULT_GRAPH_LAYOUT,
   nodeLabelMode: "author-year",
 };
-
-function sameGraphLayout(
-  left: GraphLayoutOptions,
-  right: GraphLayoutOptions,
-): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
 
 export function getGraphAppearance(): GraphLayoutOptions {
   const storedVersion = Number(
@@ -366,15 +206,6 @@ export function getGraphAppearance(): GraphLayoutOptions {
     parsed = JSON.parse(raw) as Partial<GraphLayoutOptions>;
   } catch {
     // Invalid or absent preferences fall back to the current defaults.
-  }
-
-  if (storedVersion === 3) {
-    const previous = { ...PREVIOUS_DEFAULT_GRAPH_LAYOUT, ...parsed };
-    const migrated = sameGraphLayout(previous, PREVIOUS_DEFAULT_GRAPH_LAYOUT)
-      ? { ...DEFAULT_GRAPH_LAYOUT }
-      : { ...DEFAULT_GRAPH_LAYOUT, ...parsed };
-    setGraphAppearance(migrated);
-    return migrated;
   }
 
   if (storedVersion !== GRAPH_APPEARANCE_SCHEMA_VERSION) {
@@ -395,4 +226,72 @@ export function setGraphAppearance(options: GraphLayoutOptions): void {
 export function resetGraphAppearance(): GraphLayoutOptions {
   setGraphAppearance(DEFAULT_GRAPH_LAYOUT);
   return { ...DEFAULT_GRAPH_LAYOUT };
+}
+
+function defaultFocusGraphAppearance(
+  base: GraphLayoutOptions,
+): GraphLayoutOptions {
+  return {
+    ...base,
+    xMetric: "citation-sequence",
+    xScale: "linear",
+  };
+}
+
+export function getFocusGraphAppearance(
+  base: GraphLayoutOptions,
+): GraphLayoutOptions {
+  const fallback = defaultFocusGraphAppearance(base);
+  const version = Number(
+    Zotero.Prefs.get(key("focusGraphAppearanceVersion"), true),
+  );
+  const raw = String(Zotero.Prefs.get(key("focusGraphAppearance"), true) ?? "");
+  if (version !== FOCUS_GRAPH_APPEARANCE_SCHEMA_VERSION) {
+    setFocusGraphAppearance(fallback);
+    return fallback;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<GraphLayoutOptions>;
+    return {
+      ...fallback,
+      ...parsed,
+      xScale:
+        parsed.xMetric === "citation-sequence"
+          ? "linear"
+          : (parsed.xScale ?? fallback.xScale),
+      yScale:
+        parsed.yMetric === "citation-sequence"
+          ? "linear"
+          : (parsed.yScale ?? fallback.yScale),
+    };
+  } catch {
+    setFocusGraphAppearance(fallback);
+    return fallback;
+  }
+}
+
+export function setFocusGraphAppearance(options: GraphLayoutOptions): void {
+  const normalized = {
+    ...options,
+    xScale: options.xMetric === "citation-sequence" ? "linear" : options.xScale,
+    yScale: options.yMetric === "citation-sequence" ? "linear" : options.yScale,
+  };
+  Zotero.Prefs.set(
+    key("focusGraphAppearance"),
+    JSON.stringify(normalized),
+    true,
+  );
+  Zotero.Prefs.set(
+    key("focusGraphAppearanceVersion"),
+    FOCUS_GRAPH_APPEARANCE_SCHEMA_VERSION,
+    true,
+  );
+}
+
+export function resetFocusGraphAppearance(
+  base: GraphLayoutOptions,
+): GraphLayoutOptions {
+  const reset = defaultFocusGraphAppearance(base);
+  setFocusGraphAppearance(reset);
+  return reset;
 }

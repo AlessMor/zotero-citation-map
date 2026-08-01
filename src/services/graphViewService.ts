@@ -1,45 +1,52 @@
 /// <reference lib="dom" />
 
-import { config } from "../../package.json";
 import type {
-  CitationProviderID,
   IgnoredProviderRelation,
-  ManualRelationDirection,
   RelatedWorkMetadata,
 } from "../domain/citationTypes";
+import type { ExternalWork } from "../domain/externalWork";
+import {
+  createIgnoredRelationIndex,
+  findIgnoredRelation,
+  ignoredRelationDescriptorForRelatedWork,
+  ignoredRelationDescriptorFromReference,
+  referenceMatchesRelatedWork,
+  relationshipDirection,
+  type IgnoredRelationIndex,
+  type IgnoredRelationDescriptor,
+} from "../domain/relationshipDescriptors";
 import type {
   CitationGraphNode,
-  GraphAxisMetric,
+  GhostPreview,
   GraphLayoutOptions,
-  GraphNodeColorMetric,
-  GraphNodeSizeMetric,
-  GraphScaleType,
-  MetricID,
 } from "../domain/graphTypes";
-import type {
-  LibraryCollectionFilter,
-  LibrarySnapshot,
-  ZoteroPaper,
-} from "../domain/types";
+import type { LibrarySnapshot, ZoteroPaper } from "../domain/types";
 import { buildCitationGraph } from "./citationGraphService";
 import {
   CitationGraphRenderer,
-  type GhostPreview,
+  type GraphViewTransform,
 } from "./citationGraphRenderer";
 import {
-  externalWorkDisplayTitle,
-  getMissingPaperRecommendations,
+  hydrateExternalWorksMetadata,
   refreshExternalRelationships,
+  selectedRelationshipCacheIsFresh,
   importExternalWork,
-  type ExternalWork,
 } from "./externalDiscoveryService";
+import { getMissingPaperRecommendations } from "./missingPaperRecommendationService";
 import {
   getCitationMetricRecord,
   getIgnoredRelations,
   ignoreProviderRelation,
   removeIgnoredRelation,
 } from "./citationMetricsStore";
-import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
+import {
+  createRelatedWorkLookupIndex,
+  findMatchingRelatedWork,
+  matchRelatedWorkToGraphNode,
+  normalizeExactTitle,
+  type RelatedWorkLookupIndex,
+} from "../domain/workIdentity";
+import { mergeRelatedWorkLists } from "./relationshipStoreService";
 import {
   citationDataSourceLabel,
   externalWorkURL,
@@ -56,9 +63,15 @@ import {
   notifyRelationshipMutation,
   relationshipPreviewSourceKeys,
   relationshipStatusText,
+  relationshipWorkKey,
   subscribeRelationshipMutations,
   type RelationshipMutationEvent,
 } from "./relationshipViewService";
+import {
+  getRelationshipPublicationState,
+  subscribeRelationshipPublications,
+  type RelationshipPublicationEvent,
+} from "./relationshipEvents";
 import {
   createPaperFilterController,
   createPaperListToolbar,
@@ -75,43 +88,82 @@ import {
   exportGraphJSON,
   exportGraphPNG,
 } from "./exportService";
-import {
-  axisMetricDefinitions,
-  formatMetricValue,
-  getMetricDefinition,
-  metricValue,
-  nodeColorMetricDefinitions,
-  nodeSizeMetricDefinitions,
-} from "./metricRegistry";
+import { formatMetricValue, getMetricDefinition } from "./metricRegistry";
 import { createMetricNodeForItem } from "./itemMetricContext";
 import { createPaperOverviewActionBar } from "./paperOverviewActionsService";
 import { updateCitationDataForItems } from "./citationUpdateService";
 import { createUpdateProgress } from "./updateProgressService";
-import {
-  createCitationMapIcon,
-  type CitationMapIconName,
-} from "./uiIconService";
+import { createCancellationScope } from "./cancellationScope";
+import { SerializedTaskQueue } from "./serializedTaskQueue";
+import { mapCooperatively } from "./backgroundTaskService";
+import { automaticFocusSeedRefreshPlan } from "./relationshipRefreshPolicy";
 import {
   ensureSourceMetricsForNodes,
   graphLayoutUsesSourceMetrics,
 } from "./sourceMetricsService";
+import { clamp } from "./graphMetricScale";
+import {
+  buildCollectionVisuals,
+  clear,
+  createAxesAppearance,
+  element,
+  ensureStyles,
+  externalWorkTitle,
+  formatCount,
+  graphNodeSearchText,
+  icon,
+  iconButtonContent,
+  networkLogo,
+  normalizeSearch,
+  scoreLibraryPaperSearch,
+  text,
+  type LibraryPaperSearchEntry,
+} from "./graphViewControls";
+import {
+  buildGraphFocusProjection,
+  externalWorkToFocusNode,
+  synchronizeExternalFocusNode,
+  type GraphFocusDirection,
+  type GraphFocusLocality,
+  type GraphFocusProjection,
+  type GraphFocusRanking,
+  type GraphFocusState,
+} from "./graphFocusService";
 import {
   getDetailPanelCollapsed,
   getDetailPanelWidth,
+  getFocusGraphAppearance,
   getGraphAppearance,
+  resetFocusGraphAppearance,
   resetGraphAppearance,
   setDetailPanelCollapsed,
   setDetailPanelWidth,
+  setFocusGraphAppearance,
   setGraphAppearance,
 } from "./citationPreferences";
+import {
+  appendUniqueCitationMapKeys,
+  extendCitationMapItemScope,
+  normalizedCitationMapItemIDs,
+  replaceCitationMapItemScope,
+} from "./citationMapScopePolicy";
 
 export type CitationMapFocusResult = "selected" | "revealed" | "not-found";
 
 export interface CitationMapViewController {
-  focusItem(itemID: number): CitationMapFocusResult;
+  revealItem(itemID: number): CitationMapFocusResult;
+  revealItems(itemIDs: readonly number[]): CitationMapFocusResult;
+  replaceMapItems(itemIDs: readonly number[]): CitationMapFocusResult;
+  addMapItems(itemIDs: readonly number[]): CitationMapFocusResult;
+  openFocusItem(itemID: number): CitationMapFocusResult;
+  openFocusItems(itemIDs: readonly number[]): CitationMapFocusResult;
+  addFocusItems(itemIDs: readonly number[]): CitationMapFocusResult;
+  openCollection(collectionID: number): CitationMapFocusResult;
+  setActive(active: boolean): void;
 }
 
-const HTML_NS = "http://www.w3.org/1999/xhtml";
+const FOCUS_RELATIONSHIP_CACHE_LIMIT = 200;
+const AUTOMATIC_FOCUS_REFRESH = automaticFocusSeedRefreshPlan();
 const cleanupByMount = new WeakMap<Element, () => void>();
 const controllerByMount = new WeakMap<Element, CitationMapViewController>();
 
@@ -121,672 +173,27 @@ export function getCitationMapViewController(
   return controllerByMount.get(mount) ?? null;
 }
 
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.max(minimum, Math.min(maximum, value));
-}
-
 export interface GraphViewOptions {
   mode: "tab" | "window";
   onSelectPaper: (itemID: number) => void | Promise<void>;
+  onViewKindChange?: (kind: "map" | "focus") => void;
+  initialViewKind?: "map" | "focus";
   initialItemID?: number | null;
-}
-
-interface CollectionVisuals {
-  colorsByNodeKey: Map<string, string[]>;
-  labelsByNodeKey: Map<string, string[]>;
-}
-
-function element<K extends keyof HTMLElementTagNameMap>(
-  document: Document,
-  tag: K,
-  className?: string,
-): HTMLElementTagNameMap[K] {
-  const node = document.createElementNS(
-    HTML_NS,
-    tag,
-  ) as HTMLElementTagNameMap[K];
-  if (className) node.className = className;
-  return node;
-}
-
-function text<K extends keyof HTMLElementTagNameMap>(
-  document: Document,
-  tag: K,
-  content: string,
-  className?: string,
-): HTMLElementTagNameMap[K] {
-  const node = element(document, tag, className);
-  node.textContent = content;
-  return node;
-}
-
-function clear(node: Element): void {
-  node.replaceChildren();
-}
-
-function ensureStyles(document: Document): void {
-  const id = `${config.addonRef}-graph-stylesheet`;
-  const href = `chrome://${config.addonRef}/content/graph.css`;
-  let link = document.getElementById(id) as HTMLLinkElement | null;
-  if (!link) {
-    link = element(document, "link");
-    link.id = id;
-    link.rel = "stylesheet";
-    (document.head ?? document.documentElement).appendChild(link);
-  }
-  if (link.getAttribute("href") !== href) link.setAttribute("href", href);
-}
-
-function icon(document: Document, name: CitationMapIconName): SVGSVGElement {
-  return createCitationMapIcon(document, name);
-}
-
-function networkLogo(document: Document): HTMLSpanElement {
-  const logo = element(document, "span", "cm-network-logo");
-  logo.setAttribute("aria-hidden", "true");
-  return logo;
-}
-
-function iconButtonContent(
-  document: Document,
-  name: Parameters<typeof icon>[1],
-  label: string,
-): DocumentFragment {
-  const fragment = document.createDocumentFragment();
-  fragment.append(icon(document, name), text(document, "span", label));
-  return fragment;
-}
-
-function formatCount(value: number | null): string {
-  return value === null
-    ? "—"
-    : new Intl.NumberFormat(undefined, { useGrouping: false }).format(value);
-}
-
-function normalizeSearch(value: string): string {
-  return value
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLocaleLowerCase();
-}
-
-function paperSearchText(paper: ZoteroPaper): string {
-  return normalizeSearch(
-    [
-      paper.title,
-      paper.authors.join(" "),
-      paper.doi ?? "",
-      paper.sourceTitle ?? "",
-      paper.abstract ?? "",
-      paper.year ?? "",
-    ].join(" "),
-  );
-}
-
-function externalWorkTitle(work: ExternalWork): string {
-  return externalWorkDisplayTitle(work) ?? "Title unavailable";
-}
-
-function colorForCollection(id: number, depth: number): string {
-  const hue = (id * 47 + depth * 19) % 360;
-  return `hsl(${hue} ${Math.max(42, 65 - depth * 5)}% ${Math.min(67, 45 + depth * 7)}%)`;
-}
-
-function buildCollectionVisuals(
-  snapshot: LibrarySnapshot,
-  nodes: CitationGraphNode[],
-): CollectionVisuals {
-  const byID = new Map(
-    snapshot.collections.map((collection) => [
-      collection.collectionID,
-      collection,
-    ]),
-  );
-  const colorsByNodeKey = new Map<string, string[]>();
-  const labelsByNodeKey = new Map<string, string[]>();
-  for (const node of nodes) {
-    const memberships = node.collectionIDs
-      .map((id) => byID.get(id))
-      .filter((entry): entry is LibraryCollectionFilter => Boolean(entry))
-      .sort((left, right) => right.depth - left.depth);
-    const shown = memberships.slice(0, 4);
-    colorsByNodeKey.set(
-      node.key,
-      shown.map((collection) =>
-        colorForCollection(collection.collectionID, collection.depth),
-      ),
-    );
-    labelsByNodeKey.set(
-      node.key,
-      memberships.length
-        ? memberships.map((collection) => collection.path)
-        : ["Unfiled"],
-    );
-  }
-  return { colorsByNodeKey, labelsByNodeKey };
-}
-
-function metricDescription(definition: {
-  description: string;
-  interpretation?: string;
-}): string {
-  return [definition.description, definition.interpretation]
-    .filter(Boolean)
-    .join(" ");
-}
-
-interface SelectableMetricDefinition {
-  id: MetricID;
-  label: string;
-  description: string;
-  interpretation?: string;
-}
-
-function metricHasData(nodes: CitationGraphNode[], metric: MetricID): boolean {
-  return nodes.some((node) => {
-    const value = metricValue(node, metric);
-    return typeof value === "number" && Number.isFinite(value);
-  });
-}
-
-function createMetricSelect(
-  document: Document,
-  definitions: ReadonlyArray<SelectableMetricDefinition>,
-  nodes: CitationGraphNode[],
-  selected: string,
-  includeFree = false,
-): HTMLSelectElement {
-  const select = element(document, "select", "cm-select");
-
-  if (includeFree) {
-    const option = element(document, "option");
-    option.value = "free";
-    option.textContent = "Free";
-    option.title =
-      "Position nodes freely along this axis. Drag a node to move it along every free axis.";
-    option.dataset.metricDescription = option.title;
-    select.appendChild(option);
-  }
-
-  for (const definition of definitions) {
-    if (!metricHasData(nodes, definition.id)) continue;
-
-    const option = element(document, "option");
-    option.value = definition.id;
-    option.textContent = definition.label;
-    option.title = metricDescription(definition);
-    option.dataset.metricDescription = option.title;
-    select.appendChild(option);
-  }
-
-  const options = Array.from(select.options) as HTMLOptionElement[];
-  const selectedOption = options.find(
-    (option) => option.value === selected && !option.disabled,
-  );
-
-  select.value = selectedOption?.value ?? options[0]?.value ?? "";
-
-  return select;
-}
-function appendMetricOption(
-  document: Document,
-  select: HTMLSelectElement,
-  value: string,
-  label: string,
-  description: string,
-): void {
-  const option = element(document, "option");
-  option.value = value;
-  option.textContent = label;
-  option.title = description;
-  option.dataset.metricDescription = description;
-  select.appendChild(option);
-}
-
-function selectAvailableValue(
-  select: HTMLSelectElement,
-  requested: string,
-): void {
-  const options = Array.from(select.options) as HTMLOptionElement[];
-  const requestedOption = options.find(
-    (option) => option.value === requested && !option.disabled,
-  );
-  const fallback = options.find((option) => !option.disabled);
-  select.value = requestedOption?.value ?? fallback?.value ?? "";
-}
-
-function createScaleSelect(
-  document: Document,
-  selected: GraphScaleType,
-): HTMLSelectElement {
-  const select = element(document, "select", "cm-select");
-  for (const [value, label] of [
-    ["linear", "Lin"],
-    ["log", "Log"],
-  ] as const) {
-    const option = element(document, "option");
-    option.value = value;
-    option.textContent = label;
-    select.appendChild(option);
-  }
-  select.value = selected;
-  return select;
-}
-
-function createMetricHelp(
-  document: Document,
-  select: HTMLSelectElement,
-  fallback: string,
-): HTMLParagraphElement {
-  const help = text(document, "p", fallback, "cm-metric-help");
-  const showSelected = (): void => {
-    const option = select.selectedOptions[0];
-    const description =
-      option?.dataset.metricDescription || option?.title || fallback;
-    help.textContent = description;
-    select.title = description;
-  };
-  const showHovered = (event: Event): void => {
-    const option = (event.target as Element | null)?.closest?.(
-      "option",
-    ) as HTMLOptionElement | null;
-    const description = option?.dataset.metricDescription || option?.title;
-    if (description) help.textContent = description;
-  };
-  for (const eventName of ["input", "change", "command"]) {
-    select.addEventListener(eventName, showSelected);
-  }
-  select.addEventListener("mouseover", showHovered, true);
-  select.addEventListener("mousemove", showHovered, true);
-  select.addEventListener("mouseleave", showSelected);
-  showSelected();
-  return help;
-}
-
-function createAxesAppearance(
-  document: Document,
-  initial: GraphLayoutOptions,
-  nodes: CitationGraphNode[],
-  onChange: (layout: GraphLayoutOptions) => void,
-  onLegendChange: (visible: boolean) => void,
-): {
-  root: HTMLDivElement;
-  button: HTMLButtonElement;
-  panel: HTMLDivElement;
-  setLayout: (layout: GraphLayoutOptions) => void;
-  getLayout: () => GraphLayoutOptions;
-  getLegendVisible: () => boolean;
-  close: () => void;
-} {
-  const root = element(document, "div", "cm-appearance-control");
-  const button = element(
-    document,
-    "button",
-    "cm-overlay-button cm-appearance-button",
-  );
-  button.type = "button";
-  button.textContent = "⚙";
-  button.title = "Graph display settings";
-  button.setAttribute("aria-label", "Graph display settings");
-  button.setAttribute("aria-expanded", "false");
-
-  const panel = element(document, "div", "cm-appearance-panel");
-  panel.hidden = true;
-  panel.style.display = "none";
-  panel.setAttribute("role", "dialog");
-  panel.setAttribute("aria-label", "Graph display settings");
-  panel.style.width = "min(390px, calc(100vw - 38px))";
-
-  const xMetric = createMetricSelect(
-    document,
-    axisMetricDefinitions(),
-    nodes,
-    initial.xMetric,
-    true,
-  );
-  const xScale = createScaleSelect(document, initial.xScale);
-  const yMetric = createMetricSelect(
-    document,
-    axisMetricDefinitions(),
-    nodes,
-    initial.yMetric,
-    true,
-  );
-  const yScale = createScaleSelect(document, initial.yScale);
-  const sizeMetric = createMetricSelect(
-    document,
-    nodeSizeMetricDefinitions(),
-    nodes,
-    initial.nodeSizeMetric,
-  );
-  const uniform = element(document, "option");
-  uniform.value = "uniform";
-  uniform.textContent = "Uniform";
-  uniform.title = "Display every visible node with the same size.";
-  uniform.dataset.metricDescription = uniform.title;
-  sizeMetric.prepend(uniform);
-  selectAvailableValue(sizeMetric, initial.nodeSizeMetric);
-
-  const colorMetric = element(document, "select", "cm-select");
-  const categoricalDefinitions: Array<{
-    value: GraphNodeColorMetric;
-    label: string;
-    description: string;
-    available: boolean;
-  }> = [
-    {
-      value: "collection",
-      label: "Collection",
-      description: "Colour nodes by their Zotero collection membership.",
-      available: nodes.some((node) => node.collectionIDs.length > 0),
-    },
-    {
-      value: "publication-type",
-      label: "Publication type",
-      description:
-        "Colour nodes by the publication type reported by the provider.",
-      available: nodes.some((node) => Boolean(node.publicationType)),
-    },
-    {
-      value: "provider",
-      label: "Provider",
-      description:
-        "Colour nodes by the scholarly-data provider used for the item.",
-      available: nodes.some((node) => Boolean(node.provider)),
-    },
-    {
-      value: "open-access",
-      label: "Open Access",
-      description: "Distinguish works with known open-access status.",
-      available: nodes.some(
-        (node) => node.isOpenAccess !== null || Boolean(node.openAccessStatus),
-      ),
-    },
-    {
-      value: "retraction",
-      label: "Retraction",
-      description: "Distinguish works with known retraction status.",
-      available: nodes.some((node) => node.isRetracted !== null),
-    },
-  ];
-  for (const definition of categoricalDefinitions) {
-    if (!definition.available) continue;
-    appendMetricOption(
-      document,
-      colorMetric,
-      definition.value,
-      definition.label,
-      definition.description,
-    );
-  }
-  for (const definition of nodeColorMetricDefinitions()) {
-    if (!metricHasData(nodes, definition.id)) continue;
-    appendMetricOption(
-      document,
-      colorMetric,
-      definition.id,
-      definition.label,
-      metricDescription(definition),
-    );
-  }
-  if (!colorMetric.options.length) {
-    appendMetricOption(
-      document,
-      colorMetric,
-      "provider",
-      "Uniform",
-      "No node colour metric has data for the currently loaded papers.",
-    );
-  }
-  selectAvailableValue(colorMetric, initial.nodeColorMetric);
-
-  const labels = element(document, "select", "cm-select");
-  for (const [value, label] of [
-    ["title", "Title"],
-    ["author-year", "Author (year)"],
-    ["none", "No labels"],
-  ]) {
-    const option = element(document, "option");
-    option.value = value;
-    option.textContent = label;
-    labels.appendChild(option);
-  }
-  labels.value = initial.nodeLabelMode;
-
-  const legendPreferenceKey = `${config.prefsPrefix}.graphShowLegend`;
-  const storedLegend = Zotero.Prefs.get(legendPreferenceKey, true);
-  const showLegend = element(document, "input");
-  showLegend.type = "checkbox";
-  showLegend.checked =
-    storedLegend === undefined || storedLegend === null
-      ? true
-      : Boolean(storedLegend);
-
-  const tabs = element(document, "div", "cm-detail-tabs");
-  tabs.style.marginTop = "0";
-  const panes = new Map<string, HTMLDivElement>();
-  const tabButtons = new Map<string, HTMLButtonElement>();
-  const activate = (id: string): void => {
-    for (const [key, pane] of panes) {
-      const selected = key === id;
-      pane.hidden = !selected;
-      pane.style.display = selected ? "block" : "none";
-      pane.setAttribute("aria-hidden", String(!selected));
-    }
-    for (const [key, tab] of tabButtons) {
-      const selected = key === id;
-      tab.dataset.selected = String(selected);
-      tab.setAttribute("aria-selected", String(selected));
-    }
-  };
-  const makePane = (id: string, label: string): HTMLDivElement => {
-    const tab = element(document, "button");
-    tab.type = "button";
-    tab.textContent = label;
-    tab.dataset.selected = "false";
-    tab.setAttribute("role", "tab");
-    tabs.appendChild(tab);
-    tabButtons.set(id, tab);
-    const pane = element(document, "div", "cm-appearance-section");
-    pane.hidden = true;
-    pane.style.display = "none";
-    pane.style.margin = "8px 0 0";
-    pane.style.border = "0";
-    pane.style.padding = "0";
-    pane.setAttribute("role", "tabpanel");
-    panes.set(id, pane);
-    tab.addEventListener("click", () => activate(id));
-    return pane;
-  };
-
-  const compactLine = (...controls: HTMLElement[]): HTMLDivElement => {
-    const line = element(document, "div", "cm-appearance-row");
-    line.style.display = "flex";
-    line.style.gridTemplateColumns = "none";
-    line.style.alignItems = "center";
-    line.style.gap = "6px";
-    for (const control of controls) line.appendChild(control);
-    return line;
-  };
-  const labelledLine = (
-    label: string,
-    control: HTMLElement,
-    trailing?: HTMLElement,
-  ): HTMLDivElement => {
-    const line = compactLine(text(document, "span", label), control);
-    const labelNode = line.firstElementChild as HTMLElement | null;
-    if (labelNode) labelNode.style.flex = "0 0 44px";
-    control.style.flex = "1 1 auto";
-    if (trailing) line.appendChild(trailing);
-    return line;
-  };
-
-  xScale.style.flex = "0 0 64px";
-  xMetric.style.flex = "1 1 auto";
-  yScale.style.flex = "0 0 64px";
-  yMetric.style.flex = "1 1 auto";
-
-  const xPane = makePane("x", "X axis");
-  xPane.append(
-    compactLine(xScale, xMetric),
-    createMetricHelp(document, xMetric, "Choose horizontal position."),
-  );
-  const yPane = makePane("y", "Y axis");
-  yPane.append(
-    compactLine(yScale, yMetric),
-    createMetricHelp(document, yMetric, "Choose vertical position."),
-  );
-  const nodesPane = makePane("nodes", "Nodes");
-  const legendLabel = element(document, "label", "cm-check-control");
-  legendLabel.style.whiteSpace = "nowrap";
-  legendLabel.append(showLegend, document.createTextNode("Show legend"));
-  nodesPane.append(
-    labelledLine("Label", labels),
-    labelledLine("Size", sizeMetric),
-    createMetricHelp(
-      document,
-      sizeMetric,
-      "Visible minimum and maximum values map to the plugin minimum and maximum node sizes.",
-    ),
-    labelledLine("Color", colorMetric, legendLabel),
-    createMetricHelp(document, colorMetric, "Choose node colour."),
-  );
-
-  panel.append(tabs, xPane, yPane, nodesPane);
-  const actions = element(document, "div", "cm-appearance-actions");
-  const reset = element(document, "button", "cm-secondary-button");
-  reset.type = "button";
-  reset.textContent = "Reset";
-  actions.appendChild(reset);
-  panel.appendChild(actions);
-  root.append(button, panel);
-
-  const read = (): GraphLayoutOptions => ({
-    xMetric: xMetric.value as GraphAxisMetric,
-    xScale: xScale.value as GraphScaleType,
-    yMetric: yMetric.value as GraphAxisMetric,
-    yScale: yScale.value as GraphScaleType,
-    nodeSizeMetric: sizeMetric.value as GraphNodeSizeMetric,
-    nodeColorMetric: colorMetric.value as GraphNodeColorMetric,
-    nodeLabelMode: labels.value as GraphLayoutOptions["nodeLabelMode"],
-  });
-  const updateAvailability = (): void => {
-    for (const [metric, scale] of [
-      [xMetric, xScale],
-      [yMetric, yScale],
-    ] as const) {
-      const selected = metric.value as GraphAxisMetric;
-      const logarithmic = scale.querySelector(
-        'option[value="log"]',
-      ) as HTMLOptionElement | null;
-      const enabled =
-        selected !== "free" && getMetricDefinition(selected).graph.logarithmic;
-      if (logarithmic) logarithmic.disabled = !enabled;
-      if (!enabled && scale.value === "log") scale.value = "linear";
-      scale.disabled = selected === "free";
-    }
-    const categoricalValues = new Set([
-      "collection",
-      "publication-type",
-      "provider",
-      "open-access",
-      "retraction",
-    ]);
-    showLegend.disabled = categoricalValues.has(colorMetric.value);
-    legendLabel.title = showLegend.disabled
-      ? "A numeric legend is available when Color uses a numeric metric."
-      : "Show or hide the numeric color legend on the graph.";
-  };
-  let last = JSON.stringify(read());
-  const commit = (layout: GraphLayoutOptions, force = false): void => {
-    const signature = JSON.stringify(layout);
-    if (!force && signature === last) return;
-    onChange(layout);
-    setGraphAppearance(layout);
-    last = signature;
-  };
-  for (const control of [
-    xMetric,
-    xScale,
-    yMetric,
-    yScale,
-    sizeMetric,
-    colorMetric,
-    labels,
-  ]) {
-    const applySelection = (): void => {
-      updateAvailability();
-      commit(read());
-    };
-    control.addEventListener("input", applySelection);
-    control.addEventListener("change", applySelection);
-  }
-  showLegend.addEventListener("change", () => {
-    Zotero.Prefs.set(legendPreferenceKey, showLegend.checked, true);
-    onLegendChange(showLegend.checked);
-  });
-
-  const close = (): void => {
-    panel.hidden = true;
-    panel.style.display = "none";
-    button.setAttribute("aria-expanded", "false");
-  };
-  button.addEventListener("click", () => {
-    if (panel.hidden) {
-      panel.hidden = false;
-      panel.style.display = "block";
-      button.setAttribute("aria-expanded", "true");
-      activate("x");
-    } else {
-      close();
-    }
-  });
-  const setControls = (layout: GraphLayoutOptions): void => {
-    selectAvailableValue(xMetric, layout.xMetric);
-    xScale.value = layout.xScale;
-    selectAvailableValue(yMetric, layout.yMetric);
-    yScale.value = layout.yScale;
-    selectAvailableValue(sizeMetric, layout.nodeSizeMetric);
-    selectAvailableValue(colorMetric, layout.nodeColorMetric);
-    labels.value = layout.nodeLabelMode;
-    updateAvailability();
-  };
-  const setLayout = (layout: GraphLayoutOptions): void => {
-    setControls(layout);
-    commit(read(), true);
-  };
-  reset.addEventListener("click", () => {
-    showLegend.checked = true;
-    Zotero.Prefs.set(legendPreferenceKey, true, true);
-    onLegendChange(true);
-    setLayout(resetGraphAppearance());
-  });
-  updateAvailability();
-  activate("x");
-  const normalizedInitial = read();
-  if (JSON.stringify(normalizedInitial) !== JSON.stringify(initial)) {
-    setGraphAppearance(normalizedInitial);
-    last = JSON.stringify(normalizedInitial);
-  }
-  return {
-    root,
-    button,
-    panel,
-    setLayout,
-    getLayout: read,
-    getLegendVisible: () => showLegend.checked,
-    close,
-  };
+  initialItemIDs?: readonly number[] | null;
+  initialItemMode?: "replace" | "add";
+  initialMapScopeItemIDs?: readonly number[] | null;
+  initialMapPinnedItemIDs?: readonly number[] | null;
+  onMapScopeChange?: (
+    scopeItemIDs: readonly number[] | null,
+    pinnedItemIDs: readonly number[],
+  ) => void;
+  initialFocusItemID?: number | null;
+  initialFocusItemIDs?: readonly number[] | null;
+  initialCollectionID?: number | null;
 }
 
 function localPaperByKey(snapshot: LibrarySnapshot): Map<string, ZoteroPaper> {
   return new Map(snapshot.papers.map((paper) => [paper.itemKey, paper]));
-}
-
-function relationshipDirection(
-  direction: "references" | "cited-by",
-): ManualRelationDirection {
-  return direction === "references" ? "reference" : "cited-by";
 }
 
 function graphNodeLibraryID(node: CitationGraphNode): number {
@@ -794,97 +201,19 @@ function graphNodeLibraryID(node: CitationGraphNode): number {
   return Number(item?.libraryID ?? Zotero.Libraries.userLibraryID);
 }
 
-function referenceMatchesExternalWork(
-  reference: RelatedWorkMetadata,
-  work: ExternalWork,
-): boolean {
-  const referenceDOI = normalizeDOI(reference.doi);
-  const workDOI = normalizeDOI(work.doi);
-  if (referenceDOI && workDOI && referenceDOI === workDOI) return true;
-  if (
-    reference.provider === work.provider &&
-    reference.providerWorkID &&
-    work.providerWorkID &&
-    String(reference.providerWorkID).toLocaleLowerCase() ===
-      String(work.providerWorkID).toLocaleLowerCase()
-  ) {
-    return true;
-  }
-  const referenceTitle = normalizeExactTitle(reference.title);
-  const workTitle = normalizeExactTitle(work.title);
-  if (!referenceTitle || !workTitle || referenceTitle !== workTitle)
-    return false;
-  return (
-    reference.year === null ||
-    work.year === null ||
-    Math.abs(reference.year - work.year) <= 1
-  );
-}
-
 function referenceMatchesGraphNode(
   reference: RelatedWorkMetadata,
   node: CitationGraphNode,
 ): boolean {
-  const referenceDOI = normalizeDOI(reference.doi);
-  const nodeDOI = normalizeDOI(node.doi);
-  if (referenceDOI && nodeDOI && referenceDOI === nodeDOI) return true;
-  if (
-    reference.provider === node.provider &&
-    reference.providerWorkID &&
-    node.providerWorkID &&
-    String(reference.providerWorkID).toLocaleLowerCase() ===
-      String(node.providerWorkID).toLocaleLowerCase()
-  ) {
-    return true;
-  }
-  const referenceTitle = normalizeExactTitle(reference.title);
-  const nodeTitle = normalizeExactTitle(node.title);
-  if (!referenceTitle || !nodeTitle || referenceTitle !== nodeTitle)
-    return false;
-  return (
-    reference.year === null ||
-    node.year === null ||
-    Math.abs(reference.year - node.year) <= 1
-  );
-}
-
-function graphDescriptorFromReference(
-  libraryID: number,
-  subjectItemKey: string,
-  reference: RelatedWorkMetadata,
-): GraphIgnoredRelationDescriptor {
-  return {
-    libraryID,
-    subjectItemKey,
-    direction: "reference",
-    provider:
-      reference.provider === "manual" || reference.provider === "zotero"
-        ? "crossref"
-        : reference.provider,
-    providerWorkID:
-      reference.provider === "manual" || reference.provider === "zotero"
-        ? null
-        : reference.providerWorkID,
-    doi: reference.doi,
-    normalizedTitle: normalizeExactTitle(reference.title) || null,
-  };
-}
-
-interface GraphIgnoredRelationDescriptor {
-  libraryID: number;
-  subjectItemKey: string;
-  direction: ManualRelationDirection;
-  provider: CitationProviderID;
-  providerWorkID: string | null;
-  doi: string | null;
-  normalizedTitle: string | null;
+  return matchRelatedWorkToGraphNode(reference, node).decision === "same-work";
 }
 
 function ignoredRelationDescriptorForExternalWork(
   node: CitationGraphNode,
   direction: "references" | "cited-by",
   work: ExternalWork,
-): GraphIgnoredRelationDescriptor {
+  referenceIndex?: RelatedWorkLookupIndex,
+): IgnoredRelationDescriptor {
   const libraryID = graphNodeLibraryID(node);
   const relatedKey = work.inLibraryItemKey ?? work.zoteroItemKey;
   if (direction === "cited-by" && relatedKey) {
@@ -893,7 +222,11 @@ function ignoredRelationDescriptorForExternalWork(
       referenceMatchesGraphNode(candidate, node),
     );
     if (reference) {
-      return graphDescriptorFromReference(libraryID, relatedKey, reference);
+      return ignoredRelationDescriptorFromReference(
+        libraryID,
+        relatedKey,
+        reference,
+      );
     }
     return {
       libraryID,
@@ -906,59 +239,44 @@ function ignoredRelationDescriptorForExternalWork(
     };
   }
   if (direction === "references") {
-    const sourceRecord = getCitationMetricRecord(libraryID, node.itemKey);
-    const reference = sourceRecord?.references.find((candidate) =>
-      referenceMatchesExternalWork(candidate, work),
-    );
+    const reference = referenceIndex
+      ? findMatchingRelatedWork(referenceIndex, work)
+      : getCitationMetricRecord(libraryID, node.itemKey)?.references.find(
+          (candidate) => referenceMatchesRelatedWork(candidate, work),
+        );
     if (reference) {
-      return graphDescriptorFromReference(libraryID, node.itemKey, reference);
+      return ignoredRelationDescriptorFromReference(
+        libraryID,
+        node.itemKey,
+        reference,
+      );
     }
   }
-  return {
+  return ignoredRelationDescriptorForRelatedWork(
     libraryID,
-    subjectItemKey: node.itemKey,
-    direction: relationshipDirection(direction),
-    provider: ignoreProviderForWork(work),
-    providerWorkID:
-      work.provider === "manual" || work.provider === "zotero"
-        ? null
-        : work.providerWorkID,
-    doi: work.doi,
-    normalizedTitle: normalizeExactTitle(work.title) || null,
-  };
+    node.itemKey,
+    relationshipDirection(direction),
+    work,
+  );
 }
 
 function ignoredRelationForExternalWork(
   node: CitationGraphNode,
   direction: "references" | "cited-by",
   work: ExternalWork,
+  ignoredIndex?: IgnoredRelationIndex,
+  referenceIndex?: RelatedWorkLookupIndex,
 ): IgnoredProviderRelation | null {
   const descriptor = ignoredRelationDescriptorForExternalWork(
     node,
     direction,
     work,
+    referenceIndex,
   );
-  return (
-    getIgnoredRelations(descriptor.libraryID).find(
-      (entry) =>
-        entry.subjectItemKey === descriptor.subjectItemKey &&
-        entry.direction === descriptor.direction &&
-        ((entry.provider === descriptor.provider &&
-          Boolean(entry.providerWorkID) &&
-          String(entry.providerWorkID).toLocaleLowerCase() ===
-            String(descriptor.providerWorkID ?? "").toLocaleLowerCase()) ||
-          (Boolean(entry.doi) &&
-            normalizeDOI(entry.doi) === normalizeDOI(descriptor.doi)) ||
-          (Boolean(entry.normalizedTitle) &&
-            entry.normalizedTitle === descriptor.normalizedTitle)),
-    ) ?? null
-  );
-}
-
-function ignoreProviderForWork(work: ExternalWork): CitationProviderID {
-  return work.provider === "manual" || work.provider === "zotero"
-    ? "crossref"
-    : work.provider;
+  const index =
+    ignoredIndex ??
+    createIgnoredRelationIndex(getIgnoredRelations(descriptor.libraryID));
+  return findIgnoredRelation(index, descriptor);
 }
 
 function createCollectionChooser(
@@ -1011,17 +329,67 @@ export function renderCitationMapView(
   ensureStyles(document);
   clear(mount);
   const model = buildCitationGraph(snapshot);
+  const libraryModel = {
+    nodes: [...model.nodes],
+    edges: [...model.edges],
+    statistics: { ...model.statistics },
+  };
   const paperByKey = localPaperByKey(snapshot);
   const visuals = buildCollectionVisuals(snapshot, model.nodes);
+  const initialViewKind =
+    options.initialViewKind ??
+    (options.initialFocusItemID || options.initialFocusItemIDs?.length
+      ? "focus"
+      : "map");
+  let currentViewKind: "map" | "focus" = initialViewKind;
   let visibleKeys = new Set(model.nodes.map((node) => node.key));
+  let mapScopeItemIDs = options.initialMapScopeItemIDs
+    ? replaceCitationMapItemScope(options.initialMapScopeItemIDs)
+    : null;
+  let mapPinnedItemIDs = replaceCitationMapItemScope(
+    options.initialMapPinnedItemIDs ?? [],
+  );
   let selectedNode: CitationGraphNode | null = null;
-  let transientFocusNode: CitationGraphNode | null = null;
+  let focusProjection: GraphFocusProjection | null = null;
+  const focusSeedRegistry = new Map<string, CitationGraphNode>();
+  const focusRelationships = new Map<
+    string,
+    { references: ExternalWork[]; citedBy: ExternalWork[] }
+  >();
+  const focusRefreshInFlight = new Map<string, Promise<void>>();
+  const focusRefreshTimers = new Map<string, number>();
+  const focusRefreshQueue = new SerializedTaskQueue();
+  let focusRefreshEpoch = 0;
+  let focusRefreshCount = 0;
+  let focusLoadActive = false;
+  let focusRebuildFrame = 0;
+  const focusBack: GraphFocusState[] = [];
+  const focusForward: GraphFocusState[] = [];
   let activeRelationshipView: {
     itemKey: string;
     direction: "references" | "cited-by";
   } | null = null;
+  let refreshActiveRelationshipView: (() => void) | null = null;
+  let relationshipDetailRefreshFrame = 0;
+  let relationshipGraphRefreshTimer = 0;
   let renderer: CitationGraphRenderer | null = null;
+  const mapPinnedKeys = (): Set<string> =>
+    new Set(
+      libraryModel.nodes
+        .filter((node) => mapPinnedItemIDs.has(node.itemID))
+        .map((node) => node.key),
+    );
+  const syncMapPinnedKeys = (draw = false): void => {
+    renderer?.setPinnedKeys(mapPinnedKeys(), draw);
+  };
+  const publishMapScope = (): void => {
+    options.onMapScopeChange?.(mapScopeItemIDs ? [...mapScopeItemIDs] : null, [
+      ...mapPinnedItemIDs,
+    ]);
+  };
   let cleaned = false;
+  let viewActive = true;
+  let inactiveRelationshipDirty = false;
   let applyFilters = (): void => undefined;
   const initialLayout = getGraphAppearance();
   const selectPaper = async (itemID: number): Promise<void> => {
@@ -1036,33 +404,102 @@ export function renderCitationMapView(
 
   const root = element(document, "div", "citation-map-root");
   root.dataset.mode = options.mode;
+  root.dataset.viewKind = currentViewKind;
+
   const header = element(document, "header", "cm-header");
   const identity = element(document, "div", "cm-header-identity");
   const titleRow = element(document, "div", "cm-title-row");
-  titleRow.append(networkLogo(document), text(document, "h1", "Citation Map"));
+  const viewTitle = text(
+    document,
+    "h1",
+    currentViewKind === "focus" ? "Focus View" : "Citation Map",
+  );
+  titleRow.append(networkLogo(document), viewTitle);
   const summary = text(
     document,
     "p",
-    `${formatCount(snapshot.statistics.totalPapers)} papers - ${formatCount(model.statistics.edges)} citation links`,
+    `${formatCount(snapshot.statistics.totalPapers)} nodes - ${formatCount(model.statistics.edges)} links`,
     "cm-library-summary",
   );
   identity.append(titleRow, summary);
   header.appendChild(identity);
 
   const toolbar = element(document, "div", "cm-header-toolbar");
-  const searchWrap = element(document, "label", "cm-search-wrap");
-  searchWrap.appendChild(icon(document, "search"));
-  const search = element(document, "input", "cm-search");
-  search.type = "search";
-  search.placeholder = "Search all fields";
-  search.setAttribute("aria-label", "Search all fields");
-  searchWrap.appendChild(search);
+  const addNodeWrap = element(document, "div", "cm-add-node-wrap");
+  const addNodeButton = element(document, "button", "cm-toolbar-button");
+  addNodeButton.type = "button";
+  addNodeButton.append(iconButtonContent(document, "add", "Add Node"));
+  addNodeButton.title =
+    "Search the complete Zotero library and add papers to this view.";
+  addNodeButton.setAttribute("aria-expanded", "false");
+  const addNodePopup = element(document, "section", "cm-add-node-popup");
+  addNodePopup.hidden = true;
+  addNodePopup.setAttribute("role", "dialog");
+  addNodePopup.setAttribute("aria-label", "Add papers to Citation Map view");
+  const addNodeSearch = element(document, "input", "cm-add-node-search");
+  addNodeSearch.type = "search";
+  addNodeSearch.placeholder = "Search title, creator, or year";
+  addNodeSearch.setAttribute(
+    "aria-label",
+    "Search titles, creators, and years in the complete Zotero library",
+  );
+  const addNodeResultsLabel = text(
+    document,
+    "h2",
+    "Results",
+    "cm-add-node-section-title",
+  );
+  const addNodeResults = element(document, "div", "cm-add-node-results");
+  const addNodeSelectedLabel = text(
+    document,
+    "h2",
+    "Selected",
+    "cm-add-node-section-title",
+  );
+  const addNodeSelected = element(document, "div", "cm-add-node-selected");
+  const addNodeStatus = text(
+    document,
+    "p",
+    "No papers selected.",
+    "cm-add-node-status",
+  );
+  const addSelectedButton = element(document, "button", "cm-primary-button");
+  addSelectedButton.type = "button";
+  addSelectedButton.textContent = "Add selected to view";
+  addSelectedButton.disabled = true;
+  const addNodeFooter = element(document, "div", "cm-add-node-footer");
+  addNodeFooter.append(addNodeStatus, addSelectedButton);
+  addNodePopup.append(
+    addNodeSearch,
+    addNodeResultsLabel,
+    addNodeResults,
+    addNodeSelectedLabel,
+    addNodeSelected,
+    addNodeFooter,
+  );
+  addNodeWrap.append(addNodeButton, addNodePopup);
+
   const graphFilterDescriptors = new Map<string, PaperListDescriptor>();
-  for (const node of model.nodes) {
+  const descriptorForGraphNode = (
+    node: CitationGraphNode,
+  ): PaperListDescriptor | null => {
+    if (node.kind === "external" && node.externalWork) {
+      return {
+        ...describeExternalWork(
+          node.externalWork as ExternalWork,
+          snapshot.libraryID,
+          true,
+          false,
+          paperByKey,
+        ),
+        key: node.key,
+      };
+    }
     const paper = paperByKey.get(node.itemKey);
-    if (!paper) continue;
-    graphFilterDescriptors.set(node.key, {
+    if (!paper) return null;
+    return {
       ...describeZoteroPaper(paper),
+      key: node.key,
       year: node.year,
       citationCount: node.citationCount,
       referenceCount: node.referenceCount,
@@ -1070,8 +507,16 @@ export function renderCitationMapView(
       collectionIDs: node.collectionIDs,
       isOpenAccess: node.isOpenAccess,
       isRetracted: node.isRetracted,
-    });
-  }
+    };
+  };
+  const rebuildGraphFilterDescriptors = (): void => {
+    graphFilterDescriptors.clear();
+    for (const node of model.nodes) {
+      const descriptor = descriptorForGraphNode(node);
+      if (descriptor) graphFilterDescriptors.set(node.key, descriptor);
+    }
+  };
+  rebuildGraphFilterDescriptors();
   const graphFilter = createPaperFilterController({
     document,
     collections: snapshot.collections,
@@ -1083,12 +528,12 @@ export function renderCitationMapView(
   similarButton.type = "button";
   similarButton.append(iconButtonContent(document, "similar", "Similar"));
   similarButton.title =
-    "Find papers related to the currently visible graph and show them in a separate detail slide without adding them automatically.";
+    "Find papers related to the currently visible papers without adding them automatically.";
   const exportWrap = element(document, "div", "cm-menu-wrapper");
   const exportButton = element(document, "button", "cm-toolbar-button");
   exportButton.type = "button";
   exportButton.append(iconButtonContent(document, "export", "Export"));
-  exportButton.title = "Export the currently visible citation graph.";
+  exportButton.title = "Export only the currently visible citation graph.";
   exportButton.setAttribute("aria-expanded", "false");
   const exportMenu = element(document, "div", "cm-export-menu");
   exportMenu.hidden = true;
@@ -1108,16 +553,105 @@ export function renderCitationMapView(
   refreshButton.type = "button";
   refreshButton.append(iconButtonContent(document, "refresh", "Refresh"));
   refreshButton.title =
-    "Check scholarly-data providers online and update Citation Map data for the currently visible papers.";
-  toolbar.append(
-    searchWrap,
-    graphFilter.root,
-    similarButton,
-    exportWrap,
-    refreshButton,
-  );
+    "Refresh metadata and citation counts for the currently visible papers.";
+  toolbar.append(addNodeWrap, similarButton, exportWrap, refreshButton);
   header.appendChild(toolbar);
   root.appendChild(header);
+
+  const queryBand = element(document, "section", "cm-query-band");
+  const searchWrap = element(document, "label", "cm-search-wrap");
+  searchWrap.appendChild(icon(document, "search"));
+  const search = element(document, "input", "cm-search");
+  search.type = "search";
+  search.placeholder = "Search all fields";
+  search.setAttribute("aria-label", "Search all fields in the current view");
+  searchWrap.appendChild(search);
+  queryBand.append(searchWrap, graphFilter.root);
+  root.appendChild(queryBand);
+
+  const setViewKind = (kind: "map" | "focus", notify = true): void => {
+    const changed = currentViewKind !== kind;
+    currentViewKind = kind;
+    root.dataset.viewKind = kind;
+    viewTitle.textContent = kind === "focus" ? "Focus View" : "Citation Map";
+    if (changed && notify) options.onViewKindChange?.(kind);
+  };
+
+  const focusBar = element(document, "section", "cm-focus-bar");
+  focusBar.hidden = true;
+  const focusBackButton = element(document, "button", "cm-secondary-button");
+  focusBackButton.type = "button";
+  focusBackButton.textContent = "←";
+  focusBackButton.title = "Previous focus";
+  const focusForwardButton = element(document, "button", "cm-secondary-button");
+  focusForwardButton.type = "button";
+  focusForwardButton.textContent = "→";
+  focusForwardButton.title = "Next focus";
+  const focusLabel = text(document, "strong", "Focus");
+  focusLabel.className = "cm-focus-label";
+  const focusSeedsHost = element(document, "div", "cm-focus-seeds");
+  const focusDirection = element(document, "select", "cm-select");
+  for (const [value, label] of [
+    ["both", "References + cited by"],
+    ["references", "References"],
+    ["cited-by", "Cited by"],
+  ] as const) {
+    const option = element(document, "option");
+    option.value = value;
+    option.textContent = label;
+    focusDirection.appendChild(option);
+  }
+  const focusLocality = element(document, "select", "cm-select");
+  for (const [value, label] of [
+    ["all", "All known papers"],
+    ["local", "In Zotero only"],
+  ] as const) {
+    const option = element(document, "option");
+    option.value = value;
+    option.textContent = label;
+    focusLocality.appendChild(option);
+  }
+  const focusRanking = element(document, "select", "cm-select");
+  for (const [value, label] of [
+    ["relevance", "Relevance"],
+    ["most-cited", "Most cited"],
+    ["most-recent", "Most recent"],
+    ["local-first", "In Zotero first"],
+  ] as const) {
+    const option = element(document, "option");
+    option.value = value;
+    option.textContent = label;
+    focusRanking.appendChild(option);
+  }
+  const focusLimit = element(document, "select", "cm-select");
+  for (const value of [10, 25, 50, 100, 200]) {
+    const option = element(document, "option");
+    option.value = String(value);
+    option.textContent = `${value} per seed per side`;
+    if (value === 25) option.selected = true;
+    focusLimit.appendChild(option);
+  }
+  const focusRefreshButton = element(document, "button", "cm-secondary-button");
+  focusRefreshButton.type = "button";
+  focusRefreshButton.textContent = "Update connections";
+  focusRefreshButton.title =
+    "Fetch fresh references and citing papers again. New Focus seeds are updated automatically in the background.";
+  const focusExitButton = element(document, "button", "cm-secondary-button");
+  focusExitButton.type = "button";
+  focusExitButton.textContent = "Back to library map";
+  focusBar.append(
+    focusBackButton,
+    focusForwardButton,
+    focusLabel,
+    focusSeedsHost,
+    focusDirection,
+    focusLocality,
+    focusRanking,
+    focusLimit,
+    focusRefreshButton,
+    focusExitButton,
+  );
+  root.appendChild(focusBar);
 
   const main = element(document, "main", "cm-main");
   const graphArea = element(document, "section", "cm-graph-area");
@@ -1142,16 +676,89 @@ export function renderCitationMapView(
   }
   graphArea.appendChild(zoom);
   let currentLayout = initialLayout;
+  let libraryLayoutBeforeFocus: GraphLayoutOptions | null = null;
+  let libraryViewBeforeFocus: GraphViewTransform | null = null;
+  let libraryCollectionFilterBeforeFocus: number | null | undefined;
+  let cameraFrame = 0;
+  let focusFitGeneration = 0;
+  const focusPostRefreshFitSeeds = new Set<string>();
+  const cancelCameraFrame = (): void => {
+    if (!cameraFrame) return;
+    const view = document.defaultView;
+    if (view) view.cancelAnimationFrame(cameraFrame);
+    else clearTimeout(cameraFrame);
+    cameraFrame = 0;
+  };
+  const scheduleCameraAction = (action: () => void): void => {
+    cancelCameraFrame();
+    const view = document.defaultView;
+    const run = (): void => {
+      cameraFrame = 0;
+      if (!cleaned) action();
+    };
+    cameraFrame = view
+      ? view.requestAnimationFrame(run)
+      : (setTimeout(run, 0) as unknown as number);
+  };
+  const scheduleFocusFit = (): void => {
+    cancelCameraFrame();
+    const generation = ++focusFitGeneration;
+    const view = document.defaultView;
+    let previousWidth = -1;
+    let previousHeight = -1;
+    let previousNodeCount = -1;
+    let stableFrames = 0;
+    let attempts = 0;
+
+    const check = (): void => {
+      cameraFrame = 0;
+      if (cleaned || !focusProjection || generation !== focusFitGeneration) {
+        return;
+      }
+      renderer?.resizeViewport();
+      const rect = renderer?.getCanvas().getBoundingClientRect();
+      const nodeCount = focusProjection.nodes.length;
+      const ready = Boolean(rect && rect.width >= 240 && rect.height >= 180);
+      const stable =
+        ready &&
+        Math.abs(rect!.width - previousWidth) < 0.5 &&
+        Math.abs(rect!.height - previousHeight) < 0.5 &&
+        nodeCount === previousNodeCount;
+      stableFrames = stable ? stableFrames + 1 : 0;
+      previousWidth = rect?.width ?? previousWidth;
+      previousHeight = rect?.height ?? previousHeight;
+      previousNodeCount = nodeCount;
+      attempts += 1;
+
+      if (stableFrames >= 2 || attempts >= 24) {
+        renderer?.fitVisibleNodes();
+        return;
+      }
+      cameraFrame = view
+        ? view.requestAnimationFrame(check)
+        : (setTimeout(check, 16) as unknown as number);
+    };
+
+    cameraFrame = view
+      ? view.requestAnimationFrame(check)
+      : (setTimeout(check, 0) as unknown as number);
+  };
+  const fitCurrentGraph = (): void => {
+    if (focusProjection || mapScopeItemIDs) renderer?.fitVisibleNodes();
+    else renderer?.fitView();
+  };
   let sourceMetricsRefreshActive = false;
   const refreshSourceMetricsForLayout = (layout: GraphLayoutOptions): void => {
     if (!graphLayoutUsesSourceMetrics(layout) || sourceMetricsRefreshActive)
       return;
     sourceMetricsRefreshActive = true;
-    const candidates = model.nodes.filter((node) => visibleKeys.has(node.key));
+    const candidates = model.nodes.filter(
+      (node) => node.kind !== "external" && visibleKeys.has(node.key),
+    );
     void ensureSourceMetricsForNodes(candidates, () => {
       if (cleaned || !graphLayoutUsesSourceMetrics(currentLayout)) return;
       renderer?.setLayout(currentLayout);
-      renderer?.fitView();
+      fitCurrentGraph();
     })
       .then((updated) => {
         if (
@@ -1162,7 +769,7 @@ export function renderCitationMapView(
           return;
         }
         renderer?.setLayout(currentLayout);
-        renderer?.fitView();
+        fitCurrentGraph();
         if (selectedNode) renderOverview(selectedNode);
       })
       .finally(() => {
@@ -1176,10 +783,20 @@ export function renderCitationMapView(
     (layout) => {
       currentLayout = layout;
       renderer?.setLayout(layout);
-      renderer?.fitView();
+      fitCurrentGraph();
       refreshSourceMetricsForLayout(layout);
     },
     (visible) => renderer?.setLegendVisible(visible),
+    (layout) => {
+      if (focusProjection) setFocusGraphAppearance(layout);
+      else setGraphAppearance(layout);
+    },
+    () =>
+      focusProjection
+        ? resetFocusGraphAppearance(
+            libraryLayoutBeforeFocus ?? getGraphAppearance(),
+          )
+        : resetGraphAppearance(),
   );
   currentLayout = appearance.getLayout();
   graphArea.appendChild(appearance.root);
@@ -1202,8 +819,1033 @@ export function renderCitationMapView(
   root.appendChild(main);
   mount.appendChild(root);
 
+  let addLibraryItemsToView = (
+    _itemIDs: readonly number[],
+  ): CitationMapFocusResult => "not-found";
+  const selectedLibraryItemIDs = new Set<number>();
+  const libraryPaperByID = new Map(
+    snapshot.papers.map((paper) => [paper.itemID, paper]),
+  );
+  let librarySearchGeneration = 0;
+
+  const closeAddNodePopup = (): void => {
+    addNodePopup.hidden = true;
+    addNodeButton.setAttribute("aria-expanded", "false");
+  };
+
+  const renderSelectedLibraryPapers = (): void => {
+    clear(addNodeSelected);
+    const selectedPapers = [...selectedLibraryItemIDs]
+      .map((itemID) => libraryPaperByID.get(itemID))
+      .filter((paper): paper is ZoteroPaper => Boolean(paper));
+    if (!selectedPapers.length) {
+      addNodeSelected.appendChild(
+        text(document, "p", "No papers selected.", "cm-placeholder"),
+      );
+    } else {
+      for (const paper of selectedPapers) {
+        const chip = element(document, "span", "cm-add-node-chip");
+        const label = text(document, "span", paper.title || "Untitled item");
+        label.title = paper.title || "Untitled item";
+        const remove = element(document, "button");
+        remove.type = "button";
+        remove.textContent = "×";
+        remove.title = `Deselect ${paper.title || "paper"}`;
+        remove.addEventListener("click", () => {
+          selectedLibraryItemIDs.delete(paper.itemID);
+          renderSelectedLibraryPapers();
+          void renderLibrarySearchResults();
+        });
+        chip.append(label, remove);
+        addNodeSelected.appendChild(chip);
+      }
+    }
+    addNodeStatus.textContent = selectedPapers.length
+      ? `${selectedPapers.length} paper${selectedPapers.length === 1 ? "" : "s"} selected.`
+      : "No papers selected.";
+    addSelectedButton.disabled = selectedPapers.length === 0;
+  };
+
+  const searchLibraryPapers = async (
+    query: string,
+  ): Promise<LibraryPaperSearchEntry[]> => {
+    const search = new Zotero.Search();
+    search.libraryID = snapshot.libraryID;
+    search.addCondition("quicksearch-titleCreatorYear", "contains", query);
+    const resultIDs = (await search.search()) as number[];
+    return mapCooperatively(
+      resultIDs,
+      (itemID) => {
+        const paper = libraryPaperByID.get(Number(itemID));
+        if (!paper) return null;
+        let shortTitle = "";
+        let court = "";
+        let citationKey = "";
+        try {
+          const item = Zotero.Items.get(paper.itemID) as Zotero.Item | null;
+          shortTitle = String(item?.getField?.("shortTitle") ?? "");
+          court = String(item?.getField?.("court") ?? "");
+          citationKey = String(item?.getField?.("citationKey") ?? "");
+        } catch (error) {
+          Zotero.debug(
+            `Citation Map: could not rank item ${paper.itemID}: ${String(error)}`,
+          );
+        }
+        return {
+          paper,
+          titleText: normalizeSearch(paper.title),
+          authorText: normalizeSearch(paper.authors.join(" ")),
+          mainPropertyText: normalizeSearch(
+            [
+              paper.sourceTitle ?? "",
+              paper.year ?? "",
+              paper.publicationDate ?? "",
+              shortTitle,
+              court,
+              citationKey,
+            ].join(" "),
+          ),
+        };
+      },
+      { forceEvery: 20 },
+    ).then((entries) =>
+      entries.filter((entry): entry is LibraryPaperSearchEntry =>
+        Boolean(entry),
+      ),
+    );
+  };
+
+  async function renderLibrarySearchResults(): Promise<void> {
+    const generation = ++librarySearchGeneration;
+    const query = addNodeSearch.value.trim();
+    clear(addNodeResults);
+    if (!query) {
+      addNodeResults.appendChild(
+        text(
+          document,
+          "p",
+          "Search by title, creator, publication title, year, or citation key.",
+          "cm-placeholder",
+        ),
+      );
+      return;
+    }
+    addNodeResults.appendChild(
+      text(document, "p", "Searching library…", "cm-placeholder"),
+    );
+    const index = await searchLibraryPapers(query).catch((error) => {
+      Zotero.logError(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      return null;
+    });
+    if (generation !== librarySearchGeneration || addNodePopup.hidden) return;
+    if (!index) {
+      clear(addNodeResults);
+      addNodeResults.appendChild(
+        text(document, "p", "Library search failed.", "cm-placeholder"),
+      );
+      return;
+    }
+    const matches: Array<{
+      entry: LibraryPaperSearchEntry;
+      score: number;
+    }> = [];
+    const compareMatches = (
+      left: { entry: LibraryPaperSearchEntry; score: number },
+      right: { entry: LibraryPaperSearchEntry; score: number },
+    ): number =>
+      right.score - left.score ||
+      left.entry.paper.title.localeCompare(right.entry.paper.title, undefined, {
+        sensitivity: "base",
+      });
+    await mapCooperatively(
+      index,
+      (entry) => {
+        if (generation !== librarySearchGeneration) return;
+        const score = scoreLibraryPaperSearch(entry, query);
+        const candidate = { entry, score };
+        const insertion = matches.findIndex(
+          (current) => compareMatches(candidate, current) < 0,
+        );
+        if (insertion < 0) matches.push(candidate);
+        else matches.splice(insertion, 0, candidate);
+        if (matches.length > 50) matches.pop();
+      },
+      { forceEvery: 100 },
+    );
+    if (generation !== librarySearchGeneration || addNodePopup.hidden) return;
+    clear(addNodeResults);
+    if (!matches.length) {
+      addNodeResults.appendChild(
+        text(document, "p", "No matching papers found.", "cm-placeholder"),
+      );
+      return;
+    }
+    for (const { entry } of matches) {
+      const paper = entry.paper;
+      const row = element(document, "label", "cm-add-node-result");
+      const checkbox = element(document, "input");
+      checkbox.type = "checkbox";
+      checkbox.checked = selectedLibraryItemIDs.has(paper.itemID);
+      const content = element(document, "span", "cm-add-node-result-copy");
+      content.append(
+        text(document, "strong", paper.title || "Untitled item"),
+        text(
+          document,
+          "span",
+          [
+            paper.authors.slice(0, 3).join(", "),
+            paper.year === null ? "" : String(paper.year),
+            paper.sourceTitle ?? "",
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          "cm-add-node-result-meta",
+        ),
+      );
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) selectedLibraryItemIDs.add(paper.itemID);
+        else selectedLibraryItemIDs.delete(paper.itemID);
+        renderSelectedLibraryPapers();
+      });
+      row.append(checkbox, content);
+      addNodeResults.appendChild(row);
+    }
+  }
+
+  addNodeButton.addEventListener("click", () => {
+    const opening = addNodePopup.hidden;
+    addNodePopup.hidden = !opening;
+    addNodeButton.setAttribute("aria-expanded", String(opening));
+    if (!opening) return;
+    renderSelectedLibraryPapers();
+    void renderLibrarySearchResults();
+    document.defaultView?.setTimeout(() => addNodeSearch.focus(), 0);
+  });
+  addNodeSearch.addEventListener("input", () => {
+    void renderLibrarySearchResults();
+  });
+  addSelectedButton.addEventListener("click", () => {
+    const itemIDs = [...selectedLibraryItemIDs];
+    if (!itemIDs.length) return;
+    addLibraryItemsToView(itemIDs);
+    selectedLibraryItemIDs.clear();
+    renderSelectedLibraryPapers();
+    closeAddNodePopup();
+  });
+  const closeAddNodePopupOnOutsidePointer = (event: Event): void => {
+    if (addNodePopup.hidden) return;
+    const target = event.target as Node | null;
+    if (target && addNodeWrap.contains(target)) return;
+    closeAddNodePopup();
+  };
+  const closeAddNodePopupOnEscape = (event: KeyboardEvent): void => {
+    if (event.key === "Escape" && !addNodePopup.hidden) {
+      closeAddNodePopup();
+      addNodeButton.focus();
+    }
+  };
+  document.addEventListener(
+    "pointerdown",
+    closeAddNodePopupOnOutsidePointer,
+    true,
+  );
+  document.addEventListener("keydown", closeAddNodePopupOnEscape, true);
+  renderSelectedLibraryPapers();
+
   const updateSummary = (): void => {
-    summary.textContent = `${formatCount(visibleKeys.size)} papers - ${formatCount(renderer?.getVisibleEdgeCount() ?? 0)} citation links`;
+    const renderedKeys = new Set(visibleKeys);
+    const base = `${formatCount(renderedKeys.size)} nodes - ${formatCount(
+      renderer?.getVisibleEdgeCount() ?? 0,
+    )} links`;
+    if (!focusProjection) {
+      summary.textContent = base;
+      return;
+    }
+    const hidden =
+      focusProjection.hidden.references + focusProjection.hidden.citedBy;
+    summary.textContent = hidden ? `${base} - ${hidden} more available` : base;
+  };
+
+  const cloneFocusState = (state: GraphFocusState): GraphFocusState => ({
+    ...state,
+    seedKeys: [...state.seedKeys],
+  });
+
+  const focusStateFromControls = (seedKeys: string[]): GraphFocusState => ({
+    seedKeys: [...new Set(seedKeys)],
+    direction: focusDirection.value as GraphFocusDirection,
+    locality: focusLocality.value as GraphFocusLocality,
+    ranking: focusRanking.value as GraphFocusRanking,
+    maxPerDirection: Math.max(1, Number(focusLimit.value) || 25),
+  });
+
+  const resolveFocusSeed = (
+    candidate: CitationGraphNode,
+  ): CitationGraphNode => {
+    const local =
+      candidate.itemID > 0
+        ? libraryModel.nodes.find(
+            (node) =>
+              node.key === candidate.key || node.itemID === candidate.itemID,
+          )
+        : null;
+    const seed = local ?? candidate;
+    focusSeedRegistry.set(seed.key, seed);
+    return seed;
+  };
+
+  const seedRelationshipGraph = (
+    seed: CitationGraphNode,
+  ): typeof libraryModel => {
+    if (libraryModel.nodes.some((node) => node.key === seed.key)) {
+      return libraryModel;
+    }
+    return {
+      nodes: [...libraryModel.nodes, seed],
+      edges: [...libraryModel.edges],
+      statistics: { ...libraryModel.statistics },
+    };
+  };
+
+  const ensureFocusRelationships = (
+    seed: CitationGraphNode,
+  ): { references: ExternalWork[]; citedBy: ExternalWork[] } => {
+    const existing = focusRelationships.get(seed.key);
+    if (existing) return existing;
+    const graph = seedRelationshipGraph(seed);
+    const cachedReferences = getRelationshipViewSnapshot(
+      graph,
+      seed,
+      "references",
+      snapshot.libraryID,
+      FOCUS_RELATIONSHIP_CACHE_LIMIT,
+      { queueBackgroundHydration: false },
+    ).works;
+    const embeddedReferences = (
+      seed.externalWork?.references?.length
+        ? seed.externalWork.references
+        : seed.references
+    ) as ExternalWork[];
+    const relationships = {
+      // Some providers include references in the paper summary itself. Use
+      // those immediately instead of waiting for a second endpoint request.
+      references: mergeRelatedWorkLists(
+        cachedReferences,
+        embeddedReferences,
+      ) as ExternalWork[],
+      citedBy: getRelationshipViewSnapshot(
+        graph,
+        seed,
+        "cited-by",
+        snapshot.libraryID,
+        FOCUS_RELATIONSHIP_CACHE_LIMIT,
+        { queueBackgroundHydration: false },
+      ).works,
+    };
+    focusRelationships.set(seed.key, relationships);
+    return relationships;
+  };
+
+  const externalWorkForFocusSeed = (seed: CitationGraphNode): ExternalWork => {
+    const external = seed.externalWork;
+    return {
+      ...(external ?? {
+        provider: seed.provider ?? "manual",
+        providerWorkID: seed.providerWorkID,
+        doi: seed.doi,
+        title: seed.title || null,
+        year: seed.year,
+        authors: [...seed.authors],
+      }),
+      provider: external?.provider ?? seed.provider ?? "manual",
+      providerWorkID: seed.providerWorkID ?? external?.providerWorkID ?? null,
+      doi: seed.doi ?? external?.doi ?? null,
+      title: seed.title || external?.title || null,
+      year: seed.year ?? external?.year ?? null,
+      publicationDate:
+        seed.publicationDate ?? external?.publicationDate ?? null,
+      authors: seed.authors.length
+        ? [...seed.authors]
+        : [...(external?.authors ?? [])],
+      sourceTitle: seed.sourceTitle ?? external?.sourceTitle ?? null,
+      citationCount: seed.citationCount ?? external?.citationCount ?? null,
+      referenceCount: seed.referenceCount ?? external?.referenceCount ?? null,
+      references: external?.references?.length
+        ? [...external.references]
+        : [...seed.references],
+    };
+  };
+
+  const prepareExternalFocusSeedForRefresh = async (
+    seed: CitationGraphNode,
+  ): Promise<boolean> => {
+    if (seed.itemID > 0) return true;
+
+    let work = externalWorkForFocusSeed(seed);
+    let refreshable = synchronizeExternalFocusNode(seed, work);
+    if (!refreshable) {
+      // External relationship cards can initially contain only a title/year.
+      // Resolve one paper summary cooperatively before attempting both
+      // relationship directions, then promote the provisional cache subject
+      // when a DOI or provider work ID becomes available.
+      const hydrated = await hydrateExternalWorksMetadata(
+        [work],
+        false,
+        1,
+        true,
+        true,
+      );
+      work = hydrated[0] ?? work;
+      refreshable = synchronizeExternalFocusNode(seed, work);
+    }
+
+    focusSeedRegistry.set(seed.key, seed);
+    if (refreshable) {
+      const relationships = focusRelationships.get(seed.key);
+      const embedded = seed.externalWork?.references ?? [];
+      if (relationships && embedded.length) {
+        relationships.references = mergeRelatedWorkLists(
+          relationships.references,
+          embedded,
+        ) as ExternalWork[];
+      }
+      scheduleFocusRebuild();
+    }
+    return refreshable;
+  };
+
+  let removeFocusSeed = (_key: string): void => undefined;
+
+  const updateFocusBar = (): void => {
+    focusBar.hidden = !focusProjection;
+    clear(focusSeedsHost);
+    if (!focusProjection) return;
+    const primarySeed = focusProjection.seeds[0];
+    focusLabel.textContent =
+      focusProjection.seeds.length === 1
+        ? `Focus: ${primarySeed.title}`
+        : `Focus: ${focusProjection.seeds.length} seeds`;
+    for (const seed of focusProjection.seeds) {
+      const chip = element(document, "span", "cm-focus-seed-chip");
+      chip.title = seed.title;
+      chip.appendChild(
+        text(
+          document,
+          "span",
+          seed.title.length > 42 ? `${seed.title.slice(0, 39)}…` : seed.title,
+        ),
+      );
+      if (focusProjection.seeds.length > 1) {
+        const remove = element(document, "button");
+        remove.type = "button";
+        remove.textContent = "×";
+        remove.title = `Remove ${seed.title} from Focus View`;
+        remove.addEventListener("click", () => removeFocusSeed(seed.key));
+        chip.appendChild(remove);
+      }
+      focusSeedsHost.appendChild(chip);
+    }
+    focusDirection.value = focusProjection.state.direction;
+    focusLocality.value = focusProjection.state.locality;
+    focusRanking.value = focusProjection.state.ranking;
+    focusLimit.value = String(focusProjection.state.maxPerDirection);
+    focusBackButton.disabled = focusBack.length === 0;
+    focusForwardButton.disabled = focusForward.length === 0;
+  };
+
+  const applyFocusProjection = (
+    projection: GraphFocusProjection,
+    projectionOptions: { fit?: boolean } = {},
+  ): void => {
+    setViewKind("focus");
+    focusProjection = projection;
+    model.nodes.splice(0, model.nodes.length, ...projection.nodes);
+    model.edges.splice(0, model.edges.length, ...projection.edges);
+    model.statistics.nodes = projection.nodes.length;
+    model.statistics.edges = projection.edges.length;
+    model.statistics.resolvedNodes = projection.nodes.filter(
+      (node) => node.citationCount !== null || node.referenceCount !== null,
+    ).length;
+    model.statistics.isolatedNodes = projection.nodes.filter(
+      (node) =>
+        !projection.edges.some(
+          (edge) => edge.source === node.key || edge.target === node.key,
+        ),
+    ).length;
+    rebuildGraphFilterDescriptors();
+    renderer?.syncModel({ draw: false });
+    renderer?.setSeedKeys(projection.seedKeys, false);
+    renderer?.setPinnedKeys(new Set(), false);
+    applyFilters();
+    if (projectionOptions.fit) scheduleFocusFit();
+    updateFocusBar();
+  };
+
+  const seedsForState = (state: GraphFocusState): CitationGraphNode[] =>
+    state.seedKeys
+      .map(
+        (key) =>
+          focusSeedRegistry.get(key) ??
+          libraryModel.nodes.find((node) => node.key === key) ??
+          model.nodes.find((node) => node.key === key) ??
+          null,
+      )
+      .filter((node): node is CitationGraphNode => Boolean(node))
+      .map(resolveFocusSeed);
+
+  const projectionForState = (
+    state: GraphFocusState,
+  ): GraphFocusProjection | null => {
+    const seeds = seedsForState(state);
+    for (const seed of seeds) ensureFocusRelationships(seed);
+    return buildGraphFocusProjection({
+      graph: libraryModel,
+      state: { ...state, seedKeys: seeds.map((seed) => seed.key) },
+      seeds,
+      relationships: focusRelationships,
+    });
+  };
+
+  const rebuildCurrentFocus = (options: { fit?: boolean } = {}): boolean => {
+    if (!focusProjection) return false;
+    if (!viewActive) {
+      inactiveRelationshipDirty = true;
+      return true;
+    }
+    const projection = projectionForState(
+      focusStateFromControls(focusProjection.state.seedKeys),
+    );
+    if (!projection) return false;
+    applyFocusProjection(projection, options);
+    return true;
+  };
+
+  const scheduleFocusRebuild = (): void => {
+    if (!focusProjection || focusRebuildFrame) return;
+    if (!viewActive) {
+      inactiveRelationshipDirty = true;
+      return;
+    }
+    const view = document.defaultView;
+    const run = (): void => {
+      focusRebuildFrame = 0;
+      if (!cleaned) rebuildCurrentFocus();
+    };
+    focusRebuildFrame = view
+      ? view.requestAnimationFrame(run)
+      : (setTimeout(run, 0) as unknown as number);
+  };
+
+  const activateFocusState = (
+    state: GraphFocusState,
+    options: { fit?: boolean; selectKey?: string } = {},
+  ): boolean => {
+    const projection = projectionForState(state);
+    if (!projection) return false;
+    focusDirection.value = projection.state.direction;
+    focusLocality.value = projection.state.locality;
+    focusRanking.value = projection.state.ranking;
+    focusLimit.value = String(projection.state.maxPerDirection);
+    applyFocusProjection(projection, { fit: options.fit });
+    const selectedKey = options.selectKey ?? projection.seeds[0].key;
+    if (visibleKeys.has(selectedKey)) {
+      renderer?.selectNode(selectedKey, false);
+    }
+    return true;
+  };
+
+  const updateFocusRefreshState = (): void => {
+    focusLoadActive = focusRefreshCount > 0;
+    focusRefreshButton.disabled = focusLoadActive;
+    focusRefreshButton.textContent = focusLoadActive
+      ? `Updating ${focusRefreshCount} seed${focusRefreshCount === 1 ? "" : "s"}…`
+      : "Update connections";
+  };
+
+  const scheduleFocusTask = (callback: () => void, delay = 0): number =>
+    document.defaultView
+      ? document.defaultView.setTimeout(callback, delay)
+      : (setTimeout(callback, delay) as unknown as number);
+
+  const clearFocusTask = (timer: number): void => {
+    if (document.defaultView) document.defaultView.clearTimeout(timer);
+    else clearTimeout(timer);
+  };
+
+  const resetFocusRefreshTracking = (shutdown = false): void => {
+    focusRefreshEpoch += 1;
+    for (const timer of focusRefreshTimers.values()) {
+      clearFocusTask(timer);
+    }
+    focusRefreshTimers.clear();
+    focusRefreshInFlight.clear();
+    focusPostRefreshFitSeeds.clear();
+    // Keep one serial queue across focus changes. Replacing the queue while a
+    // request is active would allow the old and new seed updates to overlap.
+    if (shutdown) focusRefreshQueue.close();
+    focusRefreshCount = 0;
+    updateFocusRefreshState();
+  };
+
+  const refreshFocusSeedConnections = (
+    seed: CitationGraphNode,
+    forceRefresh: boolean,
+    epoch: number,
+    mode: "automatic" | "manual",
+  ): Promise<void> => {
+    const existing = focusRefreshInFlight.get(seed.key);
+    if (existing) return existing;
+
+    const directions = (["references", "cited-by"] as const).filter(
+      (direction) =>
+        forceRefresh || !selectedRelationshipCacheIsFresh(seed, direction),
+    );
+    if (!directions.length) return Promise.resolve();
+
+    focusRefreshCount += 1;
+    updateFocusRefreshState();
+    const task = focusRefreshQueue
+      .enqueue(async () => {
+        if (cleaned || epoch !== focusRefreshEpoch) return;
+        if (seed.itemID <= 0) {
+          await prepareExternalFocusSeedForRefresh(seed);
+          if (cleaned || epoch !== focusRefreshEpoch) return;
+        }
+        for (const direction of directions) {
+          if (cleaned || epoch !== focusRefreshEpoch) return;
+          try {
+            const metadataLimit = Math.max(
+              1,
+              focusProjection?.state.maxPerDirection ?? 25,
+            );
+            await refreshExternalRelationships(
+              seed,
+              libraryModel.nodes,
+              direction,
+              {
+                maximum:
+                  mode === "automatic"
+                    ? AUTOMATIC_FOCUS_REFRESH.membershipLimit
+                    : FOCUS_RELATIONSHIP_CACHE_LIMIT,
+                refreshMembership: true,
+                // Provider I/O is asynchronous, but the singleton progress popup
+                // remains visible while cooperative background processing runs.
+                silent: false,
+                queueBackgroundHydration: true,
+                showBackgroundProgress:
+                  mode === "automatic"
+                    ? AUTOMATIC_FOCUS_REFRESH.showBackgroundProgress
+                    : true,
+                mode,
+                ...(seed.itemID <= 0
+                  ? {
+                      providerLimit: 3,
+                      providerWorkIDs:
+                        seed.provider && seed.providerWorkID
+                          ? { [seed.provider]: seed.providerWorkID }
+                          : {},
+                    }
+                  : {}),
+                // Automatic seed refresh publishes membership immediately and
+                // defers all optional summary hydration. Manual refreshes may
+                // still hydrate the currently visible papers before completing.
+                metadataHydrationLimit:
+                  mode === "automatic"
+                    ? AUTOMATIC_FOCUS_REFRESH.foregroundMetadataLimit
+                    : metadataLimit,
+                ...(mode === "automatic" ? { summaryLookupLimit: 0 } : {}),
+                onMembershipResolved: (resolution) => {
+                  if (cleaned || epoch !== focusRefreshEpoch) return;
+                  if (resolution.reportedCount !== null) {
+                    if (direction === "references") {
+                      seed.referenceCount = resolution.reportedCount;
+                    } else {
+                      seed.citationCount = resolution.reportedCount;
+                    }
+                  }
+                  const relationships = ensureFocusRelationships(seed);
+                  const published = getRelationshipViewSnapshot(
+                    seedRelationshipGraph(seed),
+                    seed,
+                    direction,
+                    snapshot.libraryID,
+                    FOCUS_RELATIONSHIP_CACHE_LIMIT,
+                    { queueBackgroundHydration: false },
+                  ).works;
+                  if (direction === "references") {
+                    relationships.references = published;
+                  } else {
+                    relationships.citedBy = published;
+                  }
+                  scheduleFocusRebuild();
+                },
+                onMetadataHydrated: () => {
+                  if (
+                    cleaned ||
+                    epoch !== focusRefreshEpoch ||
+                    !focusProjection?.seedKeys.has(seed.key)
+                  ) {
+                    return;
+                  }
+                  scheduleFocusRebuild();
+                },
+              },
+            );
+            if (cleaned || epoch !== focusRefreshEpoch) return;
+            const relationships = ensureFocusRelationships(seed);
+            const refreshed = getRelationshipViewSnapshot(
+              seedRelationshipGraph(seed),
+              seed,
+              direction,
+              snapshot.libraryID,
+              FOCUS_RELATIONSHIP_CACHE_LIMIT,
+              { queueBackgroundHydration: false },
+            ).works;
+            if (direction === "references") {
+              relationships.references = refreshed;
+            } else {
+              relationships.citedBy = refreshed;
+            }
+          } catch (error) {
+            Zotero.logError(
+              error instanceof Error ? error : new Error(String(error)),
+            );
+          }
+
+          // Yield between directions so provider result normalization cannot
+          // monopolize Zotero's UI thread.
+          await new Promise<void>((resolve) => {
+            scheduleFocusTask(resolve, 0);
+          });
+        }
+      })
+      .finally(() => {
+        if (epoch !== focusRefreshEpoch) return;
+        focusRefreshInFlight.delete(seed.key);
+        focusRefreshCount = Math.max(0, focusRefreshCount - 1);
+        updateFocusRefreshState();
+      });
+    focusRefreshInFlight.set(seed.key, task);
+    return task;
+  };
+
+  const loadFocusConnections = (
+    seeds: CitationGraphNode[],
+    options: {
+      forceRefresh?: boolean;
+      mode?: "automatic" | "manual";
+    } = {},
+  ): Promise<void> => {
+    const forceRefresh = options.forceRefresh === true;
+    const mode = options.mode ?? "automatic";
+    const uniqueSeeds = [
+      ...new Map(seeds.map((seed) => [seed.key, seed])).values(),
+    ];
+    if (!uniqueSeeds.length) return Promise.resolve();
+    const epoch = focusRefreshEpoch;
+    return Promise.all(
+      uniqueSeeds.map((seed) =>
+        refreshFocusSeedConnections(seed, forceRefresh, epoch, mode),
+      ),
+    ).then(() => {
+      if (cleaned || epoch !== focusRefreshEpoch || !focusProjection) return;
+      if (uniqueSeeds.some((seed) => focusProjection?.seedKeys.has(seed.key))) {
+        rebuildCurrentFocus();
+      }
+    });
+  };
+
+  const queueAutomaticFocusConnectionUpdate = (
+    seed: CitationGraphNode,
+    forceRefresh = AUTOMATIC_FOCUS_REFRESH.forceRefresh,
+    fitAfterRefresh = false,
+  ): void => {
+    if (fitAfterRefresh) focusPostRefreshFitSeeds.add(seed.key);
+    const previous = focusRefreshTimers.get(seed.key);
+    if (previous !== undefined) {
+      clearFocusTask(previous);
+    }
+    const epoch = focusRefreshEpoch;
+    const timer = scheduleFocusTask(() => {
+      focusRefreshTimers.delete(seed.key);
+      if (
+        cleaned ||
+        epoch !== focusRefreshEpoch ||
+        !focusProjection?.seedKeys.has(seed.key)
+      ) {
+        focusPostRefreshFitSeeds.delete(seed.key);
+        return;
+      }
+      void loadFocusConnections([seed], {
+        mode: "automatic",
+        forceRefresh,
+      }).finally(() => {
+        if (cleaned || epoch !== focusRefreshEpoch) return;
+        focusPostRefreshFitSeeds.delete(seed.key);
+        if (!focusPostRefreshFitSeeds.size && focusProjection) {
+          // The initial seed-only fit is useful for immediate feedback, but
+          // once all newly introduced seeds have published their relationship
+          // membership the complete node cloud must be fitted exactly once.
+          rebuildCurrentFocus({ fit: true });
+        }
+      });
+    }, AUTOMATIC_FOCUS_REFRESH.startDelayMs);
+    focusRefreshTimers.set(seed.key, timer);
+  };
+
+  const enterFocusSeeds = (
+    seedCandidates: readonly CitationGraphNode[],
+    options: {
+      pushHistory?: boolean;
+      state?: GraphFocusState;
+    } = {},
+  ): boolean => {
+    const seeds = [
+      ...new Map(
+        seedCandidates.map((candidate) => {
+          const seed = resolveFocusSeed(candidate);
+          return [seed.key, seed] as const;
+        }),
+      ).values(),
+    ];
+    if (!seeds.length) return false;
+    const enteringFromLibrary = !focusProjection;
+    if (!enteringFromLibrary) resetFocusRefreshTracking();
+    if (enteringFromLibrary) {
+      libraryLayoutBeforeFocus = { ...currentLayout };
+      libraryViewBeforeFocus = renderer?.getViewTransform() ?? null;
+      libraryCollectionFilterBeforeFocus = graphFilter.state().collectionID;
+      // A collection is a library-map scope, not a property of an external
+      // neighbour. Keeping it active in Focus View hides every cited/citing
+      // paper that is not already filed in that Zotero collection.
+      if (libraryCollectionFilterBeforeFocus !== null) {
+        graphFilter.setCollectionID(null);
+      }
+    }
+    if (focusProjection && options.pushHistory !== false) {
+      focusBack.push(cloneFocusState(focusProjection.state));
+      focusForward.splice(0);
+    }
+    const state = options.state ?? {
+      seedKeys: seeds.map((seed) => seed.key),
+      direction: "both",
+      locality: "all",
+      ranking: "relevance",
+      maxPerDirection: 25,
+    };
+    const normalizedState = {
+      ...state,
+      seedKeys: state.seedKeys.length
+        ? [...state.seedKeys]
+        : seeds.map((seed) => seed.key),
+    };
+    if (
+      !activateFocusState(normalizedState, {
+        fit: false,
+        selectKey: seeds[0].key,
+      })
+    ) {
+      if (enteringFromLibrary) {
+        libraryLayoutBeforeFocus = null;
+        libraryViewBeforeFocus = null;
+        if (libraryCollectionFilterBeforeFocus !== undefined) {
+          graphFilter.setCollectionID(libraryCollectionFilterBeforeFocus);
+          libraryCollectionFilterBeforeFocus = undefined;
+        }
+      }
+      return false;
+    }
+    if (enteringFromLibrary) {
+      appearance.setLayout(
+        getFocusGraphAppearance(libraryLayoutBeforeFocus ?? currentLayout),
+        false,
+      );
+    }
+    scheduleFocusFit();
+    for (const seed of seeds) {
+      queueAutomaticFocusConnectionUpdate(seed, true, true);
+    }
+    return true;
+  };
+
+  const enterFocus = (
+    seedCandidate: CitationGraphNode,
+    options: {
+      pushHistory?: boolean;
+      state?: GraphFocusState;
+    } = {},
+  ): boolean => enterFocusSeeds([seedCandidate], options);
+
+  const addFocusSeeds = (candidates: readonly CitationGraphNode[]): boolean => {
+    const seeds = [
+      ...new Map(
+        candidates.map((candidate) => {
+          const seed = resolveFocusSeed(candidate);
+          return [seed.key, seed] as const;
+        }),
+      ).values(),
+    ];
+    if (!seeds.length) return false;
+    if (!focusProjection) return enterFocusSeeds(seeds);
+
+    const missingSeeds = seeds.filter(
+      (seed) => !focusProjection?.seedKeys.has(seed.key),
+    );
+    if (!missingSeeds.length) return true;
+
+    focusBack.push(cloneFocusState(focusProjection.state));
+    focusForward.splice(0);
+    for (const seed of missingSeeds) ensureFocusRelationships(seed);
+    const state = focusStateFromControls(
+      appendUniqueCitationMapKeys(
+        focusProjection.state.seedKeys,
+        missingSeeds.map((seed) => seed.key),
+      ),
+    );
+    if (
+      !activateFocusState(state, {
+        fit: true,
+        selectKey: missingSeeds[0].key,
+      })
+    ) {
+      return false;
+    }
+    for (const seed of missingSeeds) {
+      queueAutomaticFocusConnectionUpdate(seed, true, true);
+    }
+    return true;
+  };
+
+  const addFocusSeed = (candidate: CitationGraphNode): boolean =>
+    addFocusSeeds([candidate]);
+
+  removeFocusSeed = (key: string): void => {
+    if (!focusProjection || !focusProjection.seedKeys.has(key)) return;
+    const remaining = focusProjection.state.seedKeys.filter(
+      (seedKey) => seedKey !== key,
+    );
+    if (!remaining.length) {
+      exitFocus();
+      return;
+    }
+    focusBack.push(cloneFocusState(focusProjection.state));
+    focusForward.splice(0);
+    activateFocusState(focusStateFromControls(remaining), { fit: true });
+  };
+
+  const focusOnPaper = (node: CitationGraphNode): boolean => {
+    const seed = resolveFocusSeed(node);
+    const state = focusProjection
+      ? focusStateFromControls([seed.key])
+      : undefined;
+    return enterFocus(seed, { state });
+  };
+
+  const restoreFocusState = (state: GraphFocusState): boolean =>
+    activateFocusState(cloneFocusState(state), { fit: true });
+
+  const replaceLibraryGraph = (
+    next: ReturnType<typeof buildCitationGraph>,
+  ): void => {
+    libraryModel.nodes.splice(0, libraryModel.nodes.length, ...next.nodes);
+    libraryModel.edges.splice(0, libraryModel.edges.length, ...next.edges);
+    Object.assign(libraryModel.statistics, next.statistics);
+    if (focusProjection) {
+      rebuildCurrentFocus();
+      return;
+    }
+    model.nodes.splice(0, model.nodes.length, ...libraryModel.nodes);
+    model.edges.splice(0, model.edges.length, ...libraryModel.edges);
+    Object.assign(model.statistics, libraryModel.statistics);
+    rebuildGraphFilterDescriptors();
+    renderer?.syncModel();
+    applyFilters();
+  };
+
+  const exitFocus = (): void => {
+    resetFocusRefreshTracking();
+    focusProjection = null;
+    setViewKind("map");
+    focusRelationships.clear();
+    focusSeedRegistry.clear();
+    focusBack.splice(0);
+    focusForward.splice(0);
+    model.nodes.splice(0, model.nodes.length, ...libraryModel.nodes);
+    model.edges.splice(0, model.edges.length, ...libraryModel.edges);
+    Object.assign(model.statistics, libraryModel.statistics);
+    rebuildGraphFilterDescriptors();
+    renderer?.syncModel({ draw: false });
+    renderer?.setSeedKeys(new Set(), false);
+    syncMapPinnedKeys(false);
+    const restoreLayout = libraryLayoutBeforeFocus;
+    const restoreView = libraryViewBeforeFocus;
+    const restoreCollectionFilter = libraryCollectionFilterBeforeFocus;
+    libraryLayoutBeforeFocus = null;
+    libraryViewBeforeFocus = null;
+    libraryCollectionFilterBeforeFocus = undefined;
+    if (restoreLayout) appearance.setLayout(restoreLayout, false);
+    if (restoreCollectionFilter !== undefined) {
+      graphFilter.setCollectionID(restoreCollectionFilter);
+    }
+    updateFocusBar();
+    applyFilters();
+    if (restoreView) {
+      scheduleCameraAction(() => {
+        if (!focusProjection) renderer?.setViewTransform(restoreView);
+      });
+    } else if (!restoreLayout) {
+      scheduleCameraAction(() => {
+        if (!focusProjection) renderer?.fitView();
+      });
+    }
+    renderOverview(null);
+  };
+
+  const relationshipPublicationStateForNode = (
+    node: CitationGraphNode,
+    direction: "references" | "cited-by",
+  ) =>
+    getRelationshipPublicationState(
+      snapshot.libraryID,
+      node.itemKey,
+      direction,
+    ) ??
+    getRelationshipPublicationState(
+      Zotero.Libraries.userLibraryID,
+      node.itemKey,
+      direction,
+    );
+
+  const relationshipTabLabel = (
+    node: CitationGraphNode,
+    direction: "references" | "cited-by",
+  ): string => {
+    const label = direction === "references" ? "References" : "Cited by";
+    const state = relationshipPublicationStateForNode(node, direction);
+    if (state?.active && !state.membershipPublished) {
+      return `${label} (updating…)`;
+    }
+    const reportedCounts = getRelationshipReportedCounts(
+      snapshot.libraryID,
+      node,
+    );
+    const count = state?.membershipPublished
+      ? state.reportedCount
+      : direction === "references"
+        ? reportedCounts.referenceCount
+        : reportedCounts.citationCount;
+    return `${label} (${formatCount(count)} reported)`;
+  };
+
+  const updateRelationshipTabLabels = (node: CitationGraphNode): void => {
+    for (const direction of ["cited-by", "references"] as const) {
+      const button = detail.querySelector<HTMLButtonElement>(
+        `button[data-mode="${direction}"]`,
+      );
+      if (button) button.textContent = relationshipTabLabel(node, direction);
+    }
   };
 
   function appendPaperHeader(
@@ -1235,21 +1877,11 @@ export function renderCitationMapView(
       );
     if (badges.childElementCount) detail.appendChild(badges);
 
-    const reportedCounts = getRelationshipReportedCounts(
-      snapshot.libraryID,
-      node,
-    );
     const tabs = element(document, "div", "cm-detail-tabs");
     for (const [mode, label] of [
       ["overview", "Overview"],
-      [
-        "cited-by",
-        `Cited by (${formatCount(reportedCounts.citationCount)} reported)`,
-      ],
-      [
-        "references",
-        `References (${formatCount(reportedCounts.referenceCount)} reported)`,
-      ],
+      ["cited-by", relationshipTabLabel(node, "cited-by")],
+      ["references", relationshipTabLabel(node, "references")],
     ] as const) {
       const button = element(document, "button");
       button.type = "button";
@@ -1268,37 +1900,236 @@ export function renderCitationMapView(
   function applyRelationshipMutationToGraph(
     event: RelationshipMutationEvent,
   ): void {
-    const relatedKey =
+    const localRelatedKey =
       event.work.inLibraryItemKey ?? event.work.zoteroItemKey ?? null;
-    if (!relatedKey) return;
+    const externalRelatedNode = model.nodes.find(
+      (node) =>
+        node.kind === "external" &&
+        node.externalWork &&
+        relationshipWorkKey(node.externalWork as ExternalWork) ===
+          relationshipWorkKey(event.work),
+    );
+    const relatedKey = localRelatedKey ?? externalRelatedNode?.key ?? null;
+    let shouldRebuildFocus = false;
+
+    if (focusProjection && !focusLoadActive) {
+      for (const seed of focusProjection.seeds) {
+        if (seed.itemKey !== event.subjectItemKey) continue;
+        const relationships = ensureFocusRelationships(seed);
+        const list =
+          event.direction === "references"
+            ? relationships.references
+            : relationships.citedBy;
+        const identity = relationshipWorkKey(event.work);
+        if (event.ignored) {
+          const filtered = list.filter(
+            (candidate) => relationshipWorkKey(candidate) !== identity,
+          );
+          if (event.direction === "references") {
+            relationships.references = filtered;
+          } else {
+            relationships.citedBy = filtered;
+          }
+        } else if (
+          !list.some((candidate) => relationshipWorkKey(candidate) === identity)
+        ) {
+          list.push(event.work);
+        }
+        shouldRebuildFocus = true;
+      }
+    }
+
+    if (!relatedKey) {
+      if (shouldRebuildFocus) scheduleFocusRebuild();
+      return;
+    }
     const source =
       event.direction === "references" ? event.subjectItemKey : relatedKey;
     const target =
       event.direction === "references" ? relatedKey : event.subjectItemKey;
-    if (event.ignored) {
-      for (let index = model.edges.length - 1; index >= 0; index -= 1) {
-        const edge = model.edges[index];
-        if (edge.source === source && edge.target === target) {
-          model.edges.splice(index, 1);
+    const mutate = (edges: typeof model.edges): void => {
+      if (event.ignored) {
+        for (let index = edges.length - 1; index >= 0; index -= 1) {
+          const edge = edges[index];
+          if (edge.source === source && edge.target === target) {
+            edges.splice(index, 1);
+          }
         }
+      } else if (
+        !edges.some((edge) => edge.source === source && edge.target === target)
+      ) {
+        edges.push({
+          key: `${source}>${target}`,
+          source,
+          target,
+          provenance: event.work.provider,
+          manual: false,
+        });
       }
-    } else if (
-      !model.edges.some(
-        (edge) => edge.source === source && edge.target === target,
-      )
-    ) {
-      model.edges.push({
-        key: `${source}>${target}`,
-        source,
-        target,
-        provenance: event.work.provider,
-        manual: false,
-      });
-    }
+    };
+    mutate(model.edges);
+    if (localRelatedKey) mutate(libraryModel.edges);
     renderer?.setRelationshipHidden(source, target, event.ignored);
     model.statistics.edges = model.edges.length;
+    libraryModel.statistics.edges = libraryModel.edges.length;
+    if (shouldRebuildFocus) scheduleFocusRebuild();
     updateSummary();
   }
+
+  const nodesForRelationshipPublication = (
+    event: RelationshipPublicationEvent,
+  ): CitationGraphNode[] => {
+    const byKey = new Map<string, CitationGraphNode>();
+    for (const candidate of [
+      ...libraryModel.nodes,
+      ...model.nodes,
+      ...focusSeedRegistry.values(),
+    ]) {
+      if (candidate.itemKey !== event.subjectItemKey) continue;
+      if (candidate.itemID > 0 && event.libraryID !== snapshot.libraryID) {
+        continue;
+      }
+      byKey.set(candidate.key, candidate);
+    }
+    return [...byKey.values()];
+  };
+
+  const applyRelationshipPublicationToNode = (
+    node: CitationGraphNode,
+    event: RelationshipPublicationEvent,
+  ): void => {
+    if (event.direction === "references") {
+      if (event.reportedCount !== null) {
+        node.referenceCount = event.reportedCount;
+        node.referenceCountProvider = event.reportedCountProvider;
+      }
+      node.resolvedReferenceCount = event.identifiedCount;
+      if (node.externalWork) {
+        if (event.reportedCount !== null) {
+          node.externalWork.referenceCount = event.reportedCount;
+        }
+        node.externalWork.resolvedReferenceCount = event.identifiedCount;
+      }
+      return;
+    }
+    if (event.reportedCount !== null) {
+      node.citationCount = event.reportedCount;
+      node.citationCountProvider = event.reportedCountProvider;
+      if (node.externalWork) {
+        node.externalWork.citationCount = event.reportedCount;
+      }
+    }
+  };
+
+  const scheduleSelectedPaperRefresh = (
+    itemKey: string,
+    direction?: "references" | "cited-by",
+  ): void => {
+    if (relationshipDetailRefreshFrame || cleaned) return;
+    const run = (): void => {
+      relationshipDetailRefreshFrame = 0;
+      if (cleaned || selectedNode?.itemKey !== itemKey) return;
+      if (activeRelationshipView) {
+        if (
+          !direction ||
+          (activeRelationshipView.itemKey === itemKey &&
+            activeRelationshipView.direction === direction)
+        ) {
+          refreshActiveRelationshipView?.();
+        }
+        return;
+      }
+      const current =
+        model.nodes.find((candidate) => candidate.itemKey === itemKey) ??
+        libraryModel.nodes.find((candidate) => candidate.itemKey === itemKey) ??
+        selectedNode;
+      renderOverview(current);
+    };
+    relationshipDetailRefreshFrame = document.defaultView
+      ? document.defaultView.setTimeout(run, 30)
+      : (setTimeout(run, 30) as unknown as number);
+  };
+
+  const scheduleRelationshipGraphRefresh = (): void => {
+    if (relationshipGraphRefreshTimer || cleaned) return;
+    const run = (): void => {
+      relationshipGraphRefreshTimer = 0;
+      if (cleaned || focusProjection) return;
+      renderer?.setLayout(renderer.getLayout());
+      updateSummary();
+    };
+    relationshipGraphRefreshTimer = document.defaultView
+      ? document.defaultView.setTimeout(run, 30)
+      : (setTimeout(run, 30) as unknown as number);
+  };
+
+  const applyRelationshipPublication = (
+    event: RelationshipPublicationEvent,
+  ): void => {
+    const affected = nodesForRelationshipPublication(event);
+    if (!affected.length) return;
+    for (const node of affected) {
+      applyRelationshipPublicationToNode(node, event);
+    }
+    const subject =
+      affected.find((node) => model.nodes.includes(node)) ?? affected[0];
+    if (!subject) return;
+
+    if (event.phase === "membership-published") {
+      if (focusProjection?.seedKeys.has(subject.key)) {
+        const relationships = ensureFocusRelationships(subject);
+        const published = getRelationshipViewSnapshot(
+          seedRelationshipGraph(subject),
+          subject,
+          event.direction,
+          snapshot.libraryID,
+          FOCUS_RELATIONSHIP_CACHE_LIMIT,
+          { queueBackgroundHydration: false },
+        ).works;
+        if (event.direction === "references") {
+          relationships.references = published;
+        } else {
+          relationships.citedBy = published;
+        }
+        scheduleFocusRebuild();
+      } else {
+        scheduleRelationshipGraphRefresh();
+      }
+    }
+
+    // Summary hydration does not change graph membership or topology. A full
+    // focus reconstruction for 1,000+ neighbours was one of the largest UI
+    // stalls after background retrieval. Refresh only the selected details;
+    // graph metadata is picked up by the next ordinary graph rebuild.
+
+    if (selectedNode?.itemKey !== event.subjectItemKey) return;
+    updateRelationshipTabLabels(subject);
+    if (
+      activeRelationshipView?.itemKey === event.subjectItemKey &&
+      activeRelationshipView.direction === event.direction
+    ) {
+      scheduleSelectedPaperRefresh(event.subjectItemKey, event.direction);
+      return;
+    }
+    if (
+      activeRelationshipView === null &&
+      (event.phase === "membership-published" ||
+        event.phase === "metadata-published")
+    ) {
+      scheduleSelectedPaperRefresh(event.subjectItemKey);
+    }
+  };
+
+  const focusNodeForWork = (work: ExternalWork): CitationGraphNode => {
+    const localKey = work.inLibraryItemKey ?? work.zoteroItemKey ?? null;
+    const local = localKey
+      ? libraryModel.nodes.find(
+          (node) =>
+            node.itemKey.toLocaleUpperCase() === localKey.toLocaleUpperCase(),
+        )
+      : null;
+    return local ?? externalWorkToFocusNode(work, "seed");
+  };
 
   function appendExternalWorkCards(
     works: ExternalWork[],
@@ -1306,6 +2137,8 @@ export function renderCitationMapView(
       node: CitationGraphNode;
       direction: "references" | "cited-by";
       rerender: () => void;
+      ignoredIndex?: IgnoredRelationIndex;
+      referenceIndex?: RelatedWorkLookupIndex;
     },
     target: HTMLElement = detail,
     existingList?: HTMLElement,
@@ -1422,16 +2255,46 @@ export function renderCitationMapView(
         card.appendChild(importArea);
       }
 
-      let activeIgnoredRelation = relationshipContext
-        ? ignoredRelationForExternalWork(
-            relationshipContext.node,
-            relationshipContext.direction,
-            work,
-          )
-        : null;
+      const focusNode = focusNodeForWork(work);
+      const focusButton = element(document, "button", "cm-secondary-button");
+      focusButton.type = "button";
+      focusButton.textContent = "Focus on this paper";
+      focusButton.addEventListener("click", () => {
+        focusOnPaper(focusNode);
+      });
+      actionButtons.appendChild(focusButton);
+      if (focusProjection && !focusProjection.seedKeys.has(focusNode.key)) {
+        const addSeed = element(document, "button", "cm-secondary-button");
+        addSeed.type = "button";
+        addSeed.textContent = "Add as seed";
+        addSeed.title =
+          "Add this paper to the current Focus View without adding it to Zotero.";
+        addSeed.addEventListener("click", () => {
+          if (addFocusSeed(focusNode)) addSeed.remove();
+        });
+        actionButtons.appendChild(addSeed);
+      }
+
+      let activeIgnoredRelation =
+        relationshipContext &&
+        relationshipContext.node.kind !== "external" &&
+        relationshipContext.node.itemID > 0
+          ? ignoredRelationForExternalWork(
+              relationshipContext.node,
+              relationshipContext.direction,
+              work,
+              relationshipContext.ignoredIndex,
+              relationshipContext.referenceIndex,
+            )
+          : null;
       let ignoredBadge: HTMLElement | null = null;
       let syncIgnoredState = (): void => undefined;
-      if (relationshipContext && work.provider !== "manual") {
+      if (
+        relationshipContext &&
+        relationshipContext.node.kind !== "external" &&
+        relationshipContext.node.itemID > 0 &&
+        work.provider !== "manual"
+      ) {
         const toggleIgnored = element(
           document,
           "button",
@@ -1556,6 +2419,7 @@ export function renderCitationMapView(
           renderer?.setGhostPreview({
             key: work.providerWorkID ?? work.doi ?? work.title ?? "external",
             title: externalWorkTitle(work),
+            authors: work.authors ?? [],
             year: work.year,
             citationCount: work.citationCount ?? null,
             referenceCount: work.referenceCount ?? null,
@@ -1570,6 +2434,7 @@ export function renderCitationMapView(
           const preview: GhostPreview = {
             key: work.providerWorkID ?? work.doi ?? work.title ?? "external",
             title: externalWorkTitle(work),
+            authors: work.authors ?? [],
             year: work.year,
             citationCount: work.citationCount ?? null,
             referenceCount: work.referenceCount ?? null,
@@ -1738,6 +2603,7 @@ export function renderCitationMapView(
     direction: "references" | "cited-by",
   ): void {
     activeRelationshipView = { itemKey: node.itemKey, direction };
+    refreshActiveRelationshipView = null;
     renderer?.setGhostPreview(null);
     similarRequestGeneration += 1;
     inlineSimilarResults = null;
@@ -1757,6 +2623,17 @@ export function renderCitationMapView(
     let shownCount = works.length;
     let filtered = false;
     let renderGeneration = 0;
+    let descriptorCache = new Map<ExternalWork, PaperListDescriptor>();
+    let ignoredIndex = createIgnoredRelationIndex(
+      getIgnoredRelations(snapshot.libraryID),
+    );
+    const referenceIndex =
+      direction === "references"
+        ? createRelatedWorkLookupIndex(
+            getCitationMetricRecord(snapshot.libraryID, node.itemKey)
+              ?.references ?? [],
+          )
+        : undefined;
     let renderList = (): void => undefined;
 
     const controls = element(document, "div", "cm-relationship-controls");
@@ -1793,6 +2670,8 @@ export function renderCitationMapView(
     update.title = updateLabel;
     update.setAttribute("aria-label", updateLabel);
     update.appendChild(icon(document, "refresh"));
+    update.disabled =
+      relationshipPublicationStateForNode(node, direction)?.active ?? false;
 
     const currentRelatedItemKeys = (): Set<string> =>
       new Set(
@@ -1810,38 +2689,45 @@ export function renderCitationMapView(
       updateSummary();
     };
 
-    const picker = createManualRelationshipPicker({
-      document,
-      snapshot,
-      subjectItemKey: node.itemKey,
-      direction: direction === "references" ? "reference" : "cited-by",
-      getAlreadyRelatedItemKeys: currentRelatedItemKeys,
-      buttonClassName: "cm-secondary-button",
-      inputClassName: "cm-search",
-      onApplied: (changes) => {
-        synchronizeGraph(changes);
-        relationshipSnapshot = getRelationshipViewSnapshot(
-          model,
-          node,
-          direction,
-          snapshot.libraryID,
-          RELATIONSHIP_VIEW_LIMIT,
-        );
-        works = relationshipSnapshot.works;
-        renderList();
-      },
-    });
+    const picker =
+      node.kind === "external" || node.itemID <= 0
+        ? null
+        : createManualRelationshipPicker({
+            document,
+            snapshot,
+            subjectItemKey: node.itemKey,
+            direction: direction === "references" ? "reference" : "cited-by",
+            getAlreadyRelatedItemKeys: currentRelatedItemKeys,
+            buttonClassName: "cm-secondary-button",
+            inputClassName: "cm-search",
+            onApplied: (changes) => {
+              synchronizeGraph(changes);
+              relationshipSnapshot = getRelationshipViewSnapshot(
+                model,
+                node,
+                direction,
+                snapshot.libraryID,
+                RELATIONSHIP_VIEW_LIMIT,
+              );
+              works = relationshipSnapshot.works;
+              renderList();
+            },
+          });
 
-    controls.append(toolbar.root, update, picker.button);
-    detail.append(controls, picker.overlay);
+    controls.append(toolbar.root, update);
+    if (picker) controls.appendChild(picker.button);
+    detail.appendChild(controls);
+    if (picker) detail.appendChild(picker.overlay);
 
     const status = text(document, "p", "", "cm-detail-meta");
     const updateStatus = (): void => {
+      const publicationActive =
+        relationshipPublicationStateForNode(node, direction)?.active ?? false;
       const base = relationshipStatusText(
         relationshipSnapshot,
         shownCount,
         filtered,
-        updating,
+        updating || publicationActive,
       );
       status.textContent = updateOutcome ? `${base} · ${updateOutcome}` : base;
     };
@@ -1855,9 +2741,19 @@ export function renderCitationMapView(
         work,
         providerOrder,
       }));
-      const ordered = toolbar.apply(entries, ({ work }) =>
-        describeExternalWork(work, snapshot.libraryID, true, false, paperByKey),
-      );
+      const ordered = toolbar.apply(entries, ({ work }) => {
+        const cached = descriptorCache.get(work);
+        if (cached) return cached;
+        const descriptor = describeExternalWork(
+          work,
+          snapshot.libraryID,
+          true,
+          false,
+          paperByKey,
+        );
+        descriptorCache.set(work, descriptor);
+        return descriptor;
+      });
       shownCount = ordered.length;
       filtered = toolbar.hasActiveQueryOrFilters();
       updateStatus();
@@ -1871,13 +2767,18 @@ export function renderCitationMapView(
       let index = 0;
       const appendNextBatch = (): void => {
         if (generation !== renderGeneration || !list.isConnected) return;
-        const batch = ordered.slice(index, index + 75);
+        const batch = ordered.slice(index, index + 24);
         appendExternalWorkCards(
           batch.map((entry) => entry.work),
           {
             node,
             direction,
+            ignoredIndex,
+            referenceIndex,
             rerender: () => {
+              ignoredIndex = createIgnoredRelationIndex(
+                getIgnoredRelations(snapshot.libraryID),
+              );
               relationshipSnapshot = getRelationshipViewSnapshot(
                 model,
                 node,
@@ -1886,6 +2787,7 @@ export function renderCitationMapView(
                 RELATIONSHIP_VIEW_LIMIT,
               );
               works = relationshipSnapshot.works;
+              descriptorCache = new Map();
               renderList();
             },
           },
@@ -1902,26 +2804,76 @@ export function renderCitationMapView(
       appendNextBatch();
     };
 
+    refreshActiveRelationshipView = (): void => {
+      if (
+        cleaned ||
+        activeRelationshipView?.itemKey !== node.itemKey ||
+        activeRelationshipView.direction !== direction
+      ) {
+        return;
+      }
+      relationshipSnapshot = getRelationshipViewSnapshot(
+        model,
+        node,
+        direction,
+        snapshot.libraryID,
+        RELATIONSHIP_VIEW_LIMIT,
+        { queueBackgroundHydration: false },
+      );
+      works = relationshipSnapshot.works;
+      update.disabled =
+        updating ||
+        (relationshipPublicationStateForNode(node, direction)?.active ?? false);
+      updateRelationshipTabLabels(node);
+      renderList();
+    };
+
     update.addEventListener("click", () => {
       if (update.disabled) return;
+      const requestScope = createCancellationScope(
+        `${direction} relationship update for ${node.itemKey}`,
+      );
       update.disabled = true;
       updating = true;
       updateOutcome = null;
       updateStatus();
+      const cancelUpdate = (): void => {
+        requestScope.cancel();
+        updating = false;
+        updateOutcome = "Update cancelled";
+        if (update.isConnected) update.disabled = false;
+        updateStatus();
+      };
       const progress = createUpdateProgress({
         document,
         title: updateLabel,
         message: "Checking provider pages for new relationships…",
+        onCancel: cancelUpdate,
       });
       void (async () => {
         const previousWorks = works;
         try {
-          await refreshExternalRelationships(
-            node,
-            model.nodes,
-            direction,
-            RELATIONSHIP_VIEW_LIMIT,
-          );
+          await refreshExternalRelationships(node, model.nodes, direction, {
+            maximum: RELATIONSHIP_VIEW_LIMIT,
+            refreshMembership: true,
+            silent: true,
+            mode: "manual",
+            queueBackgroundHydration: true,
+            signal: requestScope.signal,
+            onMembershipResolved: (resolution) => {
+              if (resolution.reportedCount === null) return;
+              if (direction === "references") {
+                node.referenceCount = resolution.reportedCount;
+              } else {
+                node.citationCount = resolution.reportedCount;
+              }
+            },
+          });
+          if (requestScope.signal.cancelled) {
+            updateOutcome = "Update cancelled";
+            progress.dismiss();
+            return;
+          }
           relationshipSnapshot = getRelationshipViewSnapshot(
             model,
             node,
@@ -1930,6 +2882,16 @@ export function renderCitationMapView(
             RELATIONSHIP_VIEW_LIMIT,
           );
           works = relationshipSnapshot.works;
+          descriptorCache = new Map();
+          if (focusProjection?.seedKeys.has(node.key)) {
+            const relationships = ensureFocusRelationships(node);
+            if (direction === "references") {
+              relationships.references = works;
+            } else {
+              relationships.citedBy = works;
+            }
+            rebuildCurrentFocus();
+          }
           const added = newlyRetrievedRelationshipWorkCount(
             previousWorks,
             works,
@@ -1939,6 +2901,11 @@ export function renderCitationMapView(
             : "No new papers returned";
           progress.finish(updateOutcome);
         } catch (error) {
+          if (requestScope.signal.cancelled) {
+            updateOutcome = "Update cancelled";
+            progress.dismiss();
+            return;
+          }
           updateOutcome = "Update failed";
           progress.fail(updateOutcome);
           Zotero.logError(
@@ -1954,42 +2921,10 @@ export function renderCitationMapView(
     renderList();
   }
 
-  function transientSourceKeys(node: CitationGraphNode): string[] {
-    const connected = new Set<string>();
-    for (const edge of model.edges) {
-      if (edge.source === node.key && visibleKeys.has(edge.target)) {
-        connected.add(edge.target);
-      } else if (edge.target === node.key && visibleKeys.has(edge.source)) {
-        connected.add(edge.source);
-      }
-    }
-    return [...connected];
-  }
-
-  function showTransientPreview(node: CitationGraphNode): void {
-    renderer?.setTransientPreview({
-      key: `filtered:${node.key}`,
-      title: node.title,
-      year: node.year,
-      citationCount: node.citationCount,
-      referenceCount: node.referenceCount,
-      sourceKeys: transientSourceKeys(node),
-      contextLabel: "Outside current filters",
-    });
-  }
-
   function renderOverview(node: CitationGraphNode | null): void {
     activeRelationshipView = null;
-    const preserveTransient = Boolean(
-      node &&
-      transientFocusNode?.key === node.key &&
-      !visibleKeys.has(node.key),
-    );
+    refreshActiveRelationshipView = null;
     renderer?.setGhostPreview(null);
-    if (!preserveTransient) {
-      transientFocusNode = null;
-      renderer?.setTransientPreview(null);
-    }
     similarRequestGeneration += 1;
     inlineSimilarResults = null;
     clear(detail);
@@ -2006,6 +2941,7 @@ export function renderCitationMapView(
       );
       return;
     }
+
     appendPaperHeader(node, "overview");
     const rows = element(document, "dl", "cm-metric-list");
     const appendMetric = (
@@ -2048,7 +2984,7 @@ export function renderCitationMapView(
       "Library coverage",
       formatMetricValue("library-coverage", node.libraryCoverage),
     );
-    appendMetric("Provider", node.provider ?? "—");
+    appendMetric("Provider", node.provider ?? "Zotero/local data");
     appendMetric(
       "Updated",
       node.metricsUpdatedAt
@@ -2056,32 +2992,244 @@ export function renderCitationMapView(
         : "—",
     );
     detail.appendChild(rows);
-    const overviewActions = createPaperOverviewActionBar({
-      document,
-      actionsClass: "cm-detail-actions",
-      primaryButtonClass: "cm-primary-button",
-      secondaryButtonClass: "cm-secondary-button",
-      doi: node.doi,
-      onShowInZotero: () => selectPaper(node.itemID),
-      onSimilar: () => loadInlineSimilarResults([node]),
-      onRefresh: async () => {
-        const item = Zotero.Items.get(node.itemID) as Zotero.Item | null;
-        if (!item) throw new Error("The selected Zotero item is unavailable.");
-        await updateCitationDataForItems([item], {
-          force: true,
-          includeRelationships: true,
-          progressDocument: document,
+
+    if (node.kind === "external" && node.externalWork) {
+      const work = node.externalWork as ExternalWork;
+      const actions = element(document, "div", "cm-detail-actions");
+      actions.style.flexWrap = "wrap";
+
+      const localKey = work.inLibraryItemKey ?? work.zoteroItemKey ?? null;
+      const localItem = localKey
+        ? ((Zotero.Items as any).getByLibraryAndKey?.(
+            snapshot.libraryID,
+            localKey,
+          ) as Zotero.Item | null)
+        : null;
+      if (localItem) {
+        const show = element(document, "button", "cm-secondary-button");
+        show.type = "button";
+        show.textContent = "Show in Zotero";
+        show.addEventListener("click", () => void selectPaper(localItem.id));
+        actions.appendChild(show);
+      } else {
+        const add = element(document, "button", "cm-primary-button");
+        add.type = "button";
+        add.textContent = "Add to Zotero";
+        const importArea = element(document, "section", "cm-import-area");
+        importArea.hidden = true;
+        const chooser = createCollectionChooser(document, snapshot);
+        const confirm = element(document, "button", "cm-primary-button");
+        confirm.type = "button";
+        confirm.textContent = "Add paper";
+        const cancel = element(document, "button", "cm-secondary-button");
+        cancel.type = "button";
+        cancel.textContent = "Cancel";
+        confirm.addEventListener("click", () => {
+          if (confirm.disabled) return;
+          confirm.disabled = true;
+          confirm.textContent = "Adding…";
+          void importExternalWork(work, snapshot.libraryID, [
+            ...chooser.selected,
+          ])
+            .then((items) => {
+              const imported = items[0];
+              if (!imported) throw new Error("No item was imported.");
+              work.inLibraryItemKey = String(imported.key);
+              if (node.externalWork) {
+                node.externalWork.inLibraryItemKey = String(imported.key);
+              }
+              importArea.replaceChildren(
+                text(document, "p", "Added to Zotero.", "cm-success"),
+              );
+              add.remove();
+              const show = element(document, "button", "cm-secondary-button");
+              show.type = "button";
+              show.textContent = "Show in Zotero";
+              show.addEventListener(
+                "click",
+                () => void selectPaper(imported.id),
+              );
+              actions.prepend(show);
+            })
+            .catch((error: unknown) => {
+              Zotero.logError(
+                error instanceof Error ? error : new Error(String(error)),
+              );
+              confirm.disabled = false;
+              confirm.textContent = "Import failed — try again";
+            });
         });
-        Object.assign(node, createMetricNodeForItem(item));
-        const refreshedGraph = buildCitationGraph(snapshot);
-        model.edges.splice(0, model.edges.length, ...refreshedGraph.edges);
-        Object.assign(model.statistics, refreshedGraph.statistics);
-        renderer?.setLayout(currentLayout);
-        updateSummary();
-        if (!cleaned) renderOverview(node);
-      },
-    });
-    detail.appendChild(overviewActions.root);
+        cancel.addEventListener("click", () => {
+          importArea.hidden = true;
+          add.hidden = false;
+        });
+        add.addEventListener("click", () => {
+          add.hidden = true;
+          importArea.hidden = false;
+        });
+        const importButtons = element(document, "div", "cm-detail-actions");
+        importButtons.append(cancel, confirm);
+        importArea.append(
+          text(document, "h4", "Choose collections"),
+          chooser.root,
+          importButtons,
+        );
+        actions.appendChild(add);
+        detail.appendChild(importArea);
+      }
+
+      const sourceURL = externalWorkURL(work);
+      if (sourceURL) {
+        const open = element(document, "button", "cm-secondary-button");
+        open.type = "button";
+        open.textContent = work.doi ? "Open DOI" : "Open provider record";
+        open.addEventListener("click", () => Zotero.launchURL(sourceURL));
+        actions.appendChild(open);
+      }
+
+      const focus = element(document, "button", "cm-secondary-button");
+      focus.type = "button";
+      focus.textContent = "Focus on this paper";
+      focus.title = "Replace the current seed set with this paper.";
+      focus.addEventListener("click", () => focusOnPaper(node));
+      actions.appendChild(focus);
+
+      if (focusProjection && !focusProjection.seedKeys.has(node.key)) {
+        const addSeed = element(document, "button", "cm-secondary-button");
+        addSeed.type = "button";
+        addSeed.textContent = "Add as seed";
+        addSeed.title =
+          "Add this paper to Focus View without adding it to Zotero.";
+        addSeed.addEventListener("click", () => {
+          if (addFocusSeed(node)) renderOverview(node);
+        });
+        actions.appendChild(addSeed);
+      }
+
+      const similar = element(document, "button", "cm-primary-button");
+      similar.type = "button";
+      similar.textContent = "Similar";
+      similar.addEventListener("click", () => {
+        void loadInlineSimilarResults([node]);
+      });
+      actions.appendChild(similar);
+
+      const update = element(document, "button", "cm-secondary-button");
+      update.type = "button";
+      update.textContent = "Update connections";
+      update.addEventListener("click", () => {
+        if (update.disabled) return;
+        update.disabled = true;
+        void (async () => {
+          for (const direction of ["references", "cited-by"] as const) {
+            await refreshExternalRelationships(
+              node,
+              libraryModel.nodes,
+              direction,
+              {
+                maximum: RELATIONSHIP_VIEW_LIMIT,
+                refreshMembership: true,
+                silent: true,
+                mode: "manual",
+                queueBackgroundHydration: true,
+                onMembershipResolved: (resolution) => {
+                  if (resolution.reportedCount === null) return;
+                  if (direction === "references") {
+                    node.referenceCount = resolution.reportedCount;
+                  } else {
+                    node.citationCount = resolution.reportedCount;
+                  }
+                },
+              },
+            );
+            await new Promise<void>((resolve) => {
+              scheduleFocusTask(resolve, 0);
+            });
+          }
+        })()
+          .then(() => {
+            const relationships = ensureFocusRelationships(node);
+            relationships.references = getRelationshipViewSnapshot(
+              seedRelationshipGraph(node),
+              node,
+              "references",
+              snapshot.libraryID,
+              RELATIONSHIP_VIEW_LIMIT,
+            ).works;
+            relationships.citedBy = getRelationshipViewSnapshot(
+              seedRelationshipGraph(node),
+              node,
+              "cited-by",
+              snapshot.libraryID,
+              RELATIONSHIP_VIEW_LIMIT,
+            ).works;
+            if (focusProjection?.seedKeys.has(node.key)) rebuildCurrentFocus();
+            if (!cleaned) renderOverview(node);
+          })
+          .catch((error: unknown) => {
+            Zotero.logError(
+              error instanceof Error ? error : new Error(String(error)),
+            );
+          })
+          .finally(() => {
+            if (update.isConnected) update.disabled = false;
+          });
+      });
+      actions.appendChild(update);
+      detail.appendChild(actions);
+    } else {
+      const overviewActions = createPaperOverviewActionBar({
+        document,
+        actionsClass: "cm-detail-actions",
+        primaryButtonClass: "cm-primary-button",
+        secondaryButtonClass: "cm-secondary-button",
+        doi: node.doi,
+        onShowInZotero: () => selectPaper(node.itemID),
+        onOpenFocusView:
+          focusProjection?.seedKeys.size === 1 &&
+          focusProjection.seedKeys.has(node.key)
+            ? undefined
+            : () => {
+                focusOnPaper(node);
+              },
+        onSimilar: () => loadInlineSimilarResults([node]),
+        onRefresh: async () => {
+          const item = Zotero.Items.get(node.itemID) as Zotero.Item | null;
+          if (!item)
+            throw new Error("The selected Zotero item is unavailable.");
+          await updateCitationDataForItems([item], {
+            force: false,
+            progressDocument: document,
+          });
+          const refreshedNode = createMetricNodeForItem(item);
+          Object.assign(node, refreshedNode);
+          const libraryNode = libraryModel.nodes.find(
+            (candidate) => candidate.key === refreshedNode.key,
+          );
+          if (libraryNode) Object.assign(libraryNode, refreshedNode);
+          replaceLibraryGraph(buildCitationGraph(snapshot));
+          renderer?.setLayout(currentLayout);
+          updateSummary();
+          const current = model.nodes.find(
+            (candidate) => candidate.key === refreshedNode.key,
+          );
+          if (!cleaned && current) renderOverview(current);
+        },
+      });
+      detail.appendChild(overviewActions.root);
+      if (focusProjection && !focusProjection.seedKeys.has(node.key)) {
+        const addSeed = element(document, "button", "cm-secondary-button");
+        addSeed.type = "button";
+        addSeed.textContent = "Add as seed";
+        addSeed.title =
+          "Add this paper to the current Focus View without changing Zotero.";
+        addSeed.addEventListener("click", () => {
+          if (addFocusSeed(node)) renderOverview(node);
+        });
+        overviewActions.root.appendChild(addSeed);
+      }
+    }
+
     inlineSimilarResults = element(
       document,
       "section",
@@ -2089,7 +3237,6 @@ export function renderCitationMapView(
     );
     inlineSimilarResults.style.marginTop = "10px";
     detail.appendChild(inlineSimilarResults);
-    if (preserveTransient && node) showTransientPreview(node);
   }
 
   renderer = new CitationGraphRenderer({
@@ -2099,7 +3246,14 @@ export function renderCitationMapView(
     collectionColorsByNodeKey: visuals.colorsByNodeKey,
     collectionLabelsByNodeKey: visuals.labelsByNodeKey,
     onSelectionChange: renderOverview,
-    onOpenNode: (node) => void selectPaper(node.itemID),
+    onOpenNode: (node) => {
+      if (node.kind === "external" && node.externalWork) {
+        const url = externalWorkURL(node.externalWork as ExternalWork);
+        if (url) Zotero.launchURL(url);
+        return;
+      }
+      void selectPaper(node.itemID);
+    },
     onBackgroundInteraction: appearance.close,
   });
   renderer.setLegendVisible(appearance.getLegendVisible());
@@ -2119,39 +3273,85 @@ export function renderCitationMapView(
 
   applyFilters = (): void => {
     const tokens = normalizeSearch(search.value).split(/\s+/).filter(Boolean);
+    const focusScopeKeys = focusProjection
+      ? new Set(focusProjection.nodes.map((node) => node.key))
+      : null;
+    const activeCollectionID = graphFilter.state().collectionID;
     visibleKeys = new Set(
       model.nodes
         .filter((node) => {
-          const paper = paperByKey.get(node.itemKey);
-          const descriptor = graphFilterDescriptors.get(node.key);
-          if (!paper || !descriptor || !graphFilter.matches(descriptor)) {
+          if (currentViewKind === "focus" && !focusProjection) return false;
+          if (focusScopeKeys && !focusScopeKeys.has(node.key)) return false;
+          if (
+            !focusProjection &&
+            mapScopeItemIDs &&
+            !mapScopeItemIDs.has(node.itemID)
+          ) {
             return false;
           }
-          const searchable = paperSearchText(paper);
+          const descriptor = graphFilterDescriptors.get(node.key);
+          if (!descriptor) return false;
+          // Collection membership scopes the library map. It must never hide
+          // external Focus neighbours, even if a collection is selected while
+          // Focus View is already open. Other metadata filters still apply.
+          const filterDescriptor =
+            focusProjection && activeCollectionID !== null
+              ? {
+                  ...descriptor,
+                  collectionIDs: descriptor.collectionIDs.includes(
+                    activeCollectionID,
+                  )
+                    ? descriptor.collectionIDs
+                    : [...descriptor.collectionIDs, activeCollectionID],
+                }
+              : descriptor;
+          if (!graphFilter.matches(filterDescriptor)) return false;
+          const searchable = graphNodeSearchText(node);
           return tokens.every((token) => searchable.includes(token));
         })
         .map((node) => node.key),
     );
-    renderer?.setVisibleKeys(visibleKeys);
+    renderer?.setVisibleKeys(visibleKeys, false);
     const matches = tokens.length ? new Set(visibleKeys) : null;
     renderer?.setSearchMatches(matches);
-    if (transientFocusNode) {
-      const currentNode =
-        model.nodes.find(
-          (candidate) => candidate.key === transientFocusNode?.key,
-        ) ?? transientFocusNode;
-      transientFocusNode = currentNode;
-      if (visibleKeys.has(currentNode.key)) {
-        transientFocusNode = null;
-        renderer?.setTransientPreview(null);
-        renderer?.selectNode(currentNode.key, false);
-      } else {
-        showTransientPreview(currentNode);
-      }
-    }
     updateSummary();
   };
   search.addEventListener("input", applyFilters);
+  for (const control of [
+    focusDirection,
+    focusLocality,
+    focusRanking,
+    focusLimit,
+  ]) {
+    control.addEventListener("change", () => {
+      if (!focusProjection) return;
+      scheduleFocusRebuild();
+    });
+  }
+  focusExitButton.addEventListener("click", exitFocus);
+  focusRefreshButton.addEventListener("click", () => {
+    if (!focusProjection) return;
+    loadFocusConnections(focusProjection.seeds, {
+      forceRefresh: true,
+      mode: "manual",
+    });
+  });
+  focusBackButton.addEventListener("click", () => {
+    if (!focusProjection) return;
+    const previous = focusBack.pop();
+    if (!previous) return;
+    focusForward.push(cloneFocusState(focusProjection.state));
+    restoreFocusState(previous);
+    updateFocusBar();
+  });
+  focusForwardButton.addEventListener("click", () => {
+    if (!focusProjection) return;
+    const next = focusForward.pop();
+    if (!next) return;
+    focusBack.push(cloneFocusState(focusProjection.state));
+    restoreFocusState(next);
+    updateFocusBar();
+  });
   similarButton.addEventListener("click", () => {
     if (similarButton.disabled) return;
     const visibleNodes = model.nodes.filter((node) =>
@@ -2196,29 +3396,70 @@ export function renderCitationMapView(
   });
   refreshButton.addEventListener("click", () => {
     if (refreshButton.disabled) return;
-    const items = model.nodes
-      .filter((node) => visibleKeys.has(node.key))
+    const visibleNodes = model.nodes.filter((node) =>
+      visibleKeys.has(node.key),
+    );
+    const items = visibleNodes
+      .filter((node) => node.kind !== "external" && node.itemID > 0)
       .map((node) => Zotero.Items.get(node.itemID) as Zotero.Item | null)
       .filter((item): item is Zotero.Item => Boolean(item));
-    if (!items.length) return;
+    const externalNodes = visibleNodes.filter(
+      (node) => node.kind === "external" && Boolean(node.externalWork),
+    );
+    if (!items.length && !externalNodes.length) return;
+
     refreshButton.disabled = true;
-    void updateCitationDataForItems(items, {
-      force: true,
-      includeRelationships: false,
-      progressDocument: document,
-    })
-      .then(() => {
+    const externalProgress = externalNodes.length
+      ? createUpdateProgress({
+          document,
+          title: "Refreshing visible external papers",
+          message: `Resolving metadata and citation counts for ${externalNodes.length} paper${externalNodes.length === 1 ? "" : "s"}…`,
+          total: externalNodes.length,
+        })
+      : null;
+    const localTask = items.length
+      ? updateCitationDataForItems(items, {
+          force: false,
+          progressDocument: document,
+        })
+      : Promise.resolve(null);
+    const externalTask = externalNodes.length
+      ? hydrateExternalWorksMetadata(
+          externalNodes.map((node) => node.externalWork as ExternalWork),
+          true,
+          Number.POSITIVE_INFINITY,
+          false,
+          true,
+        )
+      : Promise.resolve([] as ExternalWork[]);
+
+    void Promise.all([localTask, externalTask])
+      .then(([, hydratedExternalWorks]) => {
         if (cleaned) return;
-        for (const node of model.nodes) {
-          const item = Zotero.Items.get(node.itemID) as Zotero.Item | null;
-          if (item) Object.assign(node, createMetricNodeForItem(item));
-        }
-        applyFilters();
+        hydratedExternalWorks.forEach((work, index) => {
+          const node = externalNodes[index];
+          if (!node) return;
+          synchronizeExternalFocusNode(node, work);
+          if (node.externalWork) Object.assign(node.externalWork, work);
+        });
+        externalProgress?.finish(
+          `Refreshed ${hydratedExternalWorks.length} external paper${hydratedExternalWorks.length === 1 ? "" : "s"}.`,
+        );
+        replaceLibraryGraph(buildCitationGraph(snapshot));
         renderer?.setLayout(currentLayout);
-        renderer?.fitView();
-        if (selectedNode) renderOverview(selectedNode);
+        rebuildGraphFilterDescriptors();
+        applyFilters();
+        updateSummary();
+        if (selectedNode) {
+          const current =
+            model.nodes.find(
+              (candidate) => candidate.key === selectedNode?.key,
+            ) ?? selectedNode;
+          renderOverview(current);
+        }
       })
       .catch((error: unknown) => {
+        externalProgress?.fail("External-paper refresh failed.");
         Zotero.logError(
           error instanceof Error ? error : new Error(String(error)),
         );
@@ -2233,7 +3474,7 @@ export function renderCitationMapView(
     ) as HTMLButtonElement | null;
     if (target?.dataset.action === "in") renderer?.zoomBy(1.22);
     if (target?.dataset.action === "out") renderer?.zoomBy(1 / 1.22);
-    if (target?.dataset.action === "fit") renderer?.fitView();
+    if (target?.dataset.action === "fit") fitCurrentGraph();
   });
 
   let resizing = false;
@@ -2280,63 +3521,269 @@ export function renderCitationMapView(
       ) {
         return;
       }
+      if (!viewActive) {
+        inactiveRelationshipDirty = true;
+        return;
+      }
       applyRelationshipMutationToGraph(event);
       if (
         activeRelationshipView?.itemKey === event.subjectItemKey &&
         activeRelationshipView.direction === event.direction
       ) {
-        const subject = model.nodes.find(
-          (candidate) => candidate.itemKey === event.subjectItemKey,
-        );
-        if (subject) {
-          document.defaultView?.setTimeout(() => {
-            if (!cleaned) showRelationList(subject, event.direction);
-          }, 0);
-        }
+        document.defaultView?.setTimeout(() => {
+          if (!cleaned) refreshActiveRelationshipView?.();
+        }, 0);
       }
     },
   );
+  const unsubscribeRelationshipPublications = subscribeRelationshipPublications(
+    (event) => {
+      if (cleaned) return;
+      if (!viewActive) {
+        inactiveRelationshipDirty = true;
+        return;
+      }
+      applyRelationshipPublication(event);
+    },
+  );
+
+  const libraryNodeForItem = (itemID: number): CitationGraphNode | null => {
+    let node = libraryModel.nodes.find(
+      (candidate) => candidate.itemID === itemID,
+    );
+    if (node) return node;
+    const item = Zotero.Items.get(itemID) as Zotero.Item | null;
+    if (
+      !item ||
+      Number(item.libraryID) !== snapshot.libraryID ||
+      !item.isRegularItem?.()
+    ) {
+      return null;
+    }
+    node = createMetricNodeForItem(item);
+    libraryModel.nodes.push(node);
+    return node;
+  };
+
+  const mapNodesForItems = (itemIDs: readonly number[]): CitationGraphNode[] =>
+    normalizedCitationMapItemIDs(itemIDs)
+      .map((itemID) => {
+        const libraryNode = libraryNodeForItem(itemID);
+        if (!libraryNode) return null;
+        const renderedNode = model.nodes.find(
+          (candidate) => candidate.key === libraryNode.key,
+        );
+        return (
+          renderedNode ??
+          renderer?.addNode({ ...libraryNode, focusRole: null }) ??
+          libraryNode
+        );
+      })
+      .filter((node): node is CitationGraphNode => Boolean(node));
+
+  const applyMapItems = (
+    itemIDs: readonly number[],
+    mode: "replace" | "add",
+    pinAdded: boolean,
+  ): CitationMapFocusResult => {
+    if (!renderer) return "not-found";
+    if (focusProjection) exitFocus();
+    const renderedNodes = mapNodesForItems(itemIDs);
+    if (!renderedNodes.length) return "not-found";
+    const normalizedIDs = renderedNodes.map((node) => node.itemID);
+
+    if (mode === "replace") {
+      mapScopeItemIDs = replaceCitationMapItemScope(normalizedIDs);
+      mapPinnedItemIDs = pinAdded ? new Set(normalizedIDs) : new Set();
+      graphFilter.setCollectionID(null);
+    } else {
+      mapScopeItemIDs = extendCitationMapItemScope(
+        mapScopeItemIDs,
+        normalizedIDs,
+      );
+      if (pinAdded) {
+        mapPinnedItemIDs = new Set([...mapPinnedItemIDs, ...normalizedIDs]);
+      }
+    }
+
+    publishMapScope();
+    rebuildGraphFilterDescriptors();
+    syncMapPinnedKeys(false);
+    applyFilters();
+    const visibleAddedNodes = renderedNodes.filter((node) =>
+      visibleKeys.has(node.key),
+    );
+    if (visibleAddedNodes.length) {
+      renderer.selectNode(visibleAddedNodes[0].key, false);
+      const fittedKeys =
+        mode === "replace"
+          ? new Set(visibleAddedNodes.map((node) => node.key))
+          : new Set([...mapPinnedKeys()].filter((key) => visibleKeys.has(key)));
+      if (fittedKeys.size) {
+        scheduleCameraAction(() => renderer?.fitKeys(fittedKeys));
+      }
+    }
+    return visibleAddedNodes.length === renderedNodes.length
+      ? "selected"
+      : "revealed";
+  };
+
+  const replaceMapItems = (
+    itemIDs: readonly number[],
+  ): CitationMapFocusResult => applyMapItems(itemIDs, "replace", false);
+
+  const addMapItems = (itemIDs: readonly number[]): CitationMapFocusResult =>
+    applyMapItems(itemIDs, "add", true);
+
+  const addMapItemsRespectingFilters = (
+    itemIDs: readonly number[],
+  ): CitationMapFocusResult => applyMapItems(itemIDs, "add", false);
+
+  const revealItems = (itemIDs: readonly number[]): CitationMapFocusResult =>
+    addMapItems(itemIDs);
+
+  const revealItem = (itemID: number): CitationMapFocusResult =>
+    addMapItems([itemID]);
+
+  const reconcileInactiveView = (): void => {
+    if (!inactiveRelationshipDirty || cleaned) return;
+    inactiveRelationshipDirty = false;
+    if (focusProjection) {
+      for (const seed of focusProjection.seeds) {
+        const relationships = ensureFocusRelationships(seed);
+        relationships.references = getRelationshipViewSnapshot(
+          seedRelationshipGraph(seed),
+          seed,
+          "references",
+          snapshot.libraryID,
+          FOCUS_RELATIONSHIP_CACHE_LIMIT,
+          { queueBackgroundHydration: false },
+        ).works;
+        relationships.citedBy = getRelationshipViewSnapshot(
+          seedRelationshipGraph(seed),
+          seed,
+          "cited-by",
+          snapshot.libraryID,
+          FOCUS_RELATIONSHIP_CACHE_LIMIT,
+          { queueBackgroundHydration: false },
+        ).works;
+      }
+      rebuildCurrentFocus();
+    } else {
+      replaceLibraryGraph(buildCitationGraph(snapshot));
+      renderer?.setLayout(currentLayout);
+      applyFilters();
+      updateSummary();
+    }
+    if (selectedNode) {
+      const current =
+        model.nodes.find((node) => node.key === selectedNode?.key) ??
+        selectedNode;
+      renderOverview(current);
+    }
+  };
+
+  const addFocusItems = (
+    itemIDs: readonly number[],
+  ): CitationMapFocusResult => {
+    const nodes = normalizedCitationMapItemIDs(itemIDs)
+      .map((itemID) => libraryNodeForItem(itemID))
+      .filter((node): node is CitationGraphNode => Boolean(node));
+    return nodes.length && addFocusSeeds(nodes) ? "selected" : "not-found";
+  };
+
+  addLibraryItemsToView = (itemIDs) =>
+    currentViewKind === "focus"
+      ? addFocusItems(itemIDs)
+      : addMapItemsRespectingFilters(itemIDs);
+
+  syncMapPinnedKeys(false);
+  applyFilters();
 
   const controller: CitationMapViewController = {
-    focusItem(itemID) {
-      if (!renderer) return "not-found";
-      let node = model.nodes.find((candidate) => candidate.itemID === itemID);
-      if (!node) {
-        const item = Zotero.Items.get(itemID) as Zotero.Item | null;
-        if (
-          !item ||
-          Number(item.libraryID) !== snapshot.libraryID ||
-          !item.isRegularItem?.()
-        ) {
-          return "not-found";
-        }
-        node = createMetricNodeForItem(item);
+    revealItem,
+    revealItems,
+    replaceMapItems,
+    addMapItems,
+    openFocusItem(itemID) {
+      return addFocusItems([itemID]);
+    },
+    openFocusItems: addFocusItems,
+    addFocusItems,
+    openCollection(collectionID) {
+      if (
+        !snapshot.collections.some(
+          (entry) => entry.collectionID === collectionID,
+        )
+      ) {
+        return "not-found";
       }
-      if (visibleKeys.has(node.key)) {
-        transientFocusNode = null;
-        renderer.setTransientPreview(null);
-        return renderer.selectNode(node.key) ? "selected" : "not-found";
+      if (focusProjection) exitFocus();
+      mapScopeItemIDs = null;
+      mapPinnedItemIDs = new Set();
+      publishMapScope();
+      syncMapPinnedKeys(false);
+      graphFilter.setCollectionID(collectionID);
+      scheduleCameraAction(() => renderer?.fitVisibleNodes());
+      return "selected";
+    },
+    setActive(active) {
+      viewActive = active;
+      if (!active) {
+        appearance.close();
+        return;
       }
-      renderer.clearSelection();
-      transientFocusNode = node;
-      renderOverview(node);
-      return "revealed";
+      renderer?.resizeViewport();
+      reconcileInactiveView();
     },
   };
   controllerByMount.set(mount, controller);
 
-  if (options.initialItemID) {
-    const initial = model.nodes.find(
-      (node) => node.itemID === options.initialItemID,
-    );
-    if (initial) renderer.selectNode(initial.key);
+  if (options.initialFocusItemIDs?.length) {
+    controller.openFocusItems(options.initialFocusItemIDs);
+  } else if (options.initialFocusItemID) {
+    controller.openFocusItem(options.initialFocusItemID);
+  } else if (options.initialCollectionID) {
+    controller.openCollection(options.initialCollectionID);
+  } else if (options.initialItemIDs?.length) {
+    if (options.initialItemMode === "add") {
+      controller.addMapItems(options.initialItemIDs);
+    } else {
+      controller.replaceMapItems(options.initialItemIDs);
+    }
+  } else if (options.initialItemID) {
+    controller.replaceMapItems([options.initialItemID]);
   }
   updateSummary();
   const cleanup = (): void => {
     cleaned = true;
+    resetFocusRefreshTracking(true);
+    cancelCameraFrame();
+    if (focusRebuildFrame) {
+      document.defaultView?.cancelAnimationFrame(focusRebuildFrame);
+      clearTimeout(focusRebuildFrame);
+      focusRebuildFrame = 0;
+    }
+    if (relationshipDetailRefreshFrame) {
+      document.defaultView?.clearTimeout(relationshipDetailRefreshFrame);
+      clearTimeout(relationshipDetailRefreshFrame);
+      relationshipDetailRefreshFrame = 0;
+    }
+    if (relationshipGraphRefreshTimer) {
+      document.defaultView?.clearTimeout(relationshipGraphRefreshTimer);
+      clearTimeout(relationshipGraphRefreshTimer);
+      relationshipGraphRefreshTimer = 0;
+    }
     controllerByMount.delete(mount);
     unsubscribeRelationshipMutations();
+    unsubscribeRelationshipPublications();
     graphFilter.destroy();
+    document.removeEventListener(
+      "pointerdown",
+      closeAddNodePopupOnOutsidePointer,
+      true,
+    );
+    document.removeEventListener("keydown", closeAddNodePopupOnEscape, true);
     graphArea.removeEventListener("pointerdown", onGraphAreaPointerDown, true);
     renderer?.destroy();
     renderer = null;

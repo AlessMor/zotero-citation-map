@@ -55,6 +55,20 @@
   grid-template-columns: repeat(3, 1fr);
   gap: 4px;
 }
+.citation-map-pane-tabs > button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 36px;
+  height: auto !important;
+  padding-block: 5px;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  line-height: 1.2;
+  text-align: center;
+}
 .citation-map-item-pane button,
 .citation-map-item-pane input,
 .citation-map-item-pane select {
@@ -109,7 +123,16 @@
   flex-wrap: wrap;
   gap: 6px;
   align-items: center;
+  min-width: 0;
   margin: 7px 0;
+}
+.citation-map-pane-actions > button {
+  min-width: 0;
+  max-width: 100%;
+  height: auto !important;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  line-height: 1.2;
 }
 .citation-map-pane-badges span {
   padding: 2px 7px;

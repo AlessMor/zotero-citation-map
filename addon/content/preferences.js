@@ -2,7 +2,6 @@
 
 (() => {
   const PREF_PREFIX = "extensions.zotero.citationmap.";
-  const PROVIDER_SELECTION_VERSION = 5;
   let initialized = false;
   let notificationTimer = null;
 
@@ -66,22 +65,6 @@
       notificationTimer = null;
       Zotero.CitationMap.api.providerSelectionChanged();
     }, 0);
-  }
-
-  function migrateProviderSelection(inputs) {
-    const version = Number(
-      Zotero.Prefs.get(prefKey("providerSelectionVersion"), true) ?? 0,
-    );
-    if (version >= PROVIDER_SELECTION_VERSION) return;
-
-    writeBoolean("providerAutomatic", true);
-    setInputStates(inputs, "data-provider-pref", true);
-    Zotero.Prefs.set(prefKey("provider"), "auto", true);
-    Zotero.Prefs.set(
-      prefKey("providerSelectionVersion"),
-      PROVIDER_SELECTION_VERSION,
-      true,
-    );
   }
 
   function updateProviderStatus(inputs, automatic) {
@@ -285,7 +268,6 @@
       return false;
     }
 
-    migrateProviderSelection(providers);
     parent.addEventListener("change", handleProviderParentChange);
     for (const input of providers) {
       input.addEventListener("change", () => handleProviderChildChange(input));

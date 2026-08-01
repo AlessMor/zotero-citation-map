@@ -6,22 +6,16 @@ import type {
   RelatedWorkMetadata,
 } from "../domain/citationTypes";
 import type { CitationGraphEdge } from "../domain/graphTypes";
-import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
+import {
+  matchRelatedWorks,
+  normalizeDOI,
+  normalizeExactTitle,
+  normalizeProviderWorkID,
+} from "../domain/workIdentity";
 
-/**
- * Only transparent local connection counts are retained. Legacy fields remain
- * temporarily in the interface so old caches and downstream object shapes can
- * be read without a destructive migration; they are no longer calculated or
- * exposed as properties.
- */
 export interface NetworkMetricValues {
   incoming: number;
   outgoing: number;
-  pageRank: number;
-  betweennessCentrality: number;
-  eigenvectorCentrality: number;
-  componentSize: number;
-  citationChainDepth: number;
   isIsolated: boolean;
 }
 
@@ -30,6 +24,7 @@ export interface LocalWorkIdentity {
   doi: string | null;
   title: string | null;
   year: number | null;
+  authors: string[];
   provider: CitationProviderID | null;
   providerWorkID: string | null;
 }
@@ -42,23 +37,6 @@ export interface CitationReferenceSources {
   >;
 }
 
-function normalizeProviderWorkID(
-  provider: CitationProviderID | "manual" | "zotero",
-  value: string | null | undefined,
-): string | null {
-  let normalized = String(value ?? "").trim();
-  if (!normalized) return null;
-  if (provider === "openalex") {
-    normalized = normalized.replace(/^https?:\/\/openalex\.org\//i, "");
-  } else if (provider === "semantic-scholar") {
-    normalized = normalized.replace(
-      /^https?:\/\/(?:www\.)?semanticscholar\.org\/paper\//i,
-      "",
-    );
-  }
-  return normalized.toLocaleLowerCase();
-}
-
 function identityKey(
   provider: CitationProviderID | "manual" | "zotero",
   value: string | null | undefined,
@@ -68,17 +46,14 @@ function identityKey(
 }
 
 function ignoredKey(relation: {
-  provider: string;
+  provider: CitationProviderID | "manual" | "zotero";
   providerWorkID?: string | null;
   doi?: string | null;
   normalizedTitle?: string | null;
 }): string {
   return [
     relation.provider,
-    normalizeProviderWorkID(
-      relation.provider as CitationProviderID,
-      relation.providerWorkID,
-    ),
+    normalizeProviderWorkID(relation.provider, relation.providerWorkID),
     normalizeDOI(relation.doi),
     relation.normalizedTitle ?? "",
   ].join("|");
@@ -108,25 +83,28 @@ function explicitLocalTarget(
   return key && allowed.has(key) ? key : null;
 }
 
-function compatibleTitleTarget(
+function localIdentityMetadata(work: LocalWorkIdentity): RelatedWorkMetadata {
+  return {
+    provider: work.provider ?? "zotero",
+    providerWorkID: work.providerWorkID,
+    doi: work.doi,
+    title: work.title,
+    year: work.year,
+    authors: [...work.authors],
+    zoteroItemKey: work.itemKey,
+  };
+}
+
+function matchingTarget(
   reference: RelatedWorkMetadata,
   candidates: readonly LocalWorkIdentity[],
 ): string | null {
-  const compatible = candidates.filter(
+  const matching = candidates.filter(
     (candidate) =>
-      reference.year === null ||
-      reference.year === undefined ||
-      candidate.year === null ||
-      Math.abs(reference.year - candidate.year) <= 1,
+      matchRelatedWorks(reference, localIdentityMetadata(candidate))
+        .decision === "same-work",
   );
-  if (compatible.length === 1) return compatible[0].itemKey;
-  if (reference.year !== null && reference.year !== undefined) {
-    const exactYear = compatible.filter(
-      (candidate) => candidate.year === reference.year,
-    );
-    if (exactYear.length === 1) return exactYear[0].itemKey;
-  }
-  return null;
+  return matching.length === 1 ? matching[0].itemKey : null;
 }
 
 function mergeLocalIdentity(
@@ -139,6 +117,7 @@ function mergeLocalIdentity(
     doi: current.doi ?? incoming.doi,
     title: current.title?.trim() ? current.title : incoming.title,
     year: current.year ?? incoming.year,
+    authors: current.authors.length ? current.authors : incoming.authors,
     provider: current.provider ?? incoming.provider,
     providerWorkID: current.providerWorkID ?? incoming.providerWorkID,
   };
@@ -179,6 +158,7 @@ export function resolveRecordCitationEdges(
       doi: record.doi,
       title: record.title,
       year: record.year,
+      authors: [...record.authors],
       provider: record.provider,
       providerWorkID: record.providerWorkID,
     });
@@ -267,19 +247,31 @@ export function resolveRecordCitationEdges(
 
       let target = explicitLocalTarget(reference, allowed);
       const doi = normalizeDOI(reference.doi);
-      if (!target && doi) target = keyByDOI.get(doi) ?? null;
+      if (!target && doi) {
+        const candidateKey = keyByDOI.get(doi);
+        const candidate = candidateKey
+          ? localByItemKey.get(candidateKey)
+          : undefined;
+        target = candidate ? matchingTarget(reference, [candidate]) : null;
+      }
       if (!target) {
         const identity = identityKey(
           reference.provider,
           reference.providerWorkID,
         );
-        if (identity) target = keyByIdentity.get(identity) ?? null;
+        if (identity) {
+          const candidateKey = keyByIdentity.get(identity);
+          const candidate = candidateKey
+            ? localByItemKey.get(candidateKey)
+            : undefined;
+          target = candidate ? matchingTarget(reference, [candidate]) : null;
+        }
       }
       if (!target) {
         const title = normalizeExactTitle(reference.title);
         const candidates = title ? worksByTitle.get(title) : undefined;
         if (candidates?.length) {
-          target = compatibleTitleTarget(reference, candidates);
+          target = matchingTarget(reference, candidates);
         }
       }
       if (target) add(sourceItemKey, target, reference.provider, false);
@@ -325,11 +317,6 @@ export function computeNetworkAnalytics(
         {
           incoming: incomingCount,
           outgoing: outgoingCount,
-          pageRank: 0,
-          betweennessCentrality: 0,
-          eigenvectorCentrality: 0,
-          componentSize: 0,
-          citationChainDepth: 0,
           isIsolated: incomingCount + outgoingCount === 0,
         },
       ];

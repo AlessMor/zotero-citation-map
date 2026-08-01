@@ -1,12 +1,33 @@
 import type { RelatedWorkMetadata } from "../domain/citationTypes";
-import { externalWorkCacheIdentity, normalizeDOI } from "./citationIdentifiers";
+import {
+  relationshipCandidateIdentity,
+  stableExternalWorkIdentity,
+  stableWorkAliases,
+} from "../domain/workIdentity";
+import {
+  CACHE_RELATED_WORK_MERGE,
+  cloneRelatedWorkMetadata,
+  mergeRelatedWorkRecords,
+} from "../domain/relatedWorkMetadata";
+import { SerializedTaskQueue } from "./serializedTaskQueue";
+import {
+  decodeRelatedWorkArrayJSON,
+  decodeRelatedWorkMetadataJSON,
+} from "./cacheDecoders";
+import { createCooperativeCheckpoint } from "./backgroundTaskService";
+import { RelationshipMetadataDependencyIndex } from "./relationshipMetadataDependencyIndex";
+
+export type ExternalWorkCacheStatus =
+  "success" | "not-found" | "rate-limited" | "network-error" | "provider-error";
 
 export interface ExternalWorkCacheEntry {
   identityKey: string;
-  status: "success" | "not-found";
+  status: ExternalWorkCacheStatus;
   metadata: RelatedWorkMetadata | null;
   fetchedAt: string;
   nextRetryAt: string | null;
+  failureCount: number;
+  errorMessage: string | null;
 }
 
 export interface ExternalRelationshipCacheEntry {
@@ -21,6 +42,8 @@ interface ExternalWorkCacheRow {
   metadata_json: string | null;
   fetched_at: string;
   next_retry_at: string | null;
+  failure_count: number;
+  error_message: string | null;
 }
 
 interface ExternalRelationshipCacheRow {
@@ -30,15 +53,17 @@ interface ExternalRelationshipCacheRow {
 }
 
 const SCHEMA = `
-CREATE TABLE IF NOT EXISTS external_works (
+CREATE TABLE IF NOT EXISTS external_works_v2 (
   identity_key  TEXT PRIMARY KEY,
   status        TEXT NOT NULL,
   metadata_json TEXT,
   fetched_at    TEXT NOT NULL,
-  next_retry_at TEXT
+  next_retry_at TEXT,
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  error_message TEXT
 );
 
-CREATE TABLE IF NOT EXISTS external_relationships (
+CREATE TABLE IF NOT EXISTS external_relationships_v2 (
   relationship_key TEXT PRIMARY KEY,
   works_json       TEXT NOT NULL,
   fetched_at       TEXT NOT NULL
@@ -46,175 +71,161 @@ CREATE TABLE IF NOT EXISTS external_relationships (
 `;
 
 const SUCCESS_MAX_AGE_MS = 180 * 86400000;
-const NOT_FOUND_RETRY_MS = 30 * 86400000;
+const EXTERNAL_WORK_UPSERT_COLUMN_COUNT = 7;
+const SQLITE_SAFE_BIND_PARAMETER_COUNT = 900;
+const EXTERNAL_WORK_UPSERT_BATCH_SIZE = Math.max(
+  1,
+  Math.floor(
+    SQLITE_SAFE_BIND_PARAMETER_COUNT / EXTERNAL_WORK_UPSERT_COLUMN_COUNT,
+  ),
+);
 let db: _ZoteroTypes.DBConnection | null = null;
 let initialized = false;
 let initPromise: Promise<void> | null = null;
 let closing = false;
 let mirror = new Map<string, ExternalWorkCacheEntry>();
 let relationshipMirror = new Map<string, ExternalRelationshipCacheEntry>();
-let writeTail: Promise<void> = Promise.resolve();
+const hydratedRelationshipMirror = new Map<string, RelatedWorkMetadata[]>();
+const relationshipDependencyIndex = new RelationshipMetadataDependencyIndex();
+const writeQueue = new SerializedTaskQueue();
 
-function parseMetadata(value: string | null): RelatedWorkMetadata | null {
-  if (!value) return null;
-  try {
-    return JSON.parse(value) as RelatedWorkMetadata;
-  } catch {
-    return null;
+interface ExternalWorkUpsertRow {
+  identityKey: string;
+  metadataJSON: string;
+  fetchedAt: string;
+}
+
+interface ExternalWorkFailureUpsertRow {
+  identityKey: string;
+  status: Exclude<ExternalWorkCacheStatus, "success">;
+  fetchedAt: string;
+  nextRetryAt: string;
+  failureCount: number;
+  errorMessage: string;
+}
+
+function chunkValues<T>(values: readonly T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let start = 0; start < values.length; start += size) {
+    chunks.push(values.slice(start, start + size));
   }
+  return chunks;
+}
+
+function registerRelationshipDependencies(
+  relationshipKey: string,
+  works: readonly RelatedWorkMetadata[],
+): void {
+  relationshipDependencyIndex.register(
+    relationshipKey,
+    works.flatMap((work) => stableWorkAliases(work)),
+  );
+}
+
+/**
+ * Invalidate only relationship lists that have actually been hydrated in this
+ * session and that contain one of the updated papers. The previous global
+ * revision invalidated every large relationship list after every summary
+ * batch, which made normal item navigation repeatedly rebuild thousands of
+ * merged records.
+ */
+export function invalidateExternalRelationshipMetadata(
+  identityKeys: Iterable<string>,
+): void {
+  for (const relationshipKey of relationshipDependencyIndex.affectedRelationships(
+    identityKeys,
+  )) {
+    hydratedRelationshipMirror.delete(relationshipKey);
+  }
+}
+
+async function upsertExternalWorkRows(
+  connection: _ZoteroTypes.DBConnection,
+  rows: readonly ExternalWorkUpsertRow[],
+): Promise<void> {
+  for (const batch of chunkValues(rows, EXTERNAL_WORK_UPSERT_BATCH_SIZE)) {
+    const placeholders = batch.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(", ");
+    const parameters = batch.flatMap((row) => [
+      row.identityKey,
+      "success",
+      row.metadataJSON,
+      row.fetchedAt,
+      null,
+      0,
+      null,
+    ]);
+    await connection.queryAsync(
+      `INSERT OR REPLACE INTO external_works_v2
+       (identity_key, status, metadata_json, fetched_at, next_retry_at, failure_count, error_message)
+       VALUES ${placeholders}`,
+      parameters,
+    );
+  }
+}
+
+async function upsertExternalWorkFailureRows(
+  connection: _ZoteroTypes.DBConnection,
+  rows: readonly ExternalWorkFailureUpsertRow[],
+): Promise<void> {
+  for (const batch of chunkValues(rows, EXTERNAL_WORK_UPSERT_BATCH_SIZE)) {
+    const placeholders = batch.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(", ");
+    const parameters = batch.flatMap((row) => [
+      row.identityKey,
+      row.status,
+      null,
+      row.fetchedAt,
+      row.nextRetryAt,
+      row.failureCount,
+      row.errorMessage,
+    ]);
+    await connection.queryAsync(
+      `INSERT OR REPLACE INTO external_works_v2
+       (identity_key, status, metadata_json, fetched_at, next_retry_at, failure_count, error_message)
+       VALUES ${placeholders}`,
+      parameters,
+    );
+  }
+}
+
+function cacheStatus(value: string, context: string): ExternalWorkCacheStatus {
+  if (
+    value === "success" ||
+    value === "not-found" ||
+    value === "rate-limited" ||
+    value === "network-error" ||
+    value === "provider-error"
+  ) {
+    return value;
+  }
+  throw new Error(`${context} has unknown status ${value}.`);
 }
 
 function rowToEntry(row: ExternalWorkCacheRow): ExternalWorkCacheEntry {
+  const identityKey = String(row.identity_key);
+  const context = `external_works_v2[${identityKey}]`;
+  const status = cacheStatus(row.status, context);
+  const metadata = row.metadata_json
+    ? decodeRelatedWorkMetadataJSON(row.metadata_json, `${context}.metadata`)
+    : null;
+  if (status === "success" && !metadata) {
+    throw new Error(`${context} is successful but has no metadata.`);
+  }
   return {
-    identityKey: String(row.identity_key),
-    status: row.status === "success" ? "success" : "not-found",
-    metadata: parseMetadata(row.metadata_json),
+    identityKey,
+    status,
+    metadata,
     fetchedAt: String(row.fetched_at),
     nextRetryAt: row.next_retry_at,
+    failureCount: Number(row.failure_count ?? 0),
+    errorMessage: row.error_message,
   };
-}
-
-function parseRelationshipWorks(
-  relationshipKey: string,
-  value: string,
-): RelatedWorkMetadata[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value) as unknown;
-  } catch (error) {
-    throw new Error(
-      `Citation Map relationship cache contains invalid JSON for ${relationshipKey}: ${String(error)}`,
-      { cause: error },
-    );
-  }
-  if (!Array.isArray(parsed)) {
-    throw new TypeError(
-      `Citation Map relationship cache entry ${relationshipKey} is not an array.`,
-    );
-  }
-  return parsed as RelatedWorkMetadata[];
-}
-
-function relationshipIdentity(work: RelatedWorkMetadata): string {
-  const sharedIdentity = externalWorkCacheIdentity(work);
-  if (sharedIdentity) return sharedIdentity;
-  const localKey = (work.inLibraryItemKey ?? work.zoteroItemKey)?.trim();
-  if (localKey) return `zotero:${localKey.toLocaleUpperCase()}`;
-  const pmid = String(work.pmid ?? "")
-    .trim()
-    .toLocaleLowerCase();
-  if (pmid) return `pmid:${pmid}`;
-  const arxiv = String(work.arxiv ?? "")
-    .trim()
-    .toLocaleLowerCase();
-  if (arxiv) return `arxiv:${arxiv}`;
-  const isbn = String(work.isbn ?? "")
-    .replace(/[-\s]/g, "")
-    .toLocaleLowerCase();
-  if (isbn) return `isbn:${isbn}`;
-  return `${work.provider}:unknown:${JSON.stringify([work.authors.slice(0, 2), work.year])}`;
-}
-
-function cloneWork(work: RelatedWorkMetadata): RelatedWorkMetadata {
-  return {
-    ...work,
-    authors: [...work.authors],
-    authorIDs: [...(work.authorIDs ?? [])],
-    citationCountsByYear: [...(work.citationCountsByYear ?? [])],
-    references: work.references?.map((reference) => cloneWork(reference)),
-    dataSources: [...(work.dataSources ?? [])],
-  };
-}
-
-function nonEmptyArray<T>(
-  incoming: T[] | null | undefined,
-  existing: T[] | null | undefined,
-): T[] | undefined {
-  if (incoming?.length) return [...incoming];
-  if (existing?.length) return [...existing];
-  return incoming ?? existing ?? undefined;
 }
 
 function mergeCachedMetadata(
   existing: RelatedWorkMetadata | null | undefined,
   incoming: RelatedWorkMetadata,
 ): RelatedWorkMetadata {
-  if (!existing) return cloneWork(incoming);
-  const incomingTitle = String(incoming.title ?? "").trim();
-  const incomingSource = String(incoming.sourceTitle ?? "").trim();
-  const incomingAbstract = String(incoming.abstract ?? "").trim();
-  const incomingReferences = incoming.references ?? [];
-  const existingReferences = existing.references ?? [];
-  const references =
-    incomingReferences.length >= existingReferences.length
-      ? incomingReferences
-      : existingReferences;
-  return {
-    ...existing,
-    ...incoming,
-    providerWorkID: incoming.providerWorkID ?? existing.providerWorkID,
-    doi: incoming.doi ?? existing.doi,
-    pmid: incoming.pmid ?? existing.pmid,
-    arxiv: incoming.arxiv ?? existing.arxiv,
-    isbn: incoming.isbn ?? existing.isbn,
-    title: incomingTitle ? incoming.title : existing.title,
-    year: incoming.year ?? existing.year,
-    authors: incoming.authors.length
-      ? [...incoming.authors]
-      : [...existing.authors],
-    authorIDs: [
-      ...new Set([
-        ...(existing.authorIDs ?? []),
-        ...(incoming.authorIDs ?? []),
-      ]),
-    ],
-    sourceTitle: incomingSource ? incoming.sourceTitle : existing.sourceTitle,
-    abstract: incomingAbstract ? incoming.abstract : existing.abstract,
-    citationCount: incoming.citationCount ?? existing.citationCount,
-    referenceCount: incoming.referenceCount ?? existing.referenceCount,
-    citationCountsByYear: nonEmptyArray(
-      incoming.citationCountsByYear,
-      existing.citationCountsByYear,
-    ),
-    references: references.map((reference) => cloneWork(reference)),
-    resolvedReferenceCount:
-      incoming.resolvedReferenceCount ?? existing.resolvedReferenceCount,
-    fwci: incoming.fwci ?? existing.fwci,
-    citationPercentile:
-      incoming.citationPercentile ?? existing.citationPercentile,
-    isTop1Percent: incoming.isTop1Percent ?? existing.isTop1Percent,
-    isTop10Percent: incoming.isTop10Percent ?? existing.isTop10Percent,
-    citationsLastYear: incoming.citationsLastYear ?? existing.citationsLastYear,
-    citationVelocity: incoming.citationVelocity ?? existing.citationVelocity,
-    citationAcceleration:
-      incoming.citationAcceleration ?? existing.citationAcceleration,
-    influentialCitationCount:
-      incoming.influentialCitationCount ?? existing.influentialCitationCount,
-    publicationType: incoming.publicationType ?? existing.publicationType,
-    sourceMetrics: incoming.sourceMetrics ?? existing.sourceMetrics,
-    referenceAgeMean: incoming.referenceAgeMean ?? existing.referenceAgeMean,
-    referenceAgeSpread:
-      incoming.referenceAgeSpread ?? existing.referenceAgeSpread,
-    selfCitationEstimate:
-      incoming.selfCitationEstimate ?? existing.selfCitationEstimate,
-    futureReferenceCount:
-      incoming.futureReferenceCount ?? existing.futureReferenceCount,
-    metadataCompleteness:
-      incoming.metadataCompleteness ?? existing.metadataCompleteness,
-    isOpenAccess: incoming.isOpenAccess ?? existing.isOpenAccess,
-    openAccessStatus: incoming.openAccessStatus ?? existing.openAccessStatus,
-    isRetracted: incoming.isRetracted ?? existing.isRetracted,
-    zoteroItemKey: incoming.zoteroItemKey ?? existing.zoteroItemKey,
-    inLibraryItemKey:
-      incoming.inLibraryItemKey ?? existing.inLibraryItemKey ?? null,
-    dataSources: [
-      ...new Set([
-        ...(existing.dataSources ?? []),
-        ...(incoming.dataSources ?? []),
-      ]),
-    ],
-    updatedAt: incoming.updatedAt ?? existing.updatedAt,
-  };
+  return mergeRelatedWorkRecords(existing, incoming, CACHE_RELATED_WORK_MERGE);
 }
 
 /**
@@ -227,12 +238,13 @@ function compactRelationshipWork(
   return {
     provider: work.provider,
     providerWorkID: work.providerWorkID,
-    doi: normalizeDOI(work.doi),
+    doi: work.doi,
     pmid: work.pmid ?? null,
     arxiv: work.arxiv ?? null,
     isbn: work.isbn ?? null,
     title: work.title,
     year: work.year,
+    publicationDate: work.publicationDate ?? null,
     authors: work.authors.slice(0, 2),
     zoteroItemKey: work.zoteroItemKey ?? null,
     inLibraryItemKey: work.inLibraryItemKey ?? null,
@@ -244,9 +256,10 @@ function compactRelationshipWork(
 function hydrateRelationshipWork(
   compact: RelatedWorkMetadata,
 ): RelatedWorkMetadata {
-  const cached = mirror.get(relationshipIdentity(compact));
+  const identity = stableExternalWorkIdentity(compact);
+  const cached = identity ? mirror.get(identity) : null;
   const metadata = cached?.status === "success" ? cached.metadata : null;
-  if (!metadata) return cloneWork(compact);
+  if (!metadata) return cloneRelatedWorkMetadata(compact);
   const merged = mergeCachedMetadata(compact, metadata);
   return {
     ...merged,
@@ -266,7 +279,7 @@ function deduplicateRelationshipWorks(
 ): RelatedWorkMetadata[] {
   const unique = new Map<string, RelatedWorkMetadata>();
   for (const work of works) {
-    const key = relationshipIdentity(work);
+    const key = relationshipCandidateIdentity(work);
     unique.set(key, mergeCachedMetadata(unique.get(key), work));
   }
   return [...unique.values()];
@@ -276,9 +289,13 @@ function rowToRelationshipEntry(
   row: ExternalRelationshipCacheRow,
 ): ExternalRelationshipCacheEntry {
   const relationshipKey = String(row.relationship_key);
+  const works = decodeRelatedWorkArrayJSON(
+    row.works_json,
+    `external_relationships_v2[${relationshipKey}].works`,
+  );
   return {
     relationshipKey,
-    works: parseRelationshipWorks(relationshipKey, row.works_json),
+    works,
     fetchedAt: String(row.fetched_at),
   };
 }
@@ -296,50 +313,72 @@ async function ensureExternalWorkCache(): Promise<boolean> {
   return initialized && !closing;
 }
 
-function queueWrite(task: () => Promise<void>): Promise<void> {
-  const previous = writeTail.catch(() => undefined);
-  const next = previous.then(async () => {
-    if (!(await ensureExternalWorkCache())) return;
-    await task();
+function queueWrite<T>(task: () => Promise<T>): Promise<T> {
+  return writeQueue.enqueue(async () => {
+    if (!(await ensureExternalWorkCache())) {
+      throw new Error("Citation Map external-work cache is closing.");
+    }
+    return task();
   });
-  writeTail = next.catch(() => undefined);
-  return next;
 }
 
 export function initExternalWorkCache(): Promise<void> {
   if (initialized) return Promise.resolve();
   if (initPromise) return initPromise;
   closing = false;
+  writeQueue.reopen();
   initPromise = (async () => {
     const connection = new Zotero.DBConnection("citationmap-external");
-    for (const statement of SCHEMA.split(";")
-      .map((part) => part.trim())
-      .filter(Boolean)) {
-      await connection.queryAsync(statement);
+    try {
+      for (const statement of SCHEMA.split(";")
+        .map((part) => part.trim())
+        .filter(Boolean)) {
+        await connection.queryAsync(statement);
+      }
+      const rows = (await connection.queryAsync(
+        "SELECT * FROM external_works_v2",
+      )) as ExternalWorkCacheRow[];
+      const relationshipRows = (await connection.queryAsync(
+        "SELECT * FROM external_relationships_v2",
+      )) as ExternalRelationshipCacheRow[];
+      const nextMirror = new Map<string, ExternalWorkCacheEntry>();
+      for (const row of rows) {
+        try {
+          const entry = rowToEntry(row);
+          nextMirror.set(entry.identityKey, entry);
+        } catch (error) {
+          Zotero.logError(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        }
+      }
+      const nextRelationshipMirror = new Map<
+        string,
+        ExternalRelationshipCacheEntry
+      >();
+      for (const row of relationshipRows) {
+        try {
+          const entry = rowToRelationshipEntry(row);
+          nextRelationshipMirror.set(entry.relationshipKey, entry);
+        } catch (error) {
+          Zotero.logError(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        }
+      }
+      db = connection;
+      mirror = nextMirror;
+      relationshipMirror = nextRelationshipMirror;
+      hydratedRelationshipMirror.clear();
+      relationshipDependencyIndex.clear();
+      initialized = true;
+      Zotero.debug(
+        `Citation Map: external cache initialized with ${mirror.size} works and ${relationshipMirror.size} relationship lists`,
+      );
+    } catch (error) {
+      await connection.closeDatabase(true).catch(() => undefined);
+      throw error;
     }
-    const rows = (await connection.queryAsync(
-      "SELECT * FROM external_works",
-    )) as ExternalWorkCacheRow[];
-    const relationshipRows = (await connection.queryAsync(
-      "SELECT * FROM external_relationships",
-    )) as ExternalRelationshipCacheRow[];
-    mirror = new Map(
-      rows.map((row) => {
-        const entry = rowToEntry(row);
-        return [entry.identityKey, entry];
-      }),
-    );
-    relationshipMirror = new Map(
-      relationshipRows.map((row) => {
-        const entry = rowToRelationshipEntry(row);
-        return [entry.relationshipKey, entry];
-      }),
-    );
-    db = connection;
-    initialized = true;
-    Zotero.debug(
-      `Citation Map: external cache initialized with ${mirror.size} works and ${relationshipMirror.size} relationship lists`,
-    );
   })().finally(() => {
     initPromise = null;
   });
@@ -349,35 +388,54 @@ export function initExternalWorkCache(): Promise<void> {
 export async function closeExternalWorkCache(): Promise<void> {
   closing = true;
   if (initPromise) await initPromise.catch(() => undefined);
-  await writeTail.catch(() => undefined);
+  writeQueue.close();
+  await writeQueue.drain();
   const connection = db;
   db = null;
   initialized = false;
   mirror.clear();
   relationshipMirror.clear();
-  if (connection) await connection.closeDatabase().catch(() => undefined);
+  hydratedRelationshipMirror.clear();
+  relationshipDependencyIndex.clear();
+  if (connection) await connection.closeDatabase(true).catch(() => undefined);
 }
 
 export async function clearExternalWorkCache(): Promise<void> {
   if (!(await ensureExternalWorkCache())) return;
-  mirror.clear();
-  relationshipMirror.clear();
   await queueWrite(async () => {
-    await requireDB().queryAsync("DELETE FROM external_works");
-    await requireDB().queryAsync("DELETE FROM external_relationships");
+    const connection = requireDB();
+    await connection.executeTransaction(async () => {
+      await connection.queryAsync("DELETE FROM external_works_v2");
+      await connection.queryAsync("DELETE FROM external_relationships_v2");
+    });
+    mirror.clear();
+    relationshipMirror.clear();
+    hydratedRelationshipMirror.clear();
+    relationshipDependencyIndex.clear();
   });
+}
+
+export function getExternalRelationshipCacheSize(
+  relationshipKey: string,
+): number {
+  return relationshipMirror.get(relationshipKey)?.works.length ?? 0;
 }
 
 export function getExternalRelationshipCacheEntry(
   relationshipKey: string,
 ): ExternalRelationshipCacheEntry | null {
   const entry = relationshipMirror.get(relationshipKey);
-  return entry
-    ? {
-        ...entry,
-        works: entry.works.map((work) => hydrateRelationshipWork(work)),
-      }
-    : null;
+  if (!entry) return null;
+  let works = hydratedRelationshipMirror.get(relationshipKey);
+  if (!works) {
+    works = entry.works.map((work) => hydrateRelationshipWork(work));
+    hydratedRelationshipMirror.set(relationshipKey, works);
+    registerRelationshipDependencies(relationshipKey, entry.works);
+  }
+  return {
+    ...entry,
+    works: works.map((work) => cloneRelatedWorkMetadata(work)),
+  };
 }
 
 /**
@@ -388,48 +446,79 @@ export function getExternalRelationshipCacheEntry(
 export async function saveExternalRelationshipCache(
   relationshipKey: string,
   works: RelatedWorkMetadata[],
+  options: { writeMetadata?: boolean; alreadyCanonical?: boolean } = {},
 ): Promise<void> {
   if (!(await ensureExternalWorkCache())) return;
   const fetchedAt = new Date().toISOString();
-  const completeWorks = deduplicateRelationshipWorks(works);
+  const completeWorks = options.alreadyCanonical
+    ? works
+    : deduplicateRelationshipWorks(works);
+  const checkpoint = createCooperativeCheckpoint();
   const metadataByIdentity = new Map<string, RelatedWorkMetadata>();
-  for (const work of completeWorks) {
-    const identityKey = relationshipIdentity(work);
-    const previous = mirror.get(identityKey)?.metadata;
-    const metadata = mergeCachedMetadata(previous, work);
-    metadataByIdentity.set(identityKey, metadata);
-    mirror.set(identityKey, {
-      identityKey,
-      status: "success",
-      metadata,
-      fetchedAt,
-      nextRetryAt: null,
-    });
+  if (options.writeMetadata !== false) {
+    for (const [index, work] of completeWorks.entries()) {
+      const identityKey = stableExternalWorkIdentity(work);
+      if (identityKey) {
+        const previous = mirror.get(identityKey)?.metadata;
+        metadataByIdentity.set(
+          identityKey,
+          mergeCachedMetadata(previous, work),
+        );
+      }
+      await checkpoint((index + 1) % 50 === 0);
+    }
   }
-  const storedWorks = completeWorks.map(compactRelationshipWork);
-  relationshipMirror.set(relationshipKey, {
-    relationshipKey,
-    works: storedWorks,
-    fetchedAt,
-  });
+  const storedWorks: RelatedWorkMetadata[] = [];
+  for (const [index, work] of completeWorks.entries()) {
+    storedWorks.push(compactRelationshipWork(work));
+    await checkpoint((index + 1) % 100 === 0);
+  }
+  const metadataRows: ExternalWorkUpsertRow[] = [];
+  let serializedMetadataCount = 0;
+  for (const [identityKey, metadata] of metadataByIdentity) {
+    metadataRows.push({
+      identityKey,
+      metadataJSON: JSON.stringify(metadata),
+      fetchedAt,
+    });
+    serializedMetadataCount += 1;
+    await checkpoint(serializedMetadataCount % 50 === 0);
+  }
+
   await queueWrite(async () => {
     const connection = requireDB();
     await connection.executeTransaction(async () => {
-      for (const [identityKey, metadata] of metadataByIdentity) {
-        await connection.queryAsync(
-          `INSERT OR REPLACE INTO external_works
-           (identity_key, status, metadata_json, fetched_at, next_retry_at)
-           VALUES (?, ?, ?, ?, ?)`,
-          [identityKey, "success", JSON.stringify(metadata), fetchedAt, null],
-        );
-      }
+      await upsertExternalWorkRows(connection, metadataRows);
       await connection.queryAsync(
-        `INSERT OR REPLACE INTO external_relationships
+        `INSERT OR REPLACE INTO external_relationships_v2
          (relationship_key, works_json, fetched_at)
          VALUES (?, ?, ?)`,
         [relationshipKey, JSON.stringify(storedWorks), fetchedAt],
       );
     });
+
+    for (const [identityKey, metadata] of metadataByIdentity) {
+      mirror.set(identityKey, {
+        identityKey,
+        status: "success",
+        metadata,
+        fetchedAt,
+        nextRetryAt: null,
+        failureCount: 0,
+        errorMessage: null,
+      });
+    }
+    invalidateExternalRelationshipMetadata(metadataByIdentity.keys());
+    relationshipMirror.set(relationshipKey, {
+      relationshipKey,
+      works: storedWorks,
+      fetchedAt,
+    });
+    registerRelationshipDependencies(relationshipKey, storedWorks);
+    hydratedRelationshipMirror.set(
+      relationshipKey,
+      completeWorks.map((work) => cloneRelatedWorkMetadata(work)),
+    );
   });
 }
 
@@ -461,17 +550,11 @@ export function shouldResolveExternalWork(identityKey: string): boolean {
   return !Number.isFinite(nextRetryAt) || nextRetryAt <= Date.now();
 }
 
-export async function saveExternalWorkCacheSuccess(
-  identityKey: string,
-  metadata: RelatedWorkMetadata,
-): Promise<void> {
-  await saveExternalWorkCacheSuccesses([{ identityKey, metadata }]);
-}
-
 export async function saveExternalWorkCacheSuccesses(
   entries: Array<{ identityKey: string; metadata: RelatedWorkMetadata }>,
-): Promise<void> {
-  if (entries.length === 0 || !(await ensureExternalWorkCache())) return;
+  options: { invalidateRelationships?: boolean } = {},
+): Promise<string[]> {
+  if (entries.length === 0 || !(await ensureExternalWorkCache())) return [];
   const fetchedAt = new Date().toISOString();
   const unique = new Map<string, RelatedWorkMetadata>();
   for (const entry of entries) {
@@ -481,50 +564,126 @@ export async function saveExternalWorkCacheSuccesses(
       mergeCachedMetadata(previous, entry.metadata),
     );
   }
-  for (const [key, value] of unique) {
-    mirror.set(key, {
-      identityKey: key,
-      status: "success",
-      metadata: value,
+  const checkpoint = createCooperativeCheckpoint();
+  const rows: ExternalWorkUpsertRow[] = [];
+  let serializedCount = 0;
+  for (const [identityKey, metadata] of unique) {
+    rows.push({
+      identityKey,
+      metadataJSON: JSON.stringify(metadata),
       fetchedAt,
-      nextRetryAt: null,
     });
+    serializedCount += 1;
+    await checkpoint(serializedCount % 50 === 0);
   }
   await queueWrite(async () => {
     const connection = requireDB();
     await connection.executeTransaction(async () => {
-      for (const [key, value] of unique) {
-        await connection.queryAsync(
-          `INSERT OR REPLACE INTO external_works
-           (identity_key, status, metadata_json, fetched_at, next_retry_at)
-           VALUES (?, ?, ?, ?, ?)`,
-          [key, "success", JSON.stringify(value), fetchedAt, null],
-        );
-      }
+      await upsertExternalWorkRows(connection, rows);
     });
+    for (const [key, value] of unique) {
+      mirror.set(key, {
+        identityKey: key,
+        status: "success",
+        metadata: value,
+        fetchedAt,
+        nextRetryAt: null,
+        failureCount: 0,
+        errorMessage: null,
+      });
+    }
+    if (options.invalidateRelationships !== false) {
+      const aliases = new Set<string>();
+      for (const [identityKey, metadata] of unique) {
+        aliases.add(identityKey);
+        for (const alias of stableWorkAliases(metadata)) aliases.add(alias);
+      }
+      invalidateExternalRelationshipMetadata(aliases);
+    }
   });
+  return [...unique.keys()];
 }
 
 export async function saveExternalWorkCacheNotFound(
   identityKey: string,
 ): Promise<void> {
-  if (!(await ensureExternalWorkCache())) return;
-  const fetchedAt = new Date().toISOString();
-  const nextRetryAt = new Date(Date.now() + NOT_FOUND_RETRY_MS).toISOString();
-  const entry: ExternalWorkCacheEntry = {
+  await saveExternalWorkCacheFailure(
     identityKey,
-    status: "not-found",
-    metadata: null,
-    fetchedAt,
-    nextRetryAt,
-  };
-  mirror.set(identityKey, entry);
+    "not-found",
+    "No provider returned this work.",
+  );
+}
+
+function failureRetryAt(
+  status: Exclude<ExternalWorkCacheStatus, "success">,
+  failureCount: number,
+): string {
+  if (status === "not-found") {
+    return new Date(Date.now() + 30 * 86400000).toISOString();
+  }
+  const delays = [5 * 60000, 30 * 60000, 6 * 3600000, 86400000];
+  const delay = delays[Math.min(failureCount - 1, delays.length - 1)];
+  return new Date(Date.now() + delay).toISOString();
+}
+
+export async function saveExternalWorkCacheFailure(
+  identityKey: string,
+  status: Exclude<ExternalWorkCacheStatus, "success">,
+  message: string,
+): Promise<void> {
+  await saveExternalWorkCacheFailures([{ identityKey, status, message }]);
+}
+
+export async function saveExternalWorkCacheFailures(
+  failures: Array<{
+    identityKey: string;
+    status: Exclude<ExternalWorkCacheStatus, "success">;
+    message: string;
+  }>,
+  options: { invalidateRelationships?: boolean } = {},
+): Promise<void> {
+  if (failures.length === 0 || !(await ensureExternalWorkCache())) return;
+  const fetchedAt = new Date().toISOString();
+  const unique = new Map<
+    string,
+    { status: Exclude<ExternalWorkCacheStatus, "success">; message: string }
+  >();
+  for (const failure of failures) {
+    unique.set(failure.identityKey, {
+      status: failure.status,
+      message: failure.message,
+    });
+  }
+  const rows: ExternalWorkFailureUpsertRow[] = [];
+  for (const [identityKey, failure] of unique) {
+    const failureCount = (mirror.get(identityKey)?.failureCount ?? 0) + 1;
+    rows.push({
+      identityKey,
+      status: failure.status,
+      fetchedAt,
+      nextRetryAt: failureRetryAt(failure.status, failureCount),
+      failureCount,
+      errorMessage: failure.message,
+    });
+  }
   await queueWrite(async () => {
-    await requireDB().queryAsync(
-      `INSERT OR REPLACE INTO external_works
-       (identity_key, status, metadata_json, fetched_at, next_retry_at)
-       VALUES (?, ?, ?, ?, ?)`,
-      [identityKey, "not-found", null, fetchedAt, nextRetryAt],
-    );
+    const connection = requireDB();
+    await connection.executeTransaction(async () => {
+      await upsertExternalWorkFailureRows(connection, rows);
+    });
+    for (const row of rows) {
+      mirror.set(row.identityKey, {
+        identityKey: row.identityKey,
+        status: row.status,
+        metadata: null,
+        fetchedAt: row.fetchedAt,
+        nextRetryAt: row.nextRetryAt,
+        failureCount: row.failureCount,
+        errorMessage: row.errorMessage,
+      });
+    }
+    if (options.invalidateRelationships !== false) {
+      invalidateExternalRelationshipMetadata(unique.keys());
+    }
   });
 }

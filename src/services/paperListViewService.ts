@@ -5,8 +5,13 @@ import type {
   LibrarySnapshot,
   ZoteroPaper,
 } from "../domain/types";
-import type { ExternalWork } from "./externalDiscoveryService";
-import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
+import type { ExternalWork } from "../domain/externalWork";
+import {
+  comparePublicationYears,
+  firstPublicationYear,
+  publicationYearOrNull,
+} from "../domain/valueNormalization";
+import { normalizeDOI, normalizeExactTitle } from "../domain/workIdentity";
 import { createCitationMapIcon } from "./uiIconService";
 import {
   relationshipSortOptions,
@@ -79,6 +84,7 @@ export interface PaperFilterController {
   matches(descriptor: PaperListDescriptor): boolean;
   state(): PaperListFilterState;
   hasActiveFilters(): boolean;
+  setCollectionID(collectionID: number | null): void;
   reset(): void;
   destroy(): void;
 }
@@ -276,7 +282,7 @@ export function describeZoteroPaper(
     title: paper.title || "Title unavailable",
     authors: paper.authors,
     sourceTitle: paper.sourceTitle,
-    year: paper.year,
+    year: publicationYearOrNull(paper.year),
     citationCount: paper.metrics.citationCount,
     referenceCount: paper.metrics.referenceCount,
     dateAdded: dateOrNull(itemField(item, "dateAdded")),
@@ -328,10 +334,7 @@ export function describeExternalWork(
         localPaper?.sourceTitle ??
         itemField(item, "publicationTitle")) ||
       null,
-    year:
-      work.year ??
-      localPaper?.year ??
-      (Number.isFinite(localYear) && localYear > 0 ? localYear : null),
+    year: firstPublicationYear(work.year, localPaper?.year, localYear),
     citationCount:
       work.citationCount ?? localPaper?.metrics.citationCount ?? null,
     referenceCount:
@@ -576,10 +579,10 @@ function sortDescriptors<T>(
       let comparison = 0;
       switch (key) {
         case "newest":
-          comparison = compareNullable(a.year, b.year, true);
+          comparison = comparePublicationYears(a.year, b.year, "descending");
           break;
         case "oldest":
-          comparison = compareNullable(a.year, b.year, false);
+          comparison = comparePublicationYears(a.year, b.year, "ascending");
           break;
         case "date-saved":
           comparison = compareNullable(a.dateAdded, b.dateAdded, true);
@@ -618,7 +621,7 @@ function descriptorSearchText(descriptor: PaperListDescriptor): string {
       descriptor.title,
       descriptor.authors.join(" "),
       descriptor.sourceTitle ?? "",
-      descriptor.year ?? "",
+      publicationYearOrNull(descriptor.year) ?? "",
       descriptor.itemType ?? "",
       descriptor.tags.join(" "),
     ].join(" "),
@@ -898,10 +901,8 @@ export function createPaperFilterController(
     }
 
     const years = latestDescriptors
-      .map((entry) => entry.year)
-      .filter(
-        (entry): entry is number => entry !== null && Number.isFinite(entry),
-      );
+      .map((entry) => publicationYearOrNull(entry.year))
+      .filter((entry): entry is number => entry !== null);
     const currentYear = new Date().getFullYear();
     const minimumYear = years.length ? Math.min(...years) : currentYear - 100;
     const maximumYear = years.length ? Math.max(...years) : currentYear;
@@ -1120,13 +1121,14 @@ export function createPaperFilterController(
     if (filters.itemType && descriptor.itemType !== filters.itemType) {
       return false;
     }
-    if (descriptor.year === null) {
+    const year = publicationYearOrNull(descriptor.year);
+    if (year === null) {
       if (!filters.includeMissingYear) return false;
     } else {
-      if (filters.yearMin !== null && descriptor.year < filters.yearMin) {
+      if (filters.yearMin !== null && year < filters.yearMin) {
         return false;
       }
-      if (filters.yearMax !== null && descriptor.year > filters.yearMax) {
+      if (filters.yearMax !== null && year > filters.yearMax) {
         return false;
       }
     }
@@ -1154,6 +1156,17 @@ export function createPaperFilterController(
     matches,
     state: () => ({ ...filters }),
     hasActiveFilters: () => activeFilterCount(filters) > 0,
+    setCollectionID: (collectionID) => {
+      const normalized =
+        collectionID !== null && Number.isInteger(collectionID)
+          ? collectionID
+          : null;
+      if (filters.collectionID === normalized) return;
+      filters.collectionID = normalized;
+      updateFilterButton();
+      filterPopup.close();
+      options.onChange();
+    },
     reset: () => {
       filters = defaultFilterState();
       updateFilterButton();

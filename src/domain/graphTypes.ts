@@ -8,6 +8,7 @@ import type {
 
 export type MetricID =
   | "year"
+  | "citation-sequence"
   | "citations"
   | "references"
   | "citations-last-year"
@@ -47,15 +48,24 @@ export type GraphNodeColorMetric =
   | MetricID;
 export type GraphNodeLabelMode = "title" | "author-year" | "none";
 
+export type CitationGraphNodeKind = "local" | "external";
+export type CitationGraphFocusRole = "seed" | "reference" | "cited-by" | "both";
+
 export interface CitationGraphNode {
   key: string;
   itemID: number;
   itemKey: string;
+  kind?: CitationGraphNodeKind;
+  focusRole?: CitationGraphFocusRole | null;
+  externalWork?: RelatedWorkMetadata | null;
   title: string;
   abstract: string | null;
   sourceTitle: string | null;
   authors: string[];
   year: number | null;
+  publicationDate: string | null;
+  /** Context-derived ordinal publication/citation position. */
+  citationSequence: number | null;
   doi: string | null;
   tags: string[];
   collectionIDs: number[];
@@ -91,17 +101,23 @@ export interface CitationGraphNode {
   outgoingLibraryReferences: number;
   libraryCoverage: number | null;
   localGlobalImpactRatio: number | null;
-  pageRank: number;
-  betweennessCentrality: number;
-  eigenvectorCentrality: number;
-  componentSize: number;
-  citationChainDepth: number;
   isIsolated: boolean;
   referenceAgeMean: number | null;
   referenceAgeSpread: number | null;
   selfCitationEstimate: number | null;
   futureReferenceCount: number | null;
   references: RelatedWorkMetadata[];
+}
+
+export interface GhostPreview {
+  key: string;
+  title: string;
+  authors: string[];
+  year: number | null;
+  citationCount: number | null;
+  referenceCount: number | null;
+  sourceKeys: string[];
+  contextLabel?: string;
 }
 
 export interface CitationGraphEdge {

@@ -8,3 +8,4 @@ dist/
 FILE_MANIFEST.sha256
 .DS_Store
 TODO.md
+tsconfig.tsbuildinfo

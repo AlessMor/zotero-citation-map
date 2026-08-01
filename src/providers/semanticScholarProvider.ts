@@ -5,35 +5,17 @@ import type {
   WorkIdentifiers,
 } from "../domain/citationTypes";
 import {
-  metadataIsNonContradictory,
-  normalizeDOI,
+  matchWorkIdentifiers,
   normalizeExactTitle,
-} from "../services/citationIdentifiers";
+} from "../domain/workIdentity";
 import { requestJSON } from "./http";
-import type { CitationProvider } from "./types";
+import {
+  semanticScholarWork as toRelated,
+  type SemanticScholarPaper as S2Paper,
+} from "./semanticScholarMapper";
+import type { CitationProvider, ProviderRequestOptions } from "./types";
 import { failureStatusFromHTTP, numberOrNull, stringOrNull } from "./types";
 
-interface S2Author {
-  authorId?: string;
-  name?: string;
-}
-interface S2Paper {
-  paperId?: string;
-  externalIds?: { DOI?: string; PubMed?: string; ArXiv?: string };
-  title?: string;
-  abstract?: string;
-  year?: number;
-  authors?: S2Author[];
-  venue?: string;
-  publicationVenue?: { name?: string };
-  citationCount?: number;
-  referenceCount?: number;
-  influentialCitationCount?: number;
-  isOpenAccess?: boolean;
-  openAccessPdf?: { url?: string } | null;
-  publicationTypes?: string[];
-  matchScore?: number;
-}
 interface S2SearchResponse {
   data?: S2Paper[];
 }
@@ -60,6 +42,7 @@ const BASIC_FIELDS = [
   "title",
   "abstract",
   "year",
+  "publicationDate",
   "authors",
   "venue",
   "publicationVenue",
@@ -76,6 +59,7 @@ const RELATIONSHIP_FIELDS = [
   "externalIds",
   "title",
   "year",
+  "publicationDate",
   "authors",
   "venue",
   "publicationVenue",
@@ -86,43 +70,9 @@ const RELATIONSHIP_FIELDS = [
   "publicationTypes",
 ].join(",");
 
-function authors(paper: S2Paper): string[] {
-  return (paper.authors ?? [])
-    .map((author) => String(author.name ?? "").trim())
-    .filter(Boolean);
-}
-
-function toRelated(paper: S2Paper): RelatedWorkMetadata | null {
-  const title = stringOrNull(paper.title);
-  const paperID = stringOrNull(paper.paperId);
-  if (!title || !paperID) return null;
-  return {
-    provider: "semantic-scholar",
-    providerWorkID: paperID,
-    doi: normalizeDOI(paper.externalIds?.DOI),
-    pmid: stringOrNull(paper.externalIds?.PubMed),
-    arxiv: stringOrNull(paper.externalIds?.ArXiv),
-    title,
-    year: numberOrNull(paper.year),
-    authors: authors(paper),
-    authorIDs: (paper.authors ?? [])
-      .map((author) => String(author.authorId ?? "").trim())
-      .filter(Boolean),
-    sourceTitle: stringOrNull(paper.publicationVenue?.name ?? paper.venue),
-    abstract: stringOrNull(paper.abstract),
-    citationCount: numberOrNull(paper.citationCount),
-    referenceCount: numberOrNull(paper.referenceCount),
-    influentialCitationCount: numberOrNull(paper.influentialCitationCount),
-    publicationType: stringOrNull(paper.publicationTypes?.join(", ")),
-    isOpenAccess:
-      typeof paper.isOpenAccess === "boolean" ? paper.isOpenAccess : null,
-    openAccessStatus: paper.isOpenAccess ? "open" : null,
-    isRetracted: null,
-  };
-}
-
 export async function fetchSemanticScholarPapersBatch(
   identifiers: string[],
+  options?: ProviderRequestOptions,
 ): Promise<Array<RelatedWorkMetadata | null>> {
   if (!identifiers.length) return [];
   if (identifiers.length > SEMANTIC_SCHOLAR_BATCH_LIMIT) {
@@ -137,6 +87,7 @@ export async function fetchSemanticScholarPapersBatch(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: { ids: identifiers },
+      signal: options?.signal,
     },
   );
   if (!response.ok || !Array.isArray(response.data)) {
@@ -155,10 +106,12 @@ async function fetchRelations(
   kind: "references" | "citations",
   maximum: number,
   offset = 0,
+  options?: ProviderRequestOptions,
 ): Promise<RelatedWorkMetadata[]> {
   const response = await requestJSON<S2RelationResponse>(
     "semantic-scholar",
     `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(paperID)}/${kind}?offset=${Math.max(0, offset)}&limit=${Math.min(MAX_RELATION_PAGE_SIZE, maximum)}&fields=${encodeURIComponent(RELATIONSHIP_FIELDS)}`,
+    { signal: options?.signal },
   );
   if (!response.ok || !response.data) return [];
   return (response.data.data ?? [])
@@ -177,12 +130,19 @@ async function successFromPaper(
   matchedBy: "doi" | "pmid" | "arxiv" | "isbn" | "title",
   confidence: number,
   includeReferences = false,
+  options?: ProviderRequestOptions,
 ): Promise<ProviderLookupSuccess> {
   const related = toRelated(paper);
   const paperID = String(paper.paperId ?? "");
   const references =
     includeReferences && paperID
-      ? await fetchRelations(paperID, "references", BACKGROUND_REFERENCE_LIMIT)
+      ? await fetchRelations(
+          paperID,
+          "references",
+          BACKGROUND_REFERENCE_LIMIT,
+          0,
+          options,
+        )
       : [];
   return {
     status: "success",
@@ -193,6 +153,7 @@ async function successFromPaper(
     doi: related?.doi ?? null,
     title: related?.title ?? null,
     year: related?.year ?? null,
+    publicationDate: related?.publicationDate ?? null,
     authors: related?.authors ?? [],
     sourceTitle: related?.sourceTitle ?? null,
     abstract: related?.abstract ?? null,
@@ -237,6 +198,7 @@ function identifier(identifiers: WorkIdentifiers): {
 async function lookupPaper(
   identifiers: WorkIdentifiers,
   includeReferences: boolean,
+  options?: ProviderRequestOptions,
 ): Promise<ProviderLookupResult> {
   const selected = identifier(identifiers);
   if (!selected) {
@@ -249,6 +211,7 @@ async function lookupPaper(
   const response = await requestJSON<S2Paper>(
     "semantic-scholar",
     `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(selected.value)}?fields=${encodeURIComponent(BASIC_FIELDS)}`,
+    { signal: options?.signal },
   );
   if (!response.ok || !response.data?.paperId) {
     return {
@@ -263,19 +226,22 @@ async function lookupPaper(
     selected.kind,
     selected.kind === "doi" ? 1 : 0.98,
     includeReferences,
+    options,
   );
 }
 
 async function lookup(
   identifiers: WorkIdentifiers,
+  options?: ProviderRequestOptions,
 ): Promise<ProviderLookupResult> {
-  return lookupPaper(identifiers, false);
+  return lookupPaper(identifiers, false, options);
 }
 
 async function lookupForRelations(
   identifiers: WorkIdentifiers,
+  options?: ProviderRequestOptions,
 ): Promise<ProviderLookupResult> {
-  return lookupPaper(identifiers, false);
+  return lookupPaper(identifiers, false, options);
 }
 
 function titleTokens(value: string | null | undefined): Set<string> {
@@ -307,12 +273,14 @@ function titleSimilarity(
 
 async function searchClosestTitle(
   identifiers: WorkIdentifiers,
+  options?: ProviderRequestOptions,
 ): Promise<S2Paper | null> {
   const title = String(identifiers.title ?? "").trim();
   if (!title) return null;
   const response = await requestJSON<S2Paper>(
     "semantic-scholar",
     `https://api.semanticscholar.org/graph/v1/paper/search/match?query=${encodeURIComponent(title)}&fields=${encodeURIComponent(BASIC_FIELDS)}`,
+    { signal: options?.signal },
   );
   if (!response.ok || !response.data?.paperId) return null;
   const candidate = response.data;
@@ -321,12 +289,11 @@ async function searchClosestTitle(
   const matchScore = Number(candidate.matchScore);
   const scoreIsUseful = Number.isFinite(matchScore) && matchScore >= 0.7;
   if (!exact && similarity < 0.72 && !scoreIsUseful) return null;
+  const candidateWork = toRelated(candidate);
   if (
     (identifiers.year !== null || identifiers.authors.length > 0) &&
-    !metadataIsNonContradictory(identifiers, {
-      year: numberOrNull(candidate.year),
-      authors: authors(candidate),
-    })
+    (!candidateWork ||
+      matchWorkIdentifiers(identifiers, candidateWork).decision !== "same-work")
   ) {
     return null;
   }
@@ -335,10 +302,12 @@ async function searchClosestTitle(
 
 async function searchExactTitle(
   identifiers: WorkIdentifiers,
+  options?: ProviderRequestOptions,
 ): Promise<ProviderLookupResult> {
   const response = await requestJSON<S2SearchResponse>(
     "semantic-scholar",
     `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(identifiers.title)}&limit=20&fields=${encodeURIComponent(BASIC_FIELDS)}`,
+    { signal: options?.signal },
   );
   if (!response.ok || !response.data) {
     return {
@@ -350,14 +319,14 @@ async function searchExactTitle(
   const exactPapers = (response.data.data ?? []).filter(
     (paper) => normalizeExactTitle(paper.title) === identifiers.normalizedTitle,
   );
-  const compatible = exactPapers.filter((paper) =>
-    metadataIsNonContradictory(identifiers, {
-      year: numberOrNull(paper.year),
-      authors: authors(paper),
-    }),
-  );
+  const compatible = exactPapers.filter((paper) => {
+    const work = toRelated(paper);
+    return Boolean(
+      work && matchWorkIdentifiers(identifiers, work).decision === "same-work",
+    );
+  });
   if (compatible.length === 1) {
-    return successFromPaper(compatible[0], "title", 0.92);
+    return successFromPaper(compatible[0], "title", 0.92, false, options);
   }
   const candidates = exactPapers
     .map(toRelated)
@@ -377,7 +346,7 @@ async function searchExactTitle(
   // Similar-paper discovery must also work for a title-only Zotero item. The
   // match endpoint supplies the closest paper even when punctuation, subtitle,
   // or indexing differences prevent strict normalized equality.
-  const closest = await searchClosestTitle(identifiers);
+  const closest = await searchClosestTitle(identifiers, options);
   if (closest) {
     const confidence = Math.max(
       0.75,
@@ -387,7 +356,7 @@ async function searchExactTitle(
           titleSimilarity(identifiers.title, closest.title),
       ),
     );
-    return successFromPaper(closest, "title", confidence);
+    return successFromPaper(closest, "title", confidence, false, options);
   }
 
   return {
@@ -402,18 +371,20 @@ async function searchExactTitle(
  * title-match endpoint when no external identifier is available. */
 export async function resolveSemanticScholarPaperID(
   identifiers: WorkIdentifiers,
+  options?: ProviderRequestOptions,
 ): Promise<string | null> {
   const selected = identifier(identifiers);
   if (selected) {
     const response = await requestJSON<S2Paper>(
       "semantic-scholar",
       `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(selected.value)}?fields=paperId,title,year,authors`,
+      { signal: options?.signal },
     );
     if (response.ok && response.data?.paperId) {
       return String(response.data.paperId);
     }
   }
-  const closest = await searchClosestTitle(identifiers);
+  const closest = await searchClosestTitle(identifiers, options);
   return stringOrNull(closest?.paperId);
 }
 
@@ -422,10 +393,11 @@ export async function resolveSemanticScholarPaperID(
 export async function fetchSemanticScholarRecommendations(
   seeds: WorkIdentifiers[],
   maximum = 100,
+  options?: ProviderRequestOptions,
 ): Promise<RelatedWorkMetadata[]> {
   const positivePaperIds: string[] = [];
   for (const seed of seeds.slice(0, 100)) {
-    const paperID = await resolveSemanticScholarPaperID(seed);
+    const paperID = await resolveSemanticScholarPaperID(seed, options);
     if (paperID && !positivePaperIds.includes(paperID)) {
       positivePaperIds.push(paperID);
     }
@@ -440,6 +412,7 @@ export async function fetchSemanticScholarRecommendations(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: { positivePaperIds, negativePaperIds: [] },
+      signal: options?.signal,
     },
   );
   if (!response.ok || !response.data) return [];
@@ -473,8 +446,8 @@ export const semanticScholarProvider: CitationProvider = {
   lookup,
   lookupForRelations,
   searchExactTitle,
-  fetchCitingWorks: (paperID, maximum, offset) =>
-    fetchRelations(paperID, "citations", maximum, offset),
-  fetchReferencedWorks: (paperID, maximum, offset) =>
-    fetchRelations(paperID, "references", maximum, offset),
+  fetchCitingWorks: (paperID, maximum, offset, options) =>
+    fetchRelations(paperID, "citations", maximum, offset, options),
+  fetchReferencedWorks: (paperID, maximum, offset, options) =>
+    fetchRelations(paperID, "references", maximum, offset, options),
 };

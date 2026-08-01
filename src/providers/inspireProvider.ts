@@ -3,7 +3,11 @@ import type {
   RelatedWorkMetadata,
   WorkIdentifiers,
 } from "../domain/citationTypes";
-import { normalizeDOI } from "../services/citationIdentifiers";
+import {
+  firstPublicationYear,
+  publicationYearOrNull,
+} from "../domain/valueNormalization";
+import { normalizeDOI } from "../domain/workIdentity";
 import { requestJSON } from "./http";
 import type { CitationProvider } from "./types";
 import { failureStatusFromHTTP, numberOrNull, stringOrNull } from "./types";
@@ -57,7 +61,7 @@ function relationFromReference(
     doi,
     arxiv: reference.reference?.arxiv_eprint ?? null,
     title: raw,
-    year: reference.reference?.publication_info?.year ?? null,
+    year: publicationYearOrNull(reference.reference?.publication_info?.year),
     authors: [],
   };
 }
@@ -83,7 +87,7 @@ export const inspireProvider: CitationProvider = {
     sourceMetrics: false,
   },
   supports: (identifiers) => Boolean(queryFor(identifiers)),
-  lookup: async (identifiers): Promise<ProviderLookupResult> => {
+  lookup: async (identifiers, options): Promise<ProviderLookupResult> => {
     const query = queryFor(identifiers);
     if (!query) {
       return {
@@ -95,6 +99,7 @@ export const inspireProvider: CitationProvider = {
     const response = await requestJSON<InspireResponse>(
       "inspire",
       `https://inspirehep.net/api/literature?q=${encodeURIComponent(query)}&size=2`,
+      { signal: options?.signal },
     );
     const hit = response.data?.hits?.hits?.[0];
     if (!response.ok || !hit?.metadata) {
@@ -108,7 +113,7 @@ export const inspireProvider: CitationProvider = {
     const references = (metadata.references ?? [])
       .map(relationFromReference)
       .filter((work): work is RelatedWorkMetadata => Boolean(work));
-    const dateYear = Number(String(metadata.earliest_date ?? "").slice(0, 4));
+    const dateYear = String(metadata.earliest_date ?? "").slice(0, 4);
     return {
       status: "success",
       provider: "inspire",
@@ -117,9 +122,11 @@ export const inspireProvider: CitationProvider = {
       providerWorkID: String(hit.id ?? "") || null,
       doi: normalizeDOI(metadata.dois?.[0]?.value ?? identifiers.doi),
       title: stringOrNull(metadata.titles?.[0]?.title),
-      year:
-        metadata.publication_info?.[0]?.year ??
-        (Number.isFinite(dateYear) ? dateYear : null),
+      year: firstPublicationYear(
+        metadata.publication_info?.[0]?.year,
+        dateYear,
+      ),
+      publicationDate: stringOrNull(metadata.earliest_date),
       authors: (metadata.authors ?? [])
         .map((author) => String(author.full_name ?? "").trim())
         .filter(Boolean),

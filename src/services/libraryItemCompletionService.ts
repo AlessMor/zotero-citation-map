@@ -26,6 +26,11 @@ import {
   enrichLibrarySourceMetrics,
   type LibrarySourceMetricResult,
 } from "./librarySourceMetricsService";
+import { mapBounded, yieldToUI } from "./backgroundTaskService";
+import {
+  cancellationRequested,
+  type CancellationSignal,
+} from "./cancellationScope";
 
 export type LibraryCompletionPhase =
   "source-metrics" | "relationships" | "finalizing";
@@ -65,34 +70,6 @@ interface StoredRelationshipResolution extends RelationshipRefreshResolution {
 
 const RELATIONSHIP_ERROR_RETRY_MS = 24 * 60 * 60 * 1000;
 const RELATIONSHIP_UNAVAILABLE_RETRY_MS = 7 * 24 * 60 * 60 * 1000;
-
-async function yieldToEventLoop(): Promise<void> {
-  await new Promise<void>((resolve) => setTimeout(resolve, 0));
-}
-
-async function runBounded<T>(
-  items: T[],
-  concurrency: number,
-  task: (item: T) => Promise<void>,
-): Promise<void> {
-  let nextIndex = 0;
-  async function worker(): Promise<void> {
-    while (nextIndex < items.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      await task(items[index]);
-      // Relationship processing performs synchronous merging and serialization
-      // after each network response. Yield between roots so Zotero can repaint.
-      await yieldToEventLoop();
-    }
-  }
-  await Promise.all(
-    Array.from(
-      { length: Math.min(Math.max(1, concurrency), items.length) },
-      () => worker(),
-    ),
-  );
-}
 
 function latestRecords(
   records: CitationMetricRecord[],
@@ -292,8 +269,12 @@ export async function completeLibraryItemUpdates(
     force?: boolean;
     providerIdentitiesByItemKey?: Map<string, ProviderIdentityHints>;
     relationshipMode?: LibraryRelationshipLoadMode;
+    signal?: CancellationSignal;
   } = {},
 ): Promise<LibraryCompletionResult> {
+  const cancelled = (): boolean =>
+    isCitationRequestCancellationRequested() ||
+    cancellationRequested(options.signal);
   const itemByKey = new Map(items.map((item) => [String(item.key), item]));
   const relevantItems = records
     .map((record) => itemByKey.get(record.itemKey))
@@ -306,7 +287,7 @@ export async function completeLibraryItemUpdates(
     unresolved: 0,
     failedRequests: 0,
   };
-  if (!isCitationRequestCancellationRequested()) {
+  if (!cancelled()) {
     sourceResult = await enrichLibrarySourceMetrics(
       relevantItems,
       records,
@@ -368,11 +349,11 @@ export async function completeLibraryItemUpdates(
     Map<RelationshipDirection, StoredRelationshipResolution>
   >();
 
-  await runBounded(
+  await mapBounded(
     relationshipTasks,
     RELATIONSHIP_ITEM_PARALLELISM,
     async ({ node, direction, providerWorkIDs, maximum }) => {
-      if (isCitationRequestCancellationRequested()) return;
+      if (cancelled()) return;
       const label = direction === "references" ? "references" : "citing papers";
       const action =
         relationshipMode === "first-page" ? "Caching first-hop" : "Retrieving";
@@ -391,9 +372,14 @@ export async function completeLibraryItemUpdates(
           maximum,
           refreshMembership: true,
           silent: true,
+          // Bounded first-hop completion is background maintenance. It still
+          // uses every provider enabled in Settings, but limits membership and
+          // optional metadata so the update remains cooperative.
+          mode: relationshipMode === "first-page" ? "automatic" : "manual",
           summaryLookupLimit: 0,
           queueBackgroundHydration: true,
           providerWorkIDs,
+          signal: options.signal,
           onMembershipResolved: (value) => {
             resolution = value;
           },
@@ -438,6 +424,12 @@ export async function completeLibraryItemUpdates(
             `${completedRelationships}/${relationshipTasks.length}`,
         });
       }
+    },
+    {
+      // Relationship processing performs synchronous merging and
+      // serialization after each network response. Yield between roots so
+      // Zotero can repaint.
+      yieldAfterEach: true,
     },
   );
 
@@ -518,7 +510,7 @@ export async function completeLibraryItemUpdates(
         .slice(start, start + CITATION_RECORD_WRITE_CHUNK_SIZE)
         .map((record) => saveCitationMetricRecord(record)),
     );
-    await yieldToEventLoop();
+    await yieldToUI();
   }
 
   onProgress?.({

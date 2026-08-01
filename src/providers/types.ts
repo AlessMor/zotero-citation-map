@@ -5,6 +5,11 @@ import type {
   SourceMetrics,
   WorkIdentifiers,
 } from "../domain/citationTypes";
+import type { CancellationSignal } from "../services/cancellationScope";
+
+export interface ProviderRequestOptions {
+  signal?: CancellationSignal;
+}
 
 export interface ProviderCapabilities {
   identifiers: {
@@ -29,24 +34,34 @@ export interface CitationProvider {
   readonly label: string;
   readonly capabilities: ProviderCapabilities;
   supports(identifiers: WorkIdentifiers): boolean;
-  lookup(identifiers: WorkIdentifiers): Promise<ProviderLookupResult>;
+  lookup(
+    identifiers: WorkIdentifiers,
+    options?: ProviderRequestOptions,
+  ): Promise<ProviderLookupResult>;
   lookupForRelations?(
     identifiers: WorkIdentifiers,
+    options?: ProviderRequestOptions,
   ): Promise<ProviderLookupResult>;
   searchExactTitle?(
     identifiers: WorkIdentifiers,
+    options?: ProviderRequestOptions,
   ): Promise<ProviderLookupResult>;
   fetchCitingWorks?(
     providerWorkID: string,
     maximum: number,
     offset?: number,
+    options?: ProviderRequestOptions,
   ): Promise<RelatedWorkMetadata[]>;
   fetchReferencedWorks?(
     providerWorkID: string,
     maximum: number,
     offset?: number,
+    options?: ProviderRequestOptions,
   ): Promise<RelatedWorkMetadata[]>;
-  fetchSourceMetrics?(sourceID: string): Promise<SourceMetrics | null>;
+  fetchSourceMetrics?(
+    sourceID: string,
+    options?: ProviderRequestOptions,
+  ): Promise<SourceMetrics | null>;
 }
 
 export function failureStatusFromHTTP(

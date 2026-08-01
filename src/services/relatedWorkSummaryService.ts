@@ -5,19 +5,30 @@ import type {
   RelatedWorkMetadata,
   WorkIdentifiers,
 } from "../domain/citationTypes";
+import {
+  firstPublicationYear,
+  publicationYearOrNull,
+} from "../domain/valueNormalization";
 import { requestJSON } from "../providers/http";
+import type { ProviderRequestOptions } from "../providers/types";
+import {
+  openAlexIdentifierForWork,
+  semanticScholarIdentifierForWork,
+  shortOpenAlexID,
+} from "../providers/providerIdentifiers";
 import { getCitationProvider, getProviderPlan } from "../providers/registry";
 import {
-  externalWorkCacheIdentity,
   normalizeDOI,
   normalizeExactTitle,
-} from "./citationIdentifiers";
+  stableExternalWorkIdentity,
+} from "../domain/workIdentity";
 import { getOpenAlexAPIKey } from "./citationPreferences";
 import { providerExecutionPolicy } from "./providerExecutionPolicy";
 import {
   projectRelatedWorkSummary,
   relatedWorkNeedsSummary,
 } from "./relatedWorkHydrationState";
+import { mapBounded } from "./backgroundTaskService";
 
 const SEMANTIC_SCHOLAR_BATCH_LIMIT = 500;
 const OPENALEX_BATCH_LIMIT = 100;
@@ -26,6 +37,7 @@ const SEMANTIC_SCHOLAR_SUMMARY_FIELDS = [
   "externalIds",
   "title",
   "year",
+  "publicationDate",
   "authors",
   "venue",
   "publicationVenue",
@@ -33,12 +45,50 @@ const SEMANTIC_SCHOLAR_SUMMARY_FIELDS = [
   "referenceCount",
 ].join(",");
 const openAlexReferenceIDsCache = new Map<string, string[]>();
+const OPENALEX_REFERENCE_CACHE_MAX_ENTRIES = 6;
+const OPENALEX_REFERENCE_CACHE_MAX_IDS = 20000;
+let openAlexReferenceIDsCached = 0;
+
+function cachedOpenAlexReferenceIDs(workID: string): string[] | null {
+  const cached = openAlexReferenceIDsCache.get(workID);
+  if (!cached) return null;
+  // Refresh insertion order so active paginated retrievals stay resident.
+  openAlexReferenceIDsCache.delete(workID);
+  openAlexReferenceIDsCache.set(workID, cached);
+  return cached;
+}
+
+function cacheOpenAlexReferenceIDs(workID: string, ids: string[]): void {
+  const previous = openAlexReferenceIDsCache.get(workID);
+  if (previous) {
+    openAlexReferenceIDsCached -= previous.length;
+    openAlexReferenceIDsCache.delete(workID);
+  }
+  openAlexReferenceIDsCache.set(workID, ids);
+  openAlexReferenceIDsCached += ids.length;
+  while (
+    openAlexReferenceIDsCache.size > OPENALEX_REFERENCE_CACHE_MAX_ENTRIES ||
+    openAlexReferenceIDsCached > OPENALEX_REFERENCE_CACHE_MAX_IDS
+  ) {
+    const oldest = openAlexReferenceIDsCache.entries().next().value as
+      [string, string[]] | undefined;
+    if (!oldest) break;
+    openAlexReferenceIDsCache.delete(oldest[0]);
+    openAlexReferenceIDsCached -= oldest[1].length;
+  }
+}
+
+export function clearRelatedWorkSummaryCaches(): void {
+  openAlexReferenceIDsCache.clear();
+  openAlexReferenceIDsCached = 0;
+}
 
 const OPENALEX_SUMMARY_FIELDS = [
   "id",
   "doi",
   "display_name",
   "publication_year",
+  "publication_date",
   "authorships",
   "primary_location",
   "cited_by_count",
@@ -50,6 +100,7 @@ interface S2Paper {
   externalIds?: { DOI?: string; PubMed?: string; ArXiv?: string };
   title?: string;
   year?: number;
+  publicationDate?: string;
   authors?: Array<{ authorId?: string; name?: string }>;
   venue?: string;
   publicationVenue?: { name?: string };
@@ -62,6 +113,7 @@ interface OpenAlexWork {
   doi?: string | null;
   display_name?: string;
   publication_year?: number;
+  publication_date?: string;
   cited_by_count?: number;
   referenced_works_count?: number;
   authorships?: Array<{
@@ -106,11 +158,6 @@ function numberOrNull(value: unknown): number | null {
   return Number.isFinite(number) ? number : null;
 }
 
-function shortOpenAlexID(value: unknown): string | null {
-  const text = String(value ?? "").trim();
-  return text ? text.replace(/^https:\/\/openalex\.org\//i, "") : null;
-}
-
 function chunked<T>(items: T[], size: number): T[][] {
   const result: T[][] = [];
   for (let start = 0; start < items.length; start += size) {
@@ -119,49 +166,17 @@ function chunked<T>(items: T[], size: number): T[][] {
   return result;
 }
 
-async function runBounded(
-  tasks: Array<() => Promise<void>>,
-  parallelism: number,
-): Promise<void> {
-  let nextIndex = 0;
-  async function worker(): Promise<void> {
-    while (nextIndex < tasks.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      await tasks[index]();
-    }
-  }
-  await Promise.all(
-    Array.from(
-      { length: Math.min(Math.max(1, parallelism), tasks.length) },
-      () => worker(),
-    ),
-  );
-}
-
-function semanticScholarIdentifier(work: RelatedWorkMetadata): string | null {
-  if (work.provider === "semantic-scholar" && work.providerWorkID?.trim()) {
-    return work.providerWorkID.trim();
-  }
-  const doi = normalizeDOI(work.doi);
-  if (doi) return `DOI:${doi}`;
-  if (work.pmid?.trim()) return `PMID:${work.pmid.trim()}`;
-  if (work.arxiv?.trim()) return `ARXIV:${work.arxiv.trim()}`;
-  if (work.isbn?.trim()) return `ISBN:${work.isbn.trim()}`;
-  return null;
-}
-
 function openAlexIdentifier(
   work: RelatedWorkMetadata,
 ): { kind: "openalex" | "doi"; key: string } | null {
-  if (work.provider === "openalex" && work.providerWorkID?.trim()) {
-    const id = shortOpenAlexID(work.providerWorkID);
-    if (id && /^W\d+$/i.test(id)) {
-      return { kind: "openalex", key: id.toLocaleUpperCase() };
-    }
+  const identifier = openAlexIdentifierForWork(work);
+  if (!identifier) return null;
+  if (/^W\d+$/i.test(identifier)) {
+    return { kind: "openalex", key: identifier.toLocaleUpperCase() };
   }
-  const doi = normalizeDOI(work.doi);
-  return doi ? { kind: "doi", key: doi } : null;
+  return identifier.startsWith("DOI:")
+    ? { kind: "doi", key: identifier.slice("DOI:".length) }
+    : null;
 }
 
 function summaryFromSemanticScholar(
@@ -178,7 +193,8 @@ function summaryFromSemanticScholar(
     arxiv: stringOrNull(paper.externalIds?.ArXiv),
     isbn: null,
     title,
-    year: numberOrNull(paper.year),
+    year: publicationYearOrNull(paper.year),
+    publicationDate: stringOrNull(paper.publicationDate),
     authors: (paper.authors ?? [])
       .map((author) => String(author.name ?? "").trim())
       .filter(Boolean),
@@ -204,7 +220,8 @@ function summaryFromOpenAlex(work: OpenAlexWork): RelatedWorkMetadata | null {
     arxiv: null,
     isbn: null,
     title,
-    year: numberOrNull(work.publication_year),
+    year: publicationYearOrNull(work.publication_year),
+    publicationDate: stringOrNull(work.publication_date),
     authors: (work.authorships ?? [])
       .map((entry) => String(entry.author?.display_name ?? "").trim())
       .filter(Boolean),
@@ -233,7 +250,7 @@ function identifiersForWork(work: RelatedWorkMetadata): WorkIdentifiers {
     isbn: String(work.isbn ?? "").trim() || null,
     title: String(work.title ?? "").trim(),
     normalizedTitle: normalizeExactTitle(work.title),
-    year: work.year,
+    year: publicationYearOrNull(work.year),
     authors: [...work.authors],
     sourceTitle: work.sourceTitle ?? null,
   };
@@ -245,7 +262,8 @@ function summaryFromLookup(result: ProviderLookupSuccess): RelatedWorkMetadata {
     providerWorkID: result.providerWorkID,
     doi: result.doi,
     title: result.title,
-    year: result.year,
+    year: publicationYearOrNull(result.year),
+    publicationDate: result.publicationDate ?? null,
     authors: [...result.authors],
     sourceTitle: result.sourceTitle,
     citationCount: result.citationCount,
@@ -271,7 +289,9 @@ function mergeSummary(
     arxiv: current.arxiv ?? metadata.arxiv,
     isbn: current.isbn ?? metadata.isbn,
     title: String(current.title ?? "").trim() ? current.title : metadata.title,
-    year: current.year ?? metadata.year,
+    year: firstPublicationYear(current.year, metadata.year),
+    publicationDate:
+      current.publicationDate ?? metadata.publicationDate ?? null,
     authors: current.authors.length ? current.authors : [...metadata.authors],
     authorIDs: current.authorIDs?.length
       ? current.authorIDs
@@ -293,15 +313,21 @@ function mergeSummary(
   };
 }
 
+interface SemanticScholarBatchResult {
+  resolved: Set<number>;
+  allowIndividualFallback: boolean;
+}
+
 async function applySemanticScholarBatches(
   works: RelatedWorkMetadata[],
   indexes: number[],
-): Promise<Set<number>> {
+): Promise<SemanticScholarBatchResult> {
   const resolved = new Set<number>();
+  let rateLimited = false;
   const candidates = indexes
     .map((index) => ({
       index,
-      identifier: semanticScholarIdentifier(works[index]),
+      identifier: semanticScholarIdentifierForWork(works[index]),
     }))
     .filter((candidate): candidate is IndexedIdentifier =>
       Boolean(candidate.identifier),
@@ -317,8 +343,12 @@ async function applySemanticScholarBatches(
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: { ids: batch.map((candidate) => candidate.identifier) },
+          // A rate-limited batch should yield to other enabled providers rather
+          // than wait, retry, and then launch individual S2 fallbacks.
+          retryLimit: 0,
         },
       );
+      if (response.status === 429) rateLimited = true;
       if (!response.ok || !Array.isArray(response.data)) return;
       for (const [batchIndex, candidate] of batch.entries()) {
         const summary = response.data[batchIndex]
@@ -329,8 +359,16 @@ async function applySemanticScholarBatches(
       }
     },
   );
-  await runBounded(tasks, policy.requestParallelism);
-  return resolved;
+  await mapBounded(tasks, policy.requestParallelism, (task) => task(), {
+    yieldAfterEach: true,
+  });
+  return {
+    resolved,
+    // Once the batch endpoint reports a rate limit, do not immediately issue
+    // the bounded individual fallbacks against the same provider. Other
+    // enabled providers still run, and the next stale refresh may retry S2.
+    allowIndividualFallback: !rateLimited,
+  };
 }
 
 function openAlexURL(parameters: Record<string, string | number>): string {
@@ -360,6 +398,7 @@ function openAlexPathURL(
 async function applyOpenAlexBatches(
   works: RelatedWorkMetadata[],
   indexes: number[],
+  requestOptions?: ProviderRequestOptions,
 ): Promise<Set<number>> {
   const resolved = new Set<number>();
   if (!getOpenAlexAPIKey()) return resolved;
@@ -392,6 +431,7 @@ async function applyOpenAlexBatches(
             per_page: batch.length,
             select: OPENALEX_SUMMARY_FIELDS,
           }),
+          { signal: requestOptions?.signal },
         );
         if (!response.ok || !response.data) return;
         const byIdentity = new Map<string, RelatedWorkMetadata>();
@@ -415,7 +455,9 @@ async function applyOpenAlexBatches(
       });
     }
   }
-  await runBounded(tasks, policy.requestParallelism);
+  await mapBounded(tasks, policy.requestParallelism, (task) => task(), {
+    yieldAfterEach: true,
+  });
   return resolved;
 }
 
@@ -429,7 +471,7 @@ async function applyIndividualFallbacks(
   if (maximum <= 0) return { used: 0, resolved };
   const provider = getCitationProvider(providerID);
   const selected = indexes.slice(0, maximum);
-  await runBounded(
+  await mapBounded(
     selected.map((index) => async (): Promise<void> => {
       const identifiers = identifiersForWork(works[index]);
       let result = provider.supports(identifiers)
@@ -448,6 +490,8 @@ async function applyIndividualFallbacks(
       }
     }),
     providerExecutionPolicy(providerID).requestParallelism,
+    (task) => task(),
+    { yieldAfterEach: true },
   );
   return { used: selected.length, resolved };
 }
@@ -458,6 +502,7 @@ export async function fetchRelatedWorkSummaryPage(
   direction: "references" | "cited-by",
   maximum: number,
   offset = 0,
+  requestOptions?: ProviderRequestOptions,
 ): Promise<RelatedWorkMetadata[]> {
   const requested = Math.max(0, Math.floor(maximum));
   const start = Math.max(0, Math.floor(offset));
@@ -468,6 +513,7 @@ export async function fetchRelatedWorkSummaryPage(
     const response = await requestJSON<S2RelationResponse>(
       "semantic-scholar",
       `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(providerWorkID)}/${kind}?offset=${start}&limit=${Math.min(200, requested)}&fields=${encodeURIComponent(SEMANTIC_SCHOLAR_SUMMARY_FIELDS)}`,
+      { signal: requestOptions?.signal },
     );
     if (!response.ok || !response.data) return [];
     return (response.data.data ?? [])
@@ -495,6 +541,7 @@ export async function fetchRelatedWorkSummaryPage(
         page,
         select: OPENALEX_SUMMARY_FIELDS,
       }),
+      { signal: requestOptions?.signal },
     );
     if (!response.ok || !response.data) return [];
     return (response.data.results ?? [])
@@ -503,19 +550,20 @@ export async function fetchRelatedWorkSummaryPage(
       .filter((work): work is RelatedWorkMetadata => Boolean(work));
   }
 
-  let referenceIDs = openAlexReferenceIDsCache.get(normalizedID);
+  let referenceIDs = cachedOpenAlexReferenceIDs(normalizedID);
   if (!referenceIDs) {
     const source = await requestJSON<OpenAlexReferenceSource>(
       "openalex",
       openAlexPathURL(`/works/${encodeURIComponent(normalizedID)}`, {
         select: "referenced_works,referenced_works_count",
       }),
+      { signal: requestOptions?.signal },
     );
     if (!source.ok || !source.data) return [];
     referenceIDs = (source.data.referenced_works ?? [])
       .map(shortOpenAlexID)
       .filter((id): id is string => Boolean(id));
-    openAlexReferenceIDsCache.set(normalizedID, referenceIDs);
+    cacheOpenAlexReferenceIDs(normalizedID, referenceIDs);
   }
   const identifiers = referenceIDs.slice(start, start + requested);
   if (!identifiers.length) return [];
@@ -530,6 +578,7 @@ export async function fetchRelatedWorkSummaryPage(
   await applyOpenAlexBatches(
     summaries,
     summaries.map((_, index) => index),
+    requestOptions,
   );
   return summaries.filter((work) => Boolean(work.title));
 }
@@ -567,11 +616,11 @@ export async function resolveRelatedWorkSummaries(
       .map(({ index }) => index);
     if (!unresolved.length) break;
 
+    let allowIndividualFallback = true;
     if (providerID === "semantic-scholar") {
-      for (const index of await applySemanticScholarBatches(
-        works,
-        unresolved,
-      )) {
+      const batchResult = await applySemanticScholarBatches(works, unresolved);
+      allowIndividualFallback = batchResult.allowIndividualFallback;
+      for (const index of batchResult.resolved) {
         successfullyResolved.add(index);
       }
     } else if (providerID === "openalex") {
@@ -585,19 +634,21 @@ export async function resolveRelatedWorkSummaries(
     );
     const eligibleForFallback = stillUnresolved.filter((index) => {
       if (providerID === "semantic-scholar") {
-        return !semanticScholarIdentifier(works[index]);
+        return !semanticScholarIdentifierForWork(works[index]);
       }
       if (providerID === "openalex") {
         return !openAlexIdentifier(works[index]);
       }
       return true;
     });
-    const fallback = await applyIndividualFallbacks(
-      works,
-      eligibleForFallback,
-      providerID,
-      remaining,
-    );
+    const fallback = allowIndividualFallback
+      ? await applyIndividualFallbacks(
+          works,
+          eligibleForFallback,
+          providerID,
+          remaining,
+        )
+      : { used: 0, resolved: new Set<number>() };
     for (const index of fallback.resolved) successfullyResolved.add(index);
     remaining = Number.isFinite(remaining)
       ? Math.max(0, remaining - fallback.used)
@@ -605,7 +656,7 @@ export async function resolveRelatedWorkSummaries(
   }
 
   return works.map((work, index) => {
-    const identity = externalWorkCacheIdentity(work);
+    const identity = stableExternalWorkIdentity(work);
     return identity &&
       (successfullyResolved.has(index) || !relatedWorkNeedsSummary(work))
       ? projectRelatedWorkSummary(work)

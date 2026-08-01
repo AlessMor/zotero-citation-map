@@ -10,6 +10,7 @@ export interface PaperOverviewActionOptions {
   secondaryButtonClass?: string;
   doi: string | null;
   onShowInZotero: Action;
+  onOpenFocusView?: Action;
   onSimilar: Action;
   onRefresh: Action;
 }
@@ -18,6 +19,7 @@ export interface PaperOverviewActionBar {
   root: HTMLDivElement;
   showInZoteroButton: HTMLButtonElement;
   openDOIButton: HTMLButtonElement | null;
+  openFocusViewButton: HTMLButtonElement | null;
   similarButton: HTMLButtonElement;
   refreshButton: HTMLButtonElement;
 }
@@ -95,6 +97,20 @@ export function createPaperOverviewActionBar(
     left.appendChild(openDOIButton);
   }
 
+  let openFocusViewButton: HTMLButtonElement | null = null;
+  const openFocusView = options.onOpenFocusView;
+  if (openFocusView) {
+    openFocusViewButton = element(document, "button", secondaryButtonClass);
+    openFocusViewButton.type = "button";
+    openFocusViewButton.textContent = "Open Focus View";
+    openFocusViewButton.title =
+      "Show this paper with its direct references and citing papers in Citation Map.";
+    openFocusViewButton.addEventListener("click", () =>
+      invoke(openFocusViewButton!, openFocusView),
+    );
+    left.appendChild(openFocusViewButton);
+  }
+
   const similarButton = element(document, "button", primaryButtonClass);
   similarButton.type = "button";
   similarButton.append(
@@ -129,6 +145,7 @@ export function createPaperOverviewActionBar(
     root,
     showInZoteroButton,
     openDOIButton,
+    openFocusViewButton,
     similarButton,
     refreshButton,
   };

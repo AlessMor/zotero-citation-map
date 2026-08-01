@@ -1,38 +1,5 @@
 import type { RelatedWorkMetadata } from "../domain/citationTypes";
-import {
-  normalizeDOI,
-  normalizeExactTitle,
-  normalizeIdentifier,
-  relatedWorkStableAliases,
-} from "./citationIdentifiers";
-
-function normalizedSurname(value: string): string {
-  const compact = value
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLocaleLowerCase()
-    .replace(/[^a-z0-9\s'-]/g, " ")
-    .trim();
-  return compact.split(/\s+/).filter(Boolean).at(-1) ?? compact;
-}
-
-function stableAliases(work: RelatedWorkMetadata): string[] {
-  return relatedWorkStableAliases(work).filter(
-    (alias) => !alias.startsWith("title:"),
-  );
-}
-
-export function stableRelationshipIdentity(
-  work: RelatedWorkMetadata,
-): string | null {
-  return stableAliases(work)[0] ?? null;
-}
-
-export function hasStableRelationshipIdentity(
-  work: RelatedWorkMetadata,
-): boolean {
-  return stableRelationshipIdentity(work) !== null;
-}
+import { matchRelatedWorks, stableWorkAliases } from "../domain/workIdentity";
 
 export function partitionRelationshipCandidates(works: RelatedWorkMetadata[]): {
   identified: RelatedWorkMetadata[];
@@ -41,87 +8,9 @@ export function partitionRelationshipCandidates(works: RelatedWorkMetadata[]): {
   const identified: RelatedWorkMetadata[] = [];
   const unresolved: RelatedWorkMetadata[] = [];
   for (const work of works) {
-    (hasStableRelationshipIdentity(work) ? identified : unresolved).push(work);
+    (stableWorkAliases(work).length > 0 ? identified : unresolved).push(work);
   }
   return { identified, unresolved };
-}
-
-function identifierNamespaces(
-  work: RelatedWorkMetadata,
-): Map<string, Set<string>> {
-  const result = new Map<string, Set<string>>();
-  const add = (namespace: string, raw: unknown): void => {
-    const value = normalizeIdentifier(raw);
-    if (!value) return;
-    const values = result.get(namespace) ?? new Set<string>();
-    values.add(value);
-    result.set(namespace, values);
-  };
-
-  add("doi", normalizeDOI(work.doi));
-  add("pmid", work.pmid);
-  add("arxiv", work.arxiv);
-  add("isbn", String(work.isbn ?? "").replace(/[-\s]/g, ""));
-  add("zotero", work.inLibraryItemKey ?? work.zoteroItemKey);
-  if (work.providerWorkID && work.provider !== "manual") {
-    add(`provider:${work.provider}`, work.providerWorkID);
-  }
-  return result;
-}
-
-function sharedIdentifierEvidence(
-  left: RelatedWorkMetadata,
-  right: RelatedWorkMetadata,
-): { match: boolean; conflict: boolean } {
-  const leftIDs = identifierNamespaces(left);
-  const rightIDs = identifierNamespaces(right);
-  let match = false;
-  for (const [namespace, leftValues] of leftIDs) {
-    const rightValues = rightIDs.get(namespace);
-    if (!rightValues?.size) continue;
-    const overlaps = [...leftValues].some((value) => rightValues.has(value));
-    if (!overlaps) return { match: false, conflict: true };
-    match = true;
-  }
-  return { match, conflict: false };
-}
-
-function titleEvidence(
-  left: RelatedWorkMetadata,
-  right: RelatedWorkMetadata,
-): { match: boolean; conflict: boolean } {
-  const leftTitle = normalizeExactTitle(left.title);
-  const rightTitle = normalizeExactTitle(right.title);
-  if (!leftTitle || !rightTitle) return { match: false, conflict: false };
-  return leftTitle === rightTitle
-    ? { match: true, conflict: false }
-    : { match: false, conflict: true };
-}
-
-function authorYearEvidence(
-  left: RelatedWorkMetadata,
-  right: RelatedWorkMetadata,
-): { match: boolean; conflict: boolean } {
-  if (
-    left.year == null ||
-    right.year == null ||
-    !left.authors.length ||
-    !right.authors.length
-  ) {
-    return { match: false, conflict: false };
-  }
-  if (Math.abs(left.year - right.year) > 1) {
-    return { match: false, conflict: true };
-  }
-  const leftSurnames = new Set(
-    left.authors.map(normalizedSurname).filter(Boolean),
-  );
-  const overlaps = right.authors.some((author) =>
-    leftSurnames.has(normalizedSurname(author)),
-  );
-  return overlaps
-    ? { match: true, conflict: false }
-    : { match: false, conflict: true };
 }
 
 /**
@@ -129,17 +18,11 @@ function authorYearEvidence(
  * evidence group matches and every evidence group available on both records is
  * non-contradictory. Sparse candidates never create relationship membership.
  */
-export function candidateCanEnrichIdentifiedWork(
+function candidateCanEnrichIdentifiedWork(
   identified: RelatedWorkMetadata,
   candidate: RelatedWorkMetadata,
 ): boolean {
-  const identifier = sharedIdentifierEvidence(identified, candidate);
-  if (identifier.conflict) return false;
-  const title = titleEvidence(identified, candidate);
-  if (title.conflict) return false;
-  const authorYear = authorYearEvidence(identified, candidate);
-  if (authorYear.conflict) return false;
-  return identifier.match || title.match || authorYear.match;
+  return matchRelatedWorks(identified, candidate).decision === "same-work";
 }
 
 export function enrichIdentifiedRelationshipWorks(

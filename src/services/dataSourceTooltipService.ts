@@ -4,7 +4,7 @@ import type {
 } from "../domain/citationTypes";
 import type { CitationGraphNode } from "../domain/graphTypes";
 import { getCachedCitationGraph } from "./citationGraphService";
-import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
+import { normalizeDOI, normalizeExactTitle } from "../domain/workIdentity";
 import { createMetricNodeForItem } from "./itemMetricContext";
 import {
   formatMetricValue,
