@@ -20,9 +20,9 @@ So I decided to see if something along those lines could be integrated directly 
 
 3. in Zotero, open **Tools → Plugins**.
 
-5. Drag the downloaded `.xpi` file into the Plugins window and confirm the installation when prompted.
+4. Drag the downloaded `.xpi` file into the Plugins window and confirm the installation when prompted.
 
-7. Restart Zotero if required.
+5. Restart Zotero if required.
 
 To **update** the plugin, install the newer `.xpi` in the same way. Zotero willreplace the existing version.
 
@@ -52,7 +52,6 @@ To **update** the plugin, install the newer `.xpi` in the same way. Zotero willr
 - **Control providers and updates**
   Choose which scholarly-data providers to use, which Zotero libraries shouldupdate automatically, and when cached data become stale. Refresh data manually when needed; long updates show progress and can be cancelled.
   ![settings](docs/assets/Settings.png)
-
 
 ## Data sources
 
