@@ -57,6 +57,8 @@ export function createMetricNodeForItem(item: Zotero.Item): CitationGraphNode {
       ).trim() || null,
     authors: getAuthors(item),
     year: getYear(item),
+    publicationDate: String(item.getField?.("date") ?? "").trim() || null,
+    citationSequence: null,
     doi: record?.doi ?? null,
     tags: (item.getTags?.() ?? [])
       .map((entry: any) => String(entry?.tag ?? entry ?? "").trim())
@@ -96,11 +98,6 @@ export function createMetricNodeForItem(item: Zotero.Item): CitationGraphNode {
     outgoingLibraryReferences: analytics?.outgoing ?? 0,
     libraryCoverage: analytics?.libraryCoverage ?? null,
     localGlobalImpactRatio: analytics?.localGlobalImpactRatio ?? null,
-    pageRank: analytics?.pageRank ?? 0,
-    betweennessCentrality: analytics?.betweennessCentrality ?? 0,
-    eigenvectorCentrality: analytics?.eigenvectorCentrality ?? 0,
-    componentSize: analytics?.componentSize ?? 1,
-    citationChainDepth: analytics?.citationChainDepth ?? 0,
     isIsolated: analytics?.isIsolated ?? true,
     referenceAgeMean: analytics?.referenceAgeMean ?? null,
     referenceAgeSpread: analytics?.referenceAgeSpread ?? null,

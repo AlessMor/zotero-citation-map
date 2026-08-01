@@ -2,17 +2,22 @@ import type {
   CitationProviderID,
   RelatedWorkMetadata,
 } from "../domain/citationTypes";
+import type { ExternalWork } from "../domain/externalWork";
 import type {
   CitationGraphModel,
   CitationGraphNode,
 } from "../domain/graphTypes";
+import { comparePublicationYears } from "../domain/valueNormalization";
 import {
   getCachedExternalCitedBy,
   getCachedExternalReferences,
-  type ExternalWork,
 } from "./externalDiscoveryService";
+import type { LibraryWorkIdentity } from "./externalWorkMetadataService";
 import { getCitationMetricRecord } from "./citationMetricsStore";
-import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
+import {
+  matchRelatedWorks,
+  relationshipCandidateIdentity,
+} from "../domain/workIdentity";
 import { getProviderLabel } from "./citationPreferences";
 import { mergeRelatedWorkLists } from "./relationshipStoreService";
 
@@ -82,6 +87,10 @@ export interface RelationshipViewSnapshot {
   hasRetrievedWorks: boolean;
   relationshipLabel: "reference" | "citation";
   providerLabel: "references" | "citations";
+}
+
+export interface RelationshipViewSnapshotOptions {
+  queueBackgroundHydration?: boolean;
 }
 
 function itemByKey(libraryID: number, itemKey: string): Zotero.Item | null {
@@ -161,22 +170,7 @@ function graphRelationshipWorks(
 }
 
 export function relationshipWorkKey(work: ExternalWork): string {
-  const localKey = work.inLibraryItemKey ?? work.zoteroItemKey;
-  if (localKey) return `zotero:${localKey.toLocaleUpperCase()}`;
-  const doi = normalizeDOI(work.doi);
-  if (doi) return `doi:${doi}`;
-  if (work.pmid?.trim()) return `pmid:${work.pmid.trim().toLocaleLowerCase()}`;
-  if (work.arxiv?.trim())
-    return `arxiv:${work.arxiv.trim().toLocaleLowerCase()}`;
-  if (work.isbn?.trim())
-    return `isbn:${work.isbn.replace(/[-\s]/g, "").toLocaleLowerCase()}`;
-  if (work.providerWorkID) {
-    return `${work.provider}:${String(work.providerWorkID).toLocaleLowerCase()}`;
-  }
-  const title = normalizeExactTitle(work.title);
-  return title
-    ? `title:${title}:year:${work.year ?? "unknown"}`
-    : `${work.provider}:unknown`;
+  return relationshipCandidateIdentity(work);
 }
 
 export function newlyRetrievedRelationshipWorkCount(
@@ -192,7 +186,7 @@ export function newlyRetrievedRelationshipWorkCount(
 }
 
 export function mergeRelationshipWorks(
-  ...groups: ExternalWork[][]
+  ...groups: RelatedWorkMetadata[][]
 ): ExternalWork[] {
   return mergeRelatedWorkLists(...groups).map((work) => work as ExternalWork);
 }
@@ -214,20 +208,49 @@ export function getRelationshipViewSnapshot(
   direction: RelationshipViewDirection,
   libraryID: number,
   maximum = RELATIONSHIP_VIEW_LIMIT,
+  options: RelationshipViewSnapshotOptions = {},
 ): RelationshipViewSnapshot {
-  const record = getCitationMetricRecord(libraryID, node.itemKey);
-  const stored =
-    direction === "references"
-      ? getCachedExternalReferences(node, graph.nodes, maximum, 0)
-      : getCachedExternalCitedBy(node, graph.nodes, maximum, 0);
-
   // A complete provider snapshot is authoritative. Graph edges are a useful
   // fallback before relationship data have been hydrated, but merging them into
   // a stored snapshot can reintroduce stale/local-only edges and make the list
   // exceed the canonical provider union.
+  const embedded =
+    direction === "references"
+      ? ((node.externalWork?.references ??
+          node.references ??
+          []) as ExternalWork[])
+      : [];
+  return getRelationshipViewSnapshotFromWorks(
+    node,
+    direction,
+    libraryID,
+    graph.nodes,
+    mergeRelationshipWorks(
+      embedded,
+      graphRelationshipWorks(graph, node, direction),
+    ),
+    maximum,
+    options,
+  );
+}
+
+export function getRelationshipViewSnapshotFromWorks(
+  node: CitationGraphNode,
+  direction: RelationshipViewDirection,
+  libraryID: number,
+  libraryWorks: readonly LibraryWorkIdentity[],
+  fallbackWorks: RelatedWorkMetadata[] = [],
+  maximum = RELATIONSHIP_VIEW_LIMIT,
+  options: RelationshipViewSnapshotOptions = {},
+): RelationshipViewSnapshot {
+  const record = getCitationMetricRecord(libraryID, node.itemKey);
+  const stored =
+    direction === "references"
+      ? getCachedExternalReferences(node, libraryWorks, maximum, 0, options)
+      : getCachedExternalCitedBy(node, libraryWorks, maximum, 0, options);
   const sourceWorks = stored.length
     ? stored
-    : graphRelationshipWorks(graph, node, direction);
+    : mergeRelationshipWorks(fallbackWorks);
   const works = mergeRelationshipWorks(sourceWorks).slice(0, maximum);
   const reportedCount =
     direction === "references"
@@ -260,27 +283,7 @@ function referenceMatchesExternalWork(
   ) {
     return true;
   }
-  const referenceDOI = normalizeDOI(reference.doi);
-  const workDOI = normalizeDOI(work.doi);
-  if (referenceDOI && workDOI && referenceDOI === workDOI) return true;
-  if (
-    reference.provider === work.provider &&
-    reference.providerWorkID &&
-    work.providerWorkID &&
-    String(reference.providerWorkID).toLocaleLowerCase() ===
-      String(work.providerWorkID).toLocaleLowerCase()
-  ) {
-    return true;
-  }
-  const referenceTitle = normalizeExactTitle(reference.title);
-  const workTitle = normalizeExactTitle(work.title);
-  if (!referenceTitle || !workTitle || referenceTitle !== workTitle)
-    return false;
-  return (
-    reference.year === null ||
-    work.year === null ||
-    Math.abs(reference.year - work.year) <= 1
-  );
+  return matchRelatedWorks(reference, work).decision === "same-work";
 }
 
 export function relationshipPreviewSourceKeys(
@@ -356,13 +359,13 @@ export function sortRelationshipEntries<
   return [...entries].sort((left, right) => {
     let comparison = 0;
     if (key === "newest") {
-      comparison = compareNullableNumbers(
+      comparison = comparePublicationYears(
         left.work.year,
         right.work.year,
         "descending",
       );
     } else if (key === "oldest") {
-      comparison = compareNullableNumbers(
+      comparison = comparePublicationYears(
         left.work.year,
         right.work.year,
         "ascending",

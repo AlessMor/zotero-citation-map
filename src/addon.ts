@@ -1,5 +1,40 @@
 import { config } from "../package.json";
+import type { CitationLibraryOption } from "./services/citationLibraryService";
 import hooks from "./hooks";
+
+export interface CitationMapCacheStatus {
+  metricRecords: number;
+  manualRelations: number;
+  ignoredRelations: number;
+  lastUpdated: string | null;
+}
+
+export interface CitationMapAPI {
+  refreshAll(): void;
+  clearAllCachedData(): void;
+  providerSelectionChanged(): void;
+  openOpenAlexAccount(): void;
+  cacheStatus(): CitationMapCacheStatus;
+  updateLibraries(): CitationLibraryOption[];
+  updateLibraryIDs(): number[];
+  setUpdateLibraryIDs(libraryIDs: unknown): void;
+}
+
+function unavailableAPI(): CitationMapAPI {
+  const unavailable = (): never => {
+    throw new Error("Citation Map API is not initialized.");
+  };
+  return Object.freeze({
+    refreshAll: unavailable,
+    clearAllCachedData: unavailable,
+    providerSelectionChanged: unavailable,
+    openOpenAlexAccount: unavailable,
+    cacheStatus: unavailable,
+    updateLibraries: unavailable,
+    updateLibraryIDs: unavailable,
+    setUpdateLibraryIDs: unavailable,
+  });
+}
 
 class Addon {
   public data: {
@@ -7,13 +42,11 @@ class Addon {
     config: typeof config;
     env: "development" | "production";
     initialized: boolean;
-    graphTabID: string | null;
-    graphWindow: Window | null;
     locale?: { current: any };
   };
 
   public hooks: typeof hooks;
-  public api: Record<string, any>;
+  public api: CitationMapAPI;
 
   constructor() {
     this.data = {
@@ -21,11 +54,13 @@ class Addon {
       config,
       env: __env__,
       initialized: false,
-      graphTabID: null,
-      graphWindow: null,
     };
     this.hooks = hooks;
-    this.api = {};
+    this.api = unavailableAPI();
+  }
+
+  public setAPI(api: CitationMapAPI): void {
+    this.api = Object.freeze({ ...api });
   }
 }
 

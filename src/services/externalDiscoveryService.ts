@@ -3,33 +3,30 @@ import type {
   RelatedWorkMetadata,
   WorkIdentifiers,
 } from "../domain/citationTypes";
+import type { ExternalWork } from "../domain/externalWork";
 import type { CitationGraphNode } from "../domain/graphTypes";
-import type { RelationshipProviderSnapshot } from "../providers/relationshipAdapters";
+import { workIdentifiersForGraphNode } from "../domain/workIdentifiers";
+import type { RelationshipProviderSnapshot } from "../providers/relationshipPolicy";
 import { isCitationRequestCancellationRequested } from "../providers/http";
-import "./providerResponseCacheService";
+import type { ProviderRequestOptions } from "../providers/types";
+import { getCitationProvider, getProviderPlan } from "../providers/registry";
+import { resolveRelatedWorksMetadata } from "../providers/relatedWorkResolutionService";
 import {
-  discoverSimilarWorks,
-  getCitationProvider,
-  getProviderPlan,
-  mergeRelatedWorkMetadata,
-  resolveRelatedWorksMetadata,
-} from "../providers/registry";
-import {
-  externalWorkCacheIdentity,
+  externalWorkLookupIdentity,
+  matchWorkIdentifiers,
   normalizeDOI,
-  normalizeExactTitle,
-  relatedWorkMetadataAliases,
-} from "./citationIdentifiers";
-import {
-  registerExternalWorkMetricBatch,
-  registerExternalWorkMetrics,
-} from "./externalWorkMetricRegistry";
+  stableExternalWorkIdentity,
+  stableWorkAliases,
+  workLookupAliases,
+} from "../domain/workIdentity";
+import { relatedWorkFromProviderLookup } from "../domain/relatedWorkMetadata";
+import { registerExternalWorkMetricBatch } from "./externalWorkMetricRegistry";
 import { richestCountAttribution } from "./citationCountPolicy";
+import { getEnabledProviders, isProviderEnabled } from "./citationPreferences";
 import {
   getCitationMetricRecord,
   saveCitationMetricRecord,
 } from "./citationMetricsStore";
-import { getProviderPreference } from "./citationPreferences";
 import type { ProviderIdentityHints } from "./libraryCoreBatchService";
 import {
   RELATIONSHIP_SUMMARY_BACKGROUND_FALLBACK_LIMIT,
@@ -38,15 +35,16 @@ import {
 } from "./providerExecutionPolicy";
 import {
   cachedExternalWorkMetadata,
+  invalidateExternalRelationshipMetadata,
+  saveExternalWorkCacheFailures,
   saveExternalWorkCacheSuccesses,
   shouldResolveExternalWork,
 } from "./externalWorkCacheService";
 import {
+  getStoredRelationshipCount,
   getStoredRelationshipEntry,
   getStoredRelationshipWorks,
   mergeRelatedWorkLists,
-  getStoredProviderRelationshipEntry,
-  replaceStoredProviderRelationships,
   replaceStoredRelationshipSelection,
 } from "./relationshipStoreService";
 import {
@@ -54,47 +52,102 @@ import {
   selectRelationshipMembership,
 } from "./providerDispatcher";
 import { createUpdateProgress } from "./updateProgressService";
+import { projectRelatedWorkSummary } from "./relatedWorkHydrationState";
 import {
-  mergeRelatedWorkHydrationState,
-  projectRelatedWorkSummary,
-  relatedWorkNeedsSummary,
-} from "./relatedWorkHydrationState";
-import {
+  clearRelatedWorkSummaryCaches,
   fetchRelatedWorkSummaryPage,
   resolveRelatedWorkSummaries,
 } from "./relatedWorkSummaryService";
 import {
   normalizeImportedZoteroItems,
   normalizeRelatedWorkText,
-  normalizeScholarlyText,
 } from "./scholarlyTextService";
+import {
+  externalWorkDisplayTitle,
+  mergeExternalWorkMetadata,
+  toExternalWorks,
+  usableExternalTitle,
+  type LibraryWorkIdentity,
+} from "./externalWorkMetadataService";
+import { stampProviderWorks } from "./providerWorkMetadata";
+import {
+  orderRelationshipProviders,
+  preferredRelationshipProviders,
+  relationshipForegroundMetadataLimit,
+  relationshipProviderPolicyForSize,
+  relationshipRefreshRequiresFollowUp,
+  relationshipRefreshPolicy,
+  relationshipSnapshotIsFresh,
+  type RelationshipProviderStrategy,
+  type RelationshipRefreshMode,
+} from "./relationshipRefreshPolicy";
+import {
+  beginRelationshipPublicationBatch,
+  endRelationshipPublicationBatch,
+  publishRelationshipPublication,
+} from "./relationshipEvents";
+import {
+  beginCitationUpdatePublicationBatch,
+  endCitationUpdatePublicationBatch,
+} from "./citationUpdateEvents";
+import {
+  createCooperativeCheckpoint,
+  mapBounded,
+  mapCooperatively,
+  yieldToUI,
+} from "./backgroundTaskService";
+import {
+  cancellationRequested,
+  createCancellationScope,
+  type CancellationSignal,
+} from "./cancellationScope";
+
+function externalCacheFailureStatus(
+  error: unknown,
+): "rate-limited" | "network-error" | "provider-error" {
+  const message = String(error).toLocaleLowerCase();
+  if (message.includes("429") || message.includes("rate limit")) {
+    return "rate-limited";
+  }
+  if (
+    message.includes("network") ||
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("connection")
+  ) {
+    return "network-error";
+  }
+  return "provider-error";
+}
 
 function nodeLibraryID(node: CitationGraphNode): number {
-  const item = Zotero.Items.get(node.itemID) as Zotero.Item | null;
-  const libraryID = Number(item?.libraryID);
-  return Number.isFinite(libraryID)
-    ? libraryID
-    : Zotero.Libraries.userLibraryID;
+  if (node.itemID > 0) {
+    try {
+      const item = Zotero.Items.get(node.itemID) as Zotero.Item | null;
+      const libraryID = Number(item?.libraryID);
+      if (Number.isFinite(libraryID)) return libraryID;
+    } catch {
+      // External focus nodes deliberately have no Zotero item.
+    }
+  }
+  return Zotero.Libraries.userLibraryID;
 }
 
-export interface ExternalWork extends RelatedWorkMetadata {
-  recommendationScore?: number;
-  recommendationSources?: CitationProviderID[];
-  citingNodeKeys?: string[];
-  inLibraryItemKey?: string | null;
-}
-
-const RELATIONSHIP_MAX_AGE_MS = 30 * 86400000;
 const RELATIONSHIP_MAX_PAGES = 30;
 const RELATIONSHIP_ABSOLUTE_MAX_PAGES = 1000;
 const RELATIONSHIP_PROVIDER_TIMEOUT_MS = 15000;
+const RELATIONSHIP_PROVIDER_PARALLELISM = 3;
 // Batch-capable providers hydrate the entire deduplicated neighbour set.
 // A small bounded fallback covers identifiers unsupported by batch endpoints.
 const RELATIONSHIP_METADATA_FOREGROUND_INDIVIDUAL_LIMIT = 8;
 const RELATIONSHIP_METADATA_BACKGROUND_DELAY_MS = 350;
+const RELATIONSHIP_METADATA_ATTEMPTED_MAX = 5000;
 
 function relationshipMetadataBatchSize(): number {
-  return RELATIONSHIP_SUMMARY_BATCH_SIZE;
+  // Semantic Scholar and OpenAlex both expose batch summary endpoints. Small
+  // five-record chunks multiplied request overhead and the cooperative delay
+  // for large relationship sets without materially improving responsiveness.
+  return Math.min(100, RELATIONSHIP_SUMMARY_BATCH_SIZE);
 }
 
 interface DeferredValue<T> {
@@ -122,6 +175,8 @@ interface RelationshipMetadataHydrationTarget {
   node: CitationGraphNode;
   direction: "references" | "cited-by";
   providers: Set<CitationProviderID>;
+  silent: boolean;
+  onHydrated: Set<() => void>;
 }
 
 interface RelationshipMetadataHydrationQueueEntry {
@@ -137,11 +192,67 @@ const relationshipMetadataAttemptedThisSession = new Set<string>();
 let relationshipMetadataHydrationTimer: ReturnType<typeof setTimeout> | null =
   null;
 let relationshipMetadataHydrationRunning = false;
-const relationshipRecordSynchronizations = new Map<string, Promise<void>>();
+let activeRelationshipMembershipRefreshes = 0;
+let externalDiscoveryRunning = true;
+let externalDiscoveryGeneration = 0;
+const relationshipRecordSynchronizations = new Map<string, Promise<unknown>>();
 const activeExternalMetadataResolutions = new Map<
   string,
   Promise<RelatedWorkMetadata | null>
 >();
+
+function markRelationshipMetadataAttempted(identityKey: string): void {
+  relationshipMetadataAttemptedThisSession.delete(identityKey);
+  relationshipMetadataAttemptedThisSession.add(identityKey);
+  while (
+    relationshipMetadataAttemptedThisSession.size >
+    RELATIONSHIP_METADATA_ATTEMPTED_MAX
+  ) {
+    const oldest = relationshipMetadataAttemptedThisSession.values().next()
+      .value as string | undefined;
+    if (!oldest) break;
+    relationshipMetadataAttemptedThisSession.delete(oldest);
+  }
+}
+
+interface ActiveRelationshipRefresh {
+  promise: Promise<ExternalWork[]>;
+  cancel: () => void;
+  maximum: number;
+  mode: RelationshipRefreshMode;
+  lastResolution: RelationshipRefreshResolution | null;
+  metadataHydrated: boolean;
+  membershipCallbacks: Set<(resolution: RelationshipRefreshResolution) => void>;
+  metadataCallbacks: Set<() => void>;
+}
+
+const activeRelationshipRefreshOperations = new Map<
+  string,
+  ActiveRelationshipRefresh
+>();
+
+function invokeRefreshCallback<T>(
+  callback: (value: T) => void,
+  value: T,
+): void {
+  try {
+    callback(value);
+  } catch (error) {
+    Zotero.debug(
+      `Citation Map: relationship refresh callback failed: ${String(error)}`,
+    );
+  }
+}
+
+function invokeRefreshSignal(callback: () => void): void {
+  try {
+    callback();
+  } catch (error) {
+    Zotero.debug(
+      `Citation Map: relationship refresh signal failed: ${String(error)}`,
+    );
+  }
+}
 
 function cachedRelationshipResults(
   node: CitationGraphNode,
@@ -161,30 +272,13 @@ function cachedRelationshipResults(
   );
 }
 
-function selectedRelationshipCacheIsFresh(
+export function selectedRelationshipCacheIsFresh(
   node: CitationGraphNode,
   direction: "references" | "cited-by",
+  maxAgeMs?: number,
 ): boolean {
   const entry = getStoredRelationshipEntry(node, direction);
-  if (!entry) return false;
-  const fetchedAt = Date.parse(entry.fetchedAt);
-  return (
-    Number.isFinite(fetchedAt) &&
-    Date.now() - fetchedAt < RELATIONSHIP_MAX_AGE_MS
-  );
-}
-
-function relationshipMetadataIndex(
-  works: RelatedWorkMetadata[],
-): Map<string, RelatedWorkMetadata> {
-  const index = new Map<string, RelatedWorkMetadata>();
-  for (const work of works) {
-    for (const alias of relatedWorkMetadataAliases(work)) {
-      const previous = index.get(alias);
-      index.set(alias, previous ? mergeMetadata(previous, work) : work);
-    }
-  }
-  return index;
+  return relationshipSnapshotIsFresh(entry?.fetchedAt, maxAgeMs);
 }
 
 function metadataForRelationshipWork(
@@ -192,159 +286,14 @@ function metadataForRelationshipWork(
   index: Map<string, RelatedWorkMetadata>,
 ): RelatedWorkMetadata | null {
   let metadata: RelatedWorkMetadata | null = null;
-  for (const alias of relatedWorkMetadataAliases(work)) {
+  for (const alias of workLookupAliases(work)) {
     const candidate = index.get(alias);
     if (candidate)
-      metadata = metadata ? mergeMetadata(metadata, candidate) : candidate;
+      metadata = metadata
+        ? mergeExternalWorkMetadata(metadata, candidate)
+        : candidate;
   }
   return metadata;
-}
-
-function usableExternalTitle(
-  title: string | null | undefined,
-  doi: string | null | undefined,
-): string | null {
-  const value = normalizeScholarlyText(title);
-  if (!value) return null;
-  const normalizedValue = value
-    .replace(/^doi:\s*/i, "")
-    .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "")
-    .trim()
-    .toLocaleLowerCase();
-  const normalizedDOI = normalizeDOI(doi);
-  if (normalizedDOI && normalizedValue === normalizedDOI) return null;
-  if (/^https?:\/\//i.test(value)) return null;
-  return value;
-}
-
-export function externalWorkDisplayTitle(
-  work: RelatedWorkMetadata,
-): string | null {
-  const direct = usableExternalTitle(work.title, work.doi);
-  if (direct) return direct;
-  const key = externalWorkCacheIdentity(work);
-  const cached = key ? cachedExternalWorkMetadata(key) : null;
-  return cached
-    ? usableExternalTitle(cached.title, cached.doi ?? work.doi)
-    : null;
-}
-
-function mergeMetadata<T extends RelatedWorkMetadata>(
-  work: T,
-  metadata: RelatedWorkMetadata | null,
-): T {
-  const merged = mergeRelatedWorkMetadata(work, metadata);
-  const sources = new Set<CitationProviderID>(work.dataSources ?? []);
-  if (work.provider !== "manual" && work.provider !== "zotero") {
-    sources.add(work.provider);
-  }
-  for (const source of metadata?.dataSources ?? []) sources.add(source);
-  if (
-    metadata &&
-    metadata.provider !== "manual" &&
-    metadata.provider !== "zotero"
-  ) {
-    sources.add(metadata.provider);
-  }
-  const timestamps = [work.updatedAt, metadata?.updatedAt]
-    .filter((value): value is string => Boolean(value))
-    .sort((left, right) => Date.parse(left) - Date.parse(right));
-  const authors =
-    work.authors.length >= (metadata?.authors.length ?? 0)
-      ? work.authors
-      : (metadata?.authors ?? []);
-  const normalized = normalizeRelatedWorkText({
-    ...merged,
-    authors: [...authors],
-    authorIDs: [
-      ...new Set([...(work.authorIDs ?? []), ...(metadata?.authorIDs ?? [])]),
-    ],
-    citationCountsByYear: work.citationCountsByYear?.length
-      ? work.citationCountsByYear
-      : (metadata?.citationCountsByYear ?? []),
-    references:
-      (work.references?.length ?? 0) >= (metadata?.references?.length ?? 0)
-        ? work.references
-        : metadata?.references,
-    resolvedReferenceCount:
-      work.resolvedReferenceCount ?? metadata?.resolvedReferenceCount ?? null,
-    fwci: work.fwci ?? metadata?.fwci ?? null,
-    citationPercentile:
-      work.citationPercentile ?? metadata?.citationPercentile ?? null,
-    isTop1Percent: work.isTop1Percent ?? metadata?.isTop1Percent ?? null,
-    isTop10Percent: work.isTop10Percent ?? metadata?.isTop10Percent ?? null,
-    citationsLastYear:
-      work.citationsLastYear ?? metadata?.citationsLastYear ?? null,
-    citationVelocity:
-      work.citationVelocity ?? metadata?.citationVelocity ?? null,
-    citationAcceleration:
-      work.citationAcceleration ?? metadata?.citationAcceleration ?? null,
-    influentialCitationCount:
-      work.influentialCitationCount ??
-      metadata?.influentialCitationCount ??
-      null,
-    publicationType: work.publicationType ?? metadata?.publicationType ?? null,
-    sourceMetrics: work.sourceMetrics ?? metadata?.sourceMetrics ?? null,
-    referenceAgeMean:
-      work.referenceAgeMean ?? metadata?.referenceAgeMean ?? null,
-    referenceAgeSpread:
-      work.referenceAgeSpread ?? metadata?.referenceAgeSpread ?? null,
-    selfCitationEstimate:
-      work.selfCitationEstimate ?? metadata?.selfCitationEstimate ?? null,
-    futureReferenceCount:
-      work.futureReferenceCount ?? metadata?.futureReferenceCount ?? null,
-    metadataCompleteness:
-      work.metadataCompleteness ?? metadata?.metadataCompleteness ?? null,
-    dataSources: [...sources],
-    updatedAt: timestamps.at(-1) ?? null,
-  } as T);
-  return mergeRelatedWorkHydrationState(normalized, metadata);
-}
-
-function localIndexes(nodes: CitationGraphNode[]): {
-  byDOI: Map<string, string>;
-  byTitle: Map<string, string>;
-} {
-  const byDOI = new Map<string, string>();
-  const byTitle = new Map<string, string>();
-  for (const node of nodes) {
-    const doi = normalizeDOI(node.doi);
-    const title = normalizeExactTitle(node.title);
-    if (doi && !byDOI.has(doi)) byDOI.set(doi, node.itemKey);
-    if (title && !byTitle.has(title)) byTitle.set(title, node.itemKey);
-  }
-  return { byDOI, byTitle };
-}
-
-function toExternal(
-  work: RelatedWorkMetadata,
-  localByDOI: Map<string, string>,
-  localByTitle: Map<string, string>,
-): ExternalWork {
-  const key = externalWorkCacheIdentity(work);
-  const resolved = normalizeRelatedWorkText(
-    key ? mergeMetadata(work, cachedExternalWorkMetadata(key)) : work,
-  );
-  const doi = normalizeDOI(resolved.doi);
-  const title = normalizeExactTitle(resolved.title);
-  const external: ExternalWork = {
-    ...resolved,
-    inLibraryItemKey:
-      (doi ? localByDOI.get(doi) : null) ??
-      (title ? localByTitle.get(title) : null) ??
-      resolved.zoteroItemKey ??
-      null,
-  };
-  registerExternalWorkMetrics(external);
-  return external;
-}
-
-function toExternalWorks(
-  works: RelatedWorkMetadata[],
-  libraryNodes: CitationGraphNode[],
-): ExternalWork[] {
-  const indexes = localIndexes(libraryNodes);
-  return works.map((work) => toExternal(work, indexes.byDOI, indexes.byTitle));
 }
 
 function compactRelationshipWork(work: ExternalWork): ExternalWork {
@@ -384,63 +333,6 @@ function compactRelationshipWork(work: ExternalWork): ExternalWork {
   };
 }
 
-async function cacheProviderRelationshipSnapshot(
-  node: CitationGraphNode,
-  direction: "references" | "cited-by",
-  provider: CitationProviderID,
-  works: RelatedWorkMetadata[],
-): Promise<RelatedWorkMetadata[]> {
-  const refreshedAt = new Date().toISOString();
-  const fullSnapshot = mergeRelatedWorkLists(works).map((work) =>
-    normalizeRelatedWorkText({
-      ...work,
-      dataSources: [...new Set([...(work.dataSources ?? []), provider])],
-      updatedAt: work.updatedAt ?? refreshedAt,
-      inLibraryItemKey:
-        (work as ExternalWork).inLibraryItemKey ?? work.zoteroItemKey ?? null,
-    }),
-  );
-  const cacheEntries: Array<{
-    identityKey: string;
-    metadata: RelatedWorkMetadata;
-  }> = [];
-  for (const work of fullSnapshot) {
-    const key = externalWorkCacheIdentity(work);
-    if (key && usableExternalTitle(work.title, work.doi)) {
-      cacheEntries.push({ identityKey: key, metadata: work });
-    }
-  }
-  await saveExternalWorkCacheSuccesses(cacheEntries);
-  const membership = fullSnapshot.map((work) =>
-    compactRelationshipWork(work as ExternalWork),
-  );
-  return replaceStoredProviderRelationships(
-    node,
-    direction,
-    provider,
-    membership,
-  );
-}
-
-async function mergeProviderRelationshipSnapshot(
-  node: CitationGraphNode,
-  direction: "references" | "cited-by",
-  provider: CitationProviderID,
-  works: RelatedWorkMetadata[],
-): Promise<RelatedWorkMetadata[]> {
-  const existing = getStoredProviderRelationshipEntry(
-    node,
-    direction,
-    provider,
-  );
-  return cacheProviderRelationshipSnapshot(
-    node,
-    direction,
-    provider,
-    mergeRelatedWorkLists(existing?.works ?? [], works),
-  );
-}
-
 function relationshipRecordSynchronizationKey(node: CitationGraphNode): string {
   return `${nodeLibraryID(node)}:${node.itemKey.toLocaleUpperCase()}`;
 }
@@ -450,13 +342,120 @@ interface RelationshipReportedCount {
   provider: CitationProviderID | null;
 }
 
+function retainedStoredCount(
+  count: number | null | undefined,
+  provider: CitationProviderID | null | undefined,
+): RelationshipReportedCount {
+  if (provider && !isProviderEnabled(provider)) {
+    return { count: null, provider: null };
+  }
+  return { count: count ?? null, provider: provider ?? null };
+}
+
+async function synchronizeStoredRelationshipSummary(
+  node: CitationGraphNode,
+  direction: "references" | "cited-by",
+  identifiedCount: number,
+  reported: RelationshipReportedCount | null,
+): Promise<RelationshipReportedCount> {
+  const record = getCitationMetricRecord(nodeLibraryID(node), node.itemKey);
+  if (!record) {
+    return {
+      count: reported?.count ?? null,
+      provider: reported?.provider ?? null,
+    };
+  }
+  if (direction === "references") {
+    const previous = retainedStoredCount(
+      record.referenceCount,
+      record.referenceCountProvider,
+    );
+    const result = richestCountAttribution([
+      previous,
+      {
+        count: reported?.count ?? null,
+        provider: reported?.provider ?? null,
+      },
+    ]);
+    await saveCitationMetricRecord({
+      ...record,
+      referenceCount: result.count,
+      referenceCountProvider: result.provider,
+      resolvedReferenceCount: identifiedCount,
+    });
+    return result;
+  }
+  const previous = retainedStoredCount(
+    record.citationCount,
+    record.citationCountProvider,
+  );
+  const citationCount = richestCountAttribution([
+    previous,
+    {
+      count: reported?.count ?? null,
+      provider: reported?.provider ?? null,
+    },
+  ]);
+  await saveCitationMetricRecord({
+    ...record,
+    citationCount: citationCount.count,
+    citationCountProvider: citationCount.provider,
+  });
+  return citationCount;
+}
+
+function publishRelationshipState(
+  node: CitationGraphNode,
+  direction: "references" | "cited-by",
+  phase:
+    | "refresh-started"
+    | "membership-published"
+    | "metadata-published"
+    | "refresh-finished",
+  identifiedCount: number,
+  reported: RelationshipReportedCount | null,
+): void {
+  publishRelationshipPublication({
+    libraryID: nodeLibraryID(node),
+    subjectItemKey: node.itemKey,
+    direction,
+    phase,
+    reportedCount: reported?.count ?? null,
+    reportedCountProvider: reported?.provider ?? null,
+    identifiedCount,
+  });
+}
+
+function storedRelationshipReportedCount(
+  node: CitationGraphNode,
+  direction: "references" | "cited-by",
+): RelationshipReportedCount {
+  const record = getCitationMetricRecord(nodeLibraryID(node), node.itemKey);
+  if (direction === "references") {
+    return {
+      count: record?.referenceCount ?? node.referenceCount,
+      provider:
+        record?.referenceCountProvider ?? node.referenceCountProvider ?? null,
+    };
+  }
+  return {
+    count: record?.citationCount ?? node.citationCount,
+    provider:
+      record?.citationCountProvider ?? node.citationCountProvider ?? null,
+  };
+}
+
 function expandStoredRelationshipMetadata(
   works: RelatedWorkMetadata[],
 ): RelatedWorkMetadata[] {
   return works.map((work) => {
-    const key = externalWorkCacheIdentity(work);
+    const key = stableExternalWorkIdentity(work);
     const cached = key ? cachedExternalWorkMetadata(key) : null;
-    return cached ? mergeMetadata(work, cached) : work;
+    const expanded = cached ? mergeExternalWorkMetadata(work, cached) : work;
+    // Citation metric records need a bibliography summary, not a second copy
+    // of abstracts, nested references, source metrics and citation histories
+    // already retained in the external-work cache.
+    return projectRelatedWorkSummary(expanded, false);
   });
 }
 
@@ -470,20 +469,31 @@ async function synchronizeStoredRelationshipRecord(
   if (!record) return;
   if (direction === "references") {
     const expandedWorks = expandStoredRelationshipMetadata(works);
+    const previous = retainedStoredCount(
+      record.referenceCount,
+      record.referenceCountProvider,
+    );
+    const referenceCount = richestCountAttribution([
+      previous,
+      {
+        count: reported?.count ?? null,
+        provider: reported?.provider ?? null,
+      },
+    ]);
     await saveCitationMetricRecord({
       ...record,
-      referenceCount: reported?.count ?? record.referenceCount,
-      referenceCountProvider:
-        reported?.provider ?? record.referenceCountProvider,
+      referenceCount: referenceCount.count,
+      referenceCountProvider: referenceCount.provider,
       resolvedReferenceCount: expandedWorks.length,
       references: expandedWorks,
     });
   } else {
+    const previous = retainedStoredCount(
+      record.citationCount,
+      record.citationCountProvider,
+    );
     const citationCount = richestCountAttribution([
-      {
-        count: record.citationCount,
-        provider: record.citationCountProvider,
-      },
+      previous,
       {
         count: reported?.count ?? null,
         provider: reported?.provider ?? null,
@@ -503,14 +513,35 @@ function synchronizeRelationshipRecord(
   works: RelatedWorkMetadata[],
   reported: RelationshipReportedCount | null = null,
 ): Promise<void> {
+  return queueRelationshipRecordSynchronization(node, () =>
+    synchronizeStoredRelationshipRecord(node, direction, works, reported),
+  );
+}
+
+function synchronizeRelationshipSummary(
+  node: CitationGraphNode,
+  direction: "references" | "cited-by",
+  identifiedCount: number,
+  reported: RelationshipReportedCount | null,
+): Promise<RelationshipReportedCount> {
+  return queueRelationshipRecordSynchronization(node, () =>
+    synchronizeStoredRelationshipSummary(
+      node,
+      direction,
+      identifiedCount,
+      reported,
+    ),
+  );
+}
+
+function queueRelationshipRecordSynchronization<T>(
+  node: CitationGraphNode,
+  task: () => Promise<T>,
+): Promise<T> {
   const key = relationshipRecordSynchronizationKey(node);
   const previous =
     relationshipRecordSynchronizations.get(key) ?? Promise.resolve();
-  const current = previous
-    .catch(() => undefined)
-    .then(() =>
-      synchronizeStoredRelationshipRecord(node, direction, works, reported),
-    );
+  const current = previous.catch(() => undefined).then(task);
   relationshipRecordSynchronizations.set(key, current);
   void current.then(
     () => {
@@ -576,20 +607,23 @@ export async function storeExternalRelationshipSnapshot(
     compactRelationshipWork(work as ExternalWork),
   );
   await replaceStoredRelationshipSelection(node, direction, selectedMembership);
+  const reported = {
+    count: options.reportedCount ?? null,
+    provider,
+  } satisfies RelationshipReportedCount;
   await synchronizeRelationshipRecord(
     node,
     direction,
     prepared.identifiedWorks,
-    {
-      count: options.reportedCount ?? null,
-      provider,
-    },
+    reported,
   );
-  await cacheProviderRelationshipSnapshot(
+  const publishedReported = storedRelationshipReportedCount(node, direction);
+  publishRelationshipState(
     node,
     direction,
-    provider,
-    prepared.identifiedWorks,
+    "membership-published",
+    prepared.identifiedWorks.length,
+    publishedReported,
   );
   queueRelationshipMetadataHydration(
     node,
@@ -603,14 +637,13 @@ export async function storeExternalRelationshipSnapshot(
 function needsRelationshipBibliographicMetadata(
   work: RelatedWorkMetadata,
 ): boolean {
-  if (!relatedWorkNeedsSummary(work)) return false;
+  // Relationship lists can already present a useful card when a title and at
+  // least one piece of bibliographic context are present. Citation/reference
+  // totals and venue are optional enrichment and must not trigger hundreds of
+  // network lookups merely because a large References tab was opened.
+  if (!externalWorkDisplayTitle(work)) return true;
   return (
-    !externalWorkDisplayTitle(work) ||
-    work.year === null ||
-    work.authors.length === 0 ||
-    !work.sourceTitle?.trim() ||
-    work.citationCount == null ||
-    work.referenceCount == null
+    work.year === null && work.authors.length === 0 && !work.sourceTitle?.trim()
   );
 }
 
@@ -627,11 +660,16 @@ function needsExternalMetadata(work: RelatedWorkMetadata): boolean {
 function relationshipHydrationTargetKey(
   target: RelationshipMetadataHydrationTarget,
 ): string {
-  return `${nodeLibraryID(target.node)}:${target.node.itemKey.toLocaleUpperCase()}:${target.direction}`;
+  return [
+    nodeLibraryID(target.node),
+    target.node.itemKey.toLocaleUpperCase(),
+    target.direction,
+  ].join(":");
 }
 
 function scheduleRelationshipMetadataHydrationRun(): void {
   if (
+    !externalDiscoveryRunning ||
     relationshipMetadataHydrationRunning ||
     relationshipMetadataHydrationTimer !== null ||
     relationshipMetadataHydrationQueue.size === 0
@@ -640,6 +678,11 @@ function scheduleRelationshipMetadataHydrationRun(): void {
   }
   relationshipMetadataHydrationTimer = setTimeout(() => {
     relationshipMetadataHydrationTimer = null;
+    if (!externalDiscoveryRunning) return;
+    if (activeRelationshipMembershipRefreshes > 0) {
+      scheduleRelationshipMetadataHydrationRun();
+      return;
+    }
     void runRelationshipMetadataHydrationQueue().catch((error: unknown) => {
       Zotero.debug(
         `Citation Map: background relationship metadata hydration failed: ${String(error)}`,
@@ -655,21 +698,25 @@ function queueRelationshipMetadataHydration(
   retryAttempted = false,
   providers = getProviderPlan(
     direction === "references" ? "references" : "citations",
-    getProviderPreference(),
+    "auto",
   ).providers,
+  silent = false,
+  onHydrated?: () => void,
 ): void {
+  if (!externalDiscoveryRunning) return;
   const target: RelationshipMetadataHydrationTarget = {
     node,
     direction,
     providers: new Set(providers),
+    silent,
+    onHydrated: new Set(onHydrated ? [onHydrated] : []),
   };
   const targetKey = relationshipHydrationTargetKey(target);
   for (const rawWork of works) {
     if (!needsRelationshipBibliographicMetadata(rawWork)) continue;
-    const key = externalWorkCacheIdentity(rawWork);
-    if (!key) continue;
+    const key = externalWorkLookupIdentity(rawWork);
     const cached = cachedExternalWorkMetadata(key);
-    const work = cached ? mergeMetadata(rawWork, cached) : rawWork;
+    const work = cached ? mergeExternalWorkMetadata(rawWork, cached) : rawWork;
     const stillNeedsLookup = needsRelationshipBibliographicMetadata(work);
     if (retryAttempted) relationshipMetadataAttemptedThisSession.delete(key);
     if (stillNeedsLookup && relationshipMetadataAttemptedThisSession.has(key)) {
@@ -677,18 +724,25 @@ function queueRelationshipMetadataHydration(
     }
     const existing = relationshipMetadataHydrationQueue.get(key);
     if (existing) {
-      existing.work = mergeMetadata(existing.work, work);
+      existing.work = mergeExternalWorkMetadata(existing.work, work);
       const existingTarget = existing.targets.get(targetKey);
       if (existingTarget) {
         for (const provider of target.providers) {
           existingTarget.providers.add(provider);
         }
+        existingTarget.silent = existingTarget.silent && silent;
+        if (onHydrated) existingTarget.onHydrated.add(onHydrated);
       } else {
         existing.targets.set(targetKey, target);
       }
     } else {
       relationshipMetadataHydrationQueue.set(key, {
-        work: { ...work, authors: [...work.authors] },
+        // Keep only the compact fields required by summary resolution. Some
+        // provider relationship records carry abstracts, nested references,
+        // source metrics and citation histories; retaining those fields for
+        // every queued neighbour caused the background queue itself to become
+        // a second large in-memory relationship cache.
+        work: projectRelatedWorkSummary(work, false),
         targets: new Map([[targetKey, target]]),
       });
     }
@@ -698,57 +752,134 @@ function queueRelationshipMetadataHydration(
 
 async function persistHydratedRelationshipMetadata(
   targets: RelationshipMetadataHydrationTarget[],
-  metadataIndex: Map<string, RelatedWorkMetadata>,
 ): Promise<void> {
-  void metadataIndex;
+  const uniqueTargets = uniqueRelationshipHydrationTargets(targets);
+
+  // Summary metadata is already persisted once in external_works_v2 and is
+  // joined into relationship membership lazily. Rewriting the citation-metric
+  // record here duplicated the complete bibliography JSON after every summary
+  // run and could block Zotero's main thread for many seconds on 1,000+ item
+  // lists. Counts and membership were committed before hydration, so metadata
+  // publication only needs to invalidate views and announce the final state.
+  for (const target of uniqueTargets) {
+    const selectedCount = getStoredRelationshipCount(
+      target.node,
+      target.direction,
+    );
+    publishRelationshipState(
+      target.node,
+      target.direction,
+      "metadata-published",
+      selectedCount,
+      storedRelationshipReportedCount(target.node, target.direction),
+    );
+    await yieldToUI();
+  }
+}
+
+function relationshipMetadataHydrationShowsProgress(): boolean {
+  for (const entry of relationshipMetadataHydrationQueue.values()) {
+    for (const target of entry.targets.values()) {
+      if (!target.silent) return true;
+    }
+  }
+  return false;
+}
+
+function takeRelationshipMetadataHydrationBatch(
+  maximum: number,
+): Array<[string, RelationshipMetadataHydrationQueueEntry]> {
+  const batch: Array<[string, RelationshipMetadataHydrationQueueEntry]> = [];
+  for (const entry of relationshipMetadataHydrationQueue.entries()) {
+    batch.push(entry);
+    if (batch.length >= maximum) break;
+  }
+  return batch;
+}
+
+function accumulateHydrationTargets(
+  destination: Map<string, RelationshipMetadataHydrationTarget>,
+  targets: RelationshipMetadataHydrationTarget[],
+): void {
+  for (const target of uniqueRelationshipHydrationTargets(targets)) {
+    const key = relationshipHydrationTargetKey(target);
+    const existing = destination.get(key);
+    if (!existing) {
+      destination.set(key, target);
+      continue;
+    }
+    for (const provider of target.providers) existing.providers.add(provider);
+    existing.silent = existing.silent && target.silent;
+    for (const callback of target.onHydrated) {
+      existing.onHydrated.add(callback);
+    }
+  }
+}
+
+function uniqueRelationshipHydrationTargets(
+  targets: RelationshipMetadataHydrationTarget[],
+): RelationshipMetadataHydrationTarget[] {
   const uniqueTargets = new Map<string, RelationshipMetadataHydrationTarget>();
   for (const target of targets) {
     const key = relationshipHydrationTargetKey(target);
     const existing = uniqueTargets.get(key);
     if (existing) {
       for (const provider of target.providers) existing.providers.add(provider);
+      existing.silent = existing.silent && target.silent;
+      for (const callback of target.onHydrated) {
+        existing.onHydrated.add(callback);
+      }
     } else {
       uniqueTargets.set(key, target);
     }
   }
-
-  // Membership rows store only stable identities. Hydrated metadata lives once
-  // in the global external-work cache, so no relationship snapshot rewrite is
-  // required when a title, author list, journal, or count is filled in.
-  for (const target of uniqueTargets.values()) {
-    const selected = getStoredRelationshipWorks(target.node, target.direction);
-    await synchronizeRelationshipRecord(
-      target.node,
-      target.direction,
-      expandStoredRelationshipMetadata(selected),
-    );
-  }
+  return [...uniqueTargets.values()];
 }
 
 async function runRelationshipMetadataHydrationQueue(): Promise<void> {
-  if (relationshipMetadataHydrationRunning) return;
+  if (!externalDiscoveryRunning || relationshipMetadataHydrationRunning) return;
+  const generation = externalDiscoveryGeneration;
   relationshipMetadataHydrationRunning = true;
   const initialTotal = relationshipMetadataHydrationQueue.size;
   let completed = 0;
-  const progress = createUpdateProgress({
-    title: "Updating relationship metadata",
-    message: `Preparing ${initialTotal} related paper${initialTotal === 1 ? "" : "s"}`,
-    total: Math.max(1, initialTotal),
-  });
+  let remainingFallbackLookups = RELATIONSHIP_SUMMARY_BACKGROUND_FALLBACK_LIMIT;
+  const hydratedTargets = new Map<
+    string,
+    RelationshipMetadataHydrationTarget
+  >();
+  const hydratedIdentityKeys = new Set<string>();
+  const showProgress = relationshipMetadataHydrationShowsProgress();
+  const progress = showProgress
+    ? createUpdateProgress({
+        title: "Updating relationship metadata",
+        message: `Preparing ${initialTotal} related paper${initialTotal === 1 ? "" : "s"}`,
+        total: Math.max(1, initialTotal),
+      })
+    : relationshipProgress(true, "", "");
   try {
-    while (relationshipMetadataHydrationQueue.size > 0) {
+    while (
+      externalDiscoveryRunning &&
+      generation === externalDiscoveryGeneration &&
+      relationshipMetadataHydrationQueue.size > 0
+    ) {
       if (isCitationRequestCancellationRequested()) {
         relationshipMetadataHydrationQueue.clear();
         break;
       }
-      const batchEntries = [
-        ...relationshipMetadataHydrationQueue.entries(),
-      ].slice(0, relationshipMetadataBatchSize());
+      if (activeRelationshipMembershipRefreshes > 0) {
+        await new Promise<void>((resolve) =>
+          setTimeout(resolve, RELATIONSHIP_METADATA_BACKGROUND_DELAY_MS),
+        );
+        continue;
+      }
+      const batchEntries = takeRelationshipMetadataHydrationBatch(
+        relationshipMetadataBatchSize(),
+      );
       const targets: RelationshipMetadataHydrationTarget[] = [];
       const input: ExternalWork[] = [];
       for (const [key, entry] of batchEntries) {
         relationshipMetadataHydrationQueue.delete(key);
-        relationshipMetadataAttemptedThisSession.add(key);
+        markRelationshipMetadataAttempted(key);
         targets.push(...entry.targets.values());
         input.push({
           ...entry.work,
@@ -765,17 +896,37 @@ async function runRelationshipMetadataHydrationQueue(): Promise<void> {
       progress.setProgress(
         completed,
         currentTotal,
-        `Retrieving summaries for ${input.length} related paper${input.length === 1 ? "" : "s"} · ${completed}/${currentTotal} complete`,
+        `Retrieving summaries for ${input.length} related paper${
+          input.length === 1 ? "" : "s"
+        } · ${completed}/${currentTotal} complete`,
       );
 
       // Batch-capable providers run first, then Crossref/other DOI providers are
       // allowed to resolve every remaining work in this bounded background chunk.
+      // Yield before and after each network/normalization batch so the popup can
+      // repaint and Zotero can continue handling input.
+      await yieldToUI();
+      const fallbackAllocation = Number.isFinite(remainingFallbackLookups)
+        ? Math.min(remainingFallbackLookups, input.length)
+        : Number.POSITIVE_INFINITY;
+      if (Number.isFinite(remainingFallbackLookups)) {
+        remainingFallbackLookups = Math.max(
+          0,
+          remainingFallbackLookups - fallbackAllocation,
+        );
+      }
       const hydrated = await hydrateExternalWorksMetadata(
         input,
         false,
-        RELATIONSHIP_SUMMARY_BACKGROUND_FALLBACK_LIMIT,
+        fallbackAllocation,
         true,
+        false,
+        {
+          deferRelationshipInvalidation: true,
+          registerMetrics: false,
+        },
       );
+      await yieldToUI();
       if (isCitationRequestCancellationRequested()) {
         relationshipMetadataHydrationQueue.clear();
         break;
@@ -784,10 +935,12 @@ async function runRelationshipMetadataHydrationQueue(): Promise<void> {
         (work) => !needsRelationshipBibliographicMetadata(work),
       );
       if (resolved.length) {
-        await persistHydratedRelationshipMetadata(
-          targets,
-          relationshipMetadataIndex(resolved),
-        );
+        accumulateHydrationTargets(hydratedTargets, targets);
+        for (const work of resolved) {
+          for (const identity of stableWorkAliases(work)) {
+            hydratedIdentityKeys.add(identity);
+          }
+        }
       }
       completed += input.length;
       progress.setProgress(
@@ -800,6 +953,49 @@ async function runRelationshipMetadataHydrationQueue(): Promise<void> {
         await new Promise<void>((resolve) =>
           setTimeout(resolve, RELATIONSHIP_METADATA_BACKGROUND_DELAY_MS),
         );
+      }
+    }
+
+    // A large bibliography used to rewrite and republish its complete
+    // relationship record after every 100-summary batch. Keep the newly
+    // resolved metadata in the external-work cache during retrieval, then
+    // invalidate and rebuild each affected relationship list exactly once.
+    if (
+      externalDiscoveryRunning &&
+      generation === externalDiscoveryGeneration
+    ) {
+      const finalTargets = [...hydratedTargets.values()];
+      if (hydratedIdentityKeys.size) {
+        invalidateExternalRelationshipMetadata(hydratedIdentityKeys);
+      }
+      if (finalTargets.length) {
+        progress.setProgress(
+          completed,
+          Math.max(initialTotal, completed),
+          "Publishing retrieved summaries",
+        );
+        const publicationStartedAt = Date.now();
+        await persistHydratedRelationshipMetadata(finalTargets);
+        const publicationDurationMs = Date.now() - publicationStartedAt;
+        if (publicationDurationMs >= 500) {
+          Zotero.debug(
+            `Citation Map: published relationship summaries for ${finalTargets.length} target${
+              finalTargets.length === 1 ? "" : "s"
+            } in ${publicationDurationMs} ms`,
+          );
+        }
+        for (const target of finalTargets) {
+          for (const callback of target.onHydrated) {
+            try {
+              callback();
+            } catch (error) {
+              Zotero.debug(
+                `Citation Map: relationship hydration callback failed: ${String(error)}`,
+              );
+            }
+          }
+        }
+        await yieldToUI();
       }
     }
     if (!progress.isDismissed()) {
@@ -818,10 +1014,23 @@ async function runRelationshipMetadataHydrationQueue(): Promise<void> {
     throw error;
   } finally {
     relationshipMetadataHydrationRunning = false;
-    if (!isCitationRequestCancellationRequested()) {
+    if (
+      externalDiscoveryRunning &&
+      generation === externalDiscoveryGeneration &&
+      !isCitationRequestCancellationRequested()
+    ) {
       scheduleRelationshipMetadataHydrationRun();
     }
   }
+}
+
+interface ExternalMetadataHydrationRuntimeOptions {
+  /** Delay expensive relationship-list cache invalidation until the caller
+   * publishes a complete group of summary batches. */
+  deferRelationshipInvalidation?: boolean;
+  /** Background relationship summaries do not need to populate the global
+   * graph-metric registry until a work is actually materialized in a view. */
+  registerMetrics?: boolean;
 }
 
 export async function hydrateExternalWorksMetadata(
@@ -830,11 +1039,20 @@ export async function hydrateExternalWorksMetadata(
   individualLookupLimit = Number.POSITIVE_INFINITY,
   bibliographicOnly = false,
   forceRefresh = false,
+  runtimeOptions: ExternalMetadataHydrationRuntimeOptions = {},
 ): Promise<ExternalWork[]> {
-  const hydrated = works.map((work) => {
-    const key = externalWorkCacheIdentity(work);
-    return key ? mergeMetadata(work, cachedExternalWorkMetadata(key)) : work;
-  });
+  if (!externalDiscoveryRunning) return works;
+  const checkpoint = createCooperativeCheckpoint();
+  const hydrated = await mapCooperatively(
+    works,
+    (work) => {
+      const key = stableExternalWorkIdentity(work);
+      return key
+        ? mergeExternalWorkMetadata(work, cachedExternalWorkMetadata(key))
+        : work;
+    },
+    { forceEvery: 25 },
+  );
 
   const resolutionByIndex = new Map<
     number,
@@ -849,8 +1067,7 @@ export async function hydrateExternalWorksMetadata(
       ? needsRelationshipBibliographicMetadata(work)
       : needsExternalMetadata(work);
     if (!forceRefresh && !needsMetadata) continue;
-    const key = externalWorkCacheIdentity(work);
-    if (!key) continue;
+    const key = externalWorkLookupIdentity(work);
     const basicMetadataMissing = bibliographicOnly
       ? needsRelationshipBibliographicMetadata(work)
       : !usableExternalTitle(work.title, work.doi) ||
@@ -877,6 +1094,7 @@ export async function hydrateExternalWorksMetadata(
     } else {
       newCandidates.set(key, { work, indexes: [index] });
     }
+    await checkpoint();
   }
 
   if (newCandidates.size) {
@@ -910,7 +1128,7 @@ export async function hydrateExternalWorksMetadata(
       return { batch, deferred, individualLookupLimit: allocation };
     });
 
-    void runBounded(
+    void mapBounded(
       jobs,
       Math.max(
         providerExecutionPolicy("semantic-scholar").requestParallelism,
@@ -924,14 +1142,12 @@ export async function hydrateExternalWorksMetadata(
           }
           const input = batch.map(([, entry]) => entry.work);
           const resolved = bibliographicOnly
-            ? await resolveRelatedWorkSummaries(
-                input,
-                getProviderPreference(),
-                { individualLookupLimit: lookupLimit },
-              )
+            ? await resolveRelatedWorkSummaries(input, "auto", {
+                individualLookupLimit: lookupLimit,
+              })
             : await resolveRelatedWorksMetadata(
                 input,
-                getProviderPreference(),
+                "auto",
                 includeSecondaryMetrics,
                 { individualLookupLimit: lookupLimit },
               );
@@ -939,9 +1155,22 @@ export async function hydrateExternalWorksMetadata(
             result.resolve(resolved[index] ?? null);
           });
         } catch (error) {
-          Zotero.debug(
-            `Citation Map: metadata batch resolution failed: ${String(error)}`,
+          const status = externalCacheFailureStatus(error);
+          const message =
+            `Metadata resolution failed for ${batch.length} ` +
+            `work${batch.length === 1 ? "" : "s"}: ${String(error)}`;
+          await saveExternalWorkCacheFailures(
+            batch.map(([identityKey]) => ({
+              identityKey,
+              status,
+              message,
+            })),
+            {
+              invalidateRelationships:
+                runtimeOptions.deferRelationshipInvalidation !== true,
+            },
           );
+          Zotero.logError(new Error(message, { cause: error }));
           for (const result of deferred) result.resolve(null);
         }
       },
@@ -959,120 +1188,64 @@ export async function hydrateExternalWorksMetadata(
     identityKey: string;
     metadata: RelatedWorkMetadata;
   }> = [];
-  await Promise.all(
-    [...resolutionByIndex.entries()].map(async ([workIndex, resolution]) => {
-      const metadata = await resolution;
-      if (!metadata) return;
-      hydrated[workIndex] = mergeMetadata(hydrated[workIndex], metadata);
-      const key = externalWorkCacheIdentity(hydrated[workIndex]);
+  for (const [workIndex, resolution] of resolutionByIndex.entries()) {
+    const metadata = await resolution;
+    if (metadata) {
+      hydrated[workIndex] = mergeExternalWorkMetadata(
+        hydrated[workIndex],
+        metadata,
+      );
+      const key = stableExternalWorkIdentity(hydrated[workIndex]);
       if (
         key &&
         usableExternalTitle(hydrated[workIndex].title, hydrated[workIndex].doi)
       ) {
         cacheEntries.push({ identityKey: key, metadata: hydrated[workIndex] });
       }
-    }),
-  );
-  await saveExternalWorkCacheSuccesses(cacheEntries);
-  registerExternalWorkMetricBatch(hydrated);
-  return hydrated;
-}
-
-function identifiersForNode(node: CitationGraphNode): WorkIdentifiers {
-  return {
-    doi: normalizeDOI(node.doi),
-    pmid: null,
-    arxiv: null,
-    isbn: null,
-    title: node.title,
-    normalizedTitle: normalizeExactTitle(node.title),
-    year: node.year,
-    authors: node.authors,
-    sourceTitle: node.sourceTitle,
-  };
-}
-
-function normalizedSurname(value: string): string {
-  const compact = value
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLocaleLowerCase()
-    .replace(/[^a-z0-9\s'-]/g, " ")
-    .trim();
-  return compact.split(/\s+/).filter(Boolean).at(-1) ?? compact;
-}
-
-function providerMatchCompatible(
-  match: {
-    doi: string | null;
-    title: string | null;
-    year: number | null;
-    authors: string[];
-  },
-  identifiers: WorkIdentifiers,
-): boolean {
-  const expectedDOI = normalizeDOI(identifiers.doi);
-  const matchDOI = normalizeDOI(match.doi);
-  if (expectedDOI && matchDOI) return expectedDOI === matchDOI;
-
-  const expectedTitle = identifiers.normalizedTitle;
-  const matchTitle = normalizeExactTitle(match.title);
-  if (expectedTitle && matchTitle && expectedTitle !== matchTitle) return false;
-  if (
-    identifiers.year !== null &&
-    match.year !== null &&
-    Math.abs(identifiers.year - match.year) > 1
-  ) {
-    return false;
-  }
-  if (identifiers.authors.length && match.authors.length) {
-    const expected = new Set(
-      identifiers.authors.map(normalizedSurname).filter(Boolean),
-    );
-    if (
-      !match.authors.some((author) => expected.has(normalizedSurname(author)))
-    ) {
-      return false;
     }
+    await checkpoint();
   }
-  return Boolean(expectedTitle && matchTitle && expectedTitle === matchTitle);
+  await checkpoint(true);
+  const cacheSaveStartedAt = Date.now();
+  await saveExternalWorkCacheSuccesses(cacheEntries, {
+    invalidateRelationships:
+      runtimeOptions.deferRelationshipInvalidation !== true,
+  });
+  const cacheSaveDurationMs = Date.now() - cacheSaveStartedAt;
+  if (cacheSaveDurationMs >= 500) {
+    Zotero.debug(
+      `Citation Map: saved ${cacheEntries.length} related-paper summaries in ${cacheSaveDurationMs} ms`,
+    );
+  }
+  await checkpoint(true);
+  if (runtimeOptions.registerMetrics !== false) {
+    registerExternalWorkMetricBatch(hydrated);
+  }
+  return hydrated;
 }
 
 async function lookupProviderRecord(
   providerID: CitationProviderID,
   identifiers: WorkIdentifiers,
+  requestOptions?: ProviderRequestOptions,
 ) {
   const provider = getCitationProvider(providerID);
   const lookup = provider.lookupForRelations ?? provider.lookup;
-  let match = provider.supports(identifiers) ? await lookup(identifiers) : null;
+  let match = provider.supports(identifiers)
+    ? await lookup(identifiers, requestOptions)
+    : null;
   if (
     (!match || match.status !== "success") &&
     provider.searchExactTitle &&
     identifiers.normalizedTitle
   ) {
-    match = await provider.searchExactTitle(identifiers);
+    match = await provider.searchExactTitle(identifiers, requestOptions);
   }
   return match?.status === "success" &&
-    providerMatchCompatible(match, identifiers)
+    matchWorkIdentifiers(identifiers, relatedWorkFromProviderLookup(match))
+      .decision === "same-work"
     ? match
     : null;
-}
-
-function stampProviderWorks(
-  works: RelatedWorkMetadata[],
-  providerID: CitationProviderID,
-  updatedAt = new Date().toISOString(),
-): RelatedWorkMetadata[] {
-  return works.map((work) =>
-    projectRelatedWorkSummary(
-      {
-        ...work,
-        dataSources: [...new Set([...(work.dataSources ?? []), providerID])],
-        updatedAt: work.updatedAt ?? updatedAt,
-      },
-      false,
-    ),
-  );
 }
 
 async function withProviderTimeout<T>(
@@ -1104,6 +1277,7 @@ async function fetchProviderRelationshipSnapshot(
   direction: "references" | "cited-by",
   maximum: number,
   providerWorkIDs: ProviderIdentityHints = {},
+  requestOptions?: ProviderRequestOptions,
 ): Promise<RelationshipProviderSnapshot> {
   const failed = (): RelationshipProviderSnapshot => ({
     provider: providerID,
@@ -1113,7 +1287,8 @@ async function fetchProviderRelationshipSnapshot(
     succeeded: false,
   });
   try {
-    const identifiers = identifiersForNode(node);
+    const checkpoint = createCooperativeCheckpoint();
+    const identifiers = workIdentifiersForGraphNode(node);
     const provider = getCitationProvider(providerID);
     const nativeFetcher =
       direction === "references"
@@ -1129,15 +1304,19 @@ async function fetchProviderRelationshipSnapshot(
             direction,
             requested,
             offset,
+            requestOptions,
           )
       : nativeFetcher;
-    const hintedProviderWorkID = providerWorkIDs[providerID] ?? null;
+    const hintedProviderWorkID =
+      providerWorkIDs[providerID] ??
+      (providerID === node.provider ? node.providerWorkID : null) ??
+      null;
     const match = hintedProviderWorkID
       ? null
       : await withProviderTimeout(
           providerID,
           direction,
-          lookupProviderRecord(providerID, identifiers),
+          lookupProviderRecord(providerID, identifiers, requestOptions),
         );
     const reportedCount =
       direction === "references"
@@ -1181,7 +1360,6 @@ async function fetchProviderRelationshipSnapshot(
     const providerWorkID =
       hintedProviderWorkID ??
       match?.providerWorkID ??
-      (providerID === node.provider ? node.providerWorkID : null) ??
       (providerID === "opencitations" ? normalizeDOI(node.doi) : null);
     if (!providerWorkID) return failed();
 
@@ -1199,6 +1377,10 @@ async function fetchProviderRelationshipSnapshot(
           Math.max(RELATIONSHIP_MAX_PAGES, Math.ceil(target / pageSize) + 1),
         )
       : RELATIONSHIP_ABSOLUTE_MAX_PAGES;
+    const collectedWorks = [...works];
+    const collectedIdentities = new Set(
+      collectedWorks.map((work) => externalWorkLookupIdentity(work)),
+    );
     let offset = works.length;
     let pages = 0;
     let endpointExhausted = false;
@@ -1213,7 +1395,9 @@ async function fetchProviderRelationshipSnapshot(
       const pageResult = await withProviderTimeout(
         providerID,
         direction,
-        fetcher(providerWorkID, requested, offset),
+        hasSummaryFetcher
+          ? fetcher(providerWorkID, requested, offset)
+          : nativeFetcher!(providerWorkID, requested, offset, requestOptions),
       );
       if (!Array.isArray(pageResult)) return failed();
       const page = pageResult;
@@ -1223,27 +1407,34 @@ async function fetchProviderRelationshipSnapshot(
         break;
       }
       const stamped = stampProviderWorks(page, providerID);
-      const signature = stamped
-        .map((work) => externalWorkCacheIdentity(work) ?? JSON.stringify(work))
-        .join("|");
+      const pageIdentities = stamped.map((work) =>
+        externalWorkLookupIdentity(work),
+      );
+      const signature = pageIdentities.join("|");
       if (signature === previousSignature) {
-        return {
-          provider: providerID,
-          works,
-          reportedCount,
-          complete: false,
-          succeeded: true,
-        };
+        break;
       }
       previousSignature = signature;
-      works = mergeRelatedWorkLists(works, stamped);
+      collectedWorks.push(...stamped);
+      for (const identity of pageIdentities) collectedIdentities.add(identity);
       offset += page.length;
+      // Keep page retrieval append-only. Re-merging the complete accumulated
+      // list after every page makes large bibliographies increasingly
+      // expensive and can monopolize Zotero's main thread. Canonicalize once
+      // after the endpoint has finished instead.
+      await checkpoint(true);
       if (page.length < requested) {
         endpointExhausted = true;
         break;
       }
-      if (reportedCount !== null && works.length >= reportedCount) break;
+      if (reportedCount !== null && collectedIdentities.size >= reportedCount) {
+        break;
+      }
     }
+
+    await checkpoint(true);
+    works = mergeRelatedWorkLists(collectedWorks);
+    await checkpoint(true);
 
     const reachedReportedCount =
       reportedCount !== null && works.length >= reportedCount;
@@ -1274,23 +1465,45 @@ function cachedReferenceWorks(node: CitationGraphNode): RelatedWorkMetadata[] {
 
 export function getCachedExternalReferences(
   node: CitationGraphNode,
-  libraryNodes: CitationGraphNode[],
+  libraryNodes: readonly LibraryWorkIdentity[],
   maximum: number,
   offset: number,
+  options: { queueBackgroundHydration?: boolean } = {},
 ): ExternalWork[] {
   const cached = cachedReferenceWorks(node);
-  queueRelationshipMetadataHydration(node, "references", cached);
+  if (options.queueBackgroundHydration !== false) {
+    // Opening a cached relationship list must not create a foreground popup.
+    // Only genuinely display-incomplete records are queued by the hydrator.
+    queueRelationshipMetadataHydration(
+      node,
+      "references",
+      cached,
+      false,
+      undefined,
+      true,
+    );
+  }
   return toExternalWorks(cached.slice(offset, offset + maximum), libraryNodes);
 }
 
 export function getCachedExternalCitedBy(
   node: CitationGraphNode,
-  libraryNodes: CitationGraphNode[],
+  libraryNodes: readonly LibraryWorkIdentity[],
   maximum: number,
   offset: number,
+  options: { queueBackgroundHydration?: boolean } = {},
 ): ExternalWork[] {
   const cached = cachedRelationshipResults(node, "cited-by");
-  queueRelationshipMetadataHydration(node, "cited-by", cached);
+  if (options.queueBackgroundHydration !== false) {
+    queueRelationshipMetadataHydration(
+      node,
+      "cited-by",
+      cached,
+      false,
+      undefined,
+      true,
+    );
+  }
   return toExternalWorks(cached.slice(offset, offset + maximum), libraryNodes);
 }
 
@@ -1308,7 +1521,18 @@ export interface ExternalRelationshipRefreshOptions {
   summaryLookupLimit?: number;
   queueBackgroundHydration?: boolean;
   providerWorkIDs?: ProviderIdentityHints;
+  mode?: RelationshipRefreshMode;
+  providerStrategy?: RelationshipProviderStrategy;
+  providerLimit?: number;
+  metadataHydrationLimit?: number;
+  metadataBatchSize?: number;
+  /** Show a singleton progress activity while deferred metadata is hydrated. */
+  showBackgroundProgress?: boolean;
   onMembershipResolved?: (resolution: RelationshipRefreshResolution) => void;
+  onMetadataHydrated?: () => void;
+  signal?: CancellationSignal;
+  /** Internal cancellation hook used by the shared progress activity. */
+  onCancel?: () => void;
 }
 
 interface RelationshipProgress {
@@ -1323,8 +1547,11 @@ function relationshipProgress(
   silent: boolean,
   title: string,
   message: string,
+  onCancel?: () => void,
 ): RelationshipProgress {
-  if (!silent) return createUpdateProgress({ title, message, total: 4 });
+  if (!silent) {
+    return createUpdateProgress({ title, message, total: 4, onCancel });
+  }
   return {
     setProgress: () => undefined,
     finish: () => undefined,
@@ -1334,26 +1561,124 @@ function relationshipProgress(
   };
 }
 
-export async function refreshExternalRelationships(
+function relationshipProviders(
   node: CitationGraphNode,
-  libraryNodes: CitationGraphNode[],
   direction: "references" | "cited-by",
-  maximumOrOptions:
-    number | ExternalRelationshipRefreshOptions = Number.POSITIVE_INFINITY,
-  legacyRefreshMembership = false,
+  strategy: RelationshipProviderStrategy,
+  maximum: number,
+): CitationProviderID[] {
+  const plan = getProviderPlan(
+    direction === "references" ? "references" : "citations",
+    "auto",
+  );
+  const enabledProviderSet = new Set(getEnabledProviders());
+  const enabledProviders = plan.providers.filter((provider) =>
+    enabledProviderSet.has(provider),
+  );
+  const countProvider =
+    direction === "references"
+      ? node.referenceCountProvider
+      : node.citationCountProvider;
+  return orderRelationshipProviders(
+    enabledProviders,
+    preferredRelationshipProviders(
+      direction,
+      enabledProviders,
+      node.provider,
+      countProvider,
+      Boolean(normalizeDOI(node.doi)),
+    ),
+    strategy,
+    maximum,
+  );
+}
+
+async function hydrateRelationshipSelectionInBatches(
+  works: RelatedWorkMetadata[],
+  libraryNodes: readonly LibraryWorkIdentity[],
+  maximum: number,
+  batchSize: number,
+  individualLookupLimit: number,
+  signal?: CancellationSignal,
+): Promise<Map<string, RelatedWorkMetadata>> {
+  const boundedMaximum = Number.isFinite(maximum)
+    ? Math.max(0, Math.floor(maximum))
+    : works.length;
+  const selected = works.slice(0, boundedMaximum);
+  const metadata = new Map<string, RelatedWorkMetadata>();
+  let remainingIndividualLookups = individualLookupLimit;
+  for (const batch of chunkValues(selected, Math.max(1, batchSize))) {
+    if (
+      isCitationRequestCancellationRequested() ||
+      cancellationRequested(signal)
+    ) {
+      break;
+    }
+    const allocation = Number.isFinite(remainingIndividualLookups)
+      ? Math.min(remainingIndividualLookups, batch.length)
+      : Number.POSITIVE_INFINITY;
+    if (Number.isFinite(remainingIndividualLookups)) {
+      remainingIndividualLookups = Math.max(
+        0,
+        remainingIndividualLookups - allocation,
+      );
+    }
+    const hydrated = await hydrateExternalWorksMetadata(
+      toExternalWorks(batch, libraryNodes),
+      false,
+      allocation,
+      true,
+      false,
+    );
+    for (const work of hydrated) {
+      for (const alias of workLookupAliases(work)) {
+        metadata.set(alias, work);
+      }
+    }
+    await yieldToUI();
+  }
+  return metadata;
+}
+
+async function runExternalRelationshipRefresh(
+  node: CitationGraphNode,
+  libraryNodes: readonly LibraryWorkIdentity[],
+  direction: "references" | "cited-by",
+  options: ExternalRelationshipRefreshOptions,
 ): Promise<ExternalWork[]> {
-  const options: ExternalRelationshipRefreshOptions =
-    typeof maximumOrOptions === "number"
-      ? {
-          maximum: maximumOrOptions,
-          refreshMembership: legacyRefreshMembership,
-        }
-      : maximumOrOptions;
-  const requestedMaximum = options.maximum ?? Number.POSITIVE_INFINITY;
+  const cancelled = (): boolean =>
+    isCitationRequestCancellationRequested() ||
+    cancellationRequested(options.signal);
+  const mode = options.mode ?? "manual";
+  const reportedRelationshipCount =
+    direction === "references" ? node.referenceCount : node.citationCount;
+  const providerPolicy = relationshipProviderPolicyForSize(
+    mode,
+    reportedRelationshipCount,
+    {
+      ...(options.providerStrategy
+        ? { providerStrategy: options.providerStrategy }
+        : {}),
+      ...(options.providerLimit !== undefined
+        ? { providerLimit: options.providerLimit }
+        : {}),
+    },
+  );
+  const policy = relationshipRefreshPolicy(mode, {
+    ...providerPolicy,
+    ...(options.metadataHydrationLimit !== undefined
+      ? { metadataLimit: options.metadataHydrationLimit }
+      : {}),
+    ...(options.metadataBatchSize !== undefined
+      ? { metadataBatchSize: options.metadataBatchSize }
+      : {}),
+  });
+  const requestedMaximum = options.maximum ?? policy.membershipLimit;
   const maximum = Number.isFinite(requestedMaximum)
     ? Math.max(0, Math.floor(requestedMaximum))
     : Number.POSITIVE_INFINITY;
   const refreshMembership = options.refreshMembership === true;
+  if (refreshMembership) activeRelationshipMembershipRefreshes += 1;
   const summaryLookupLimit =
     options.summaryLookupLimit ??
     RELATIONSHIP_METADATA_FOREGROUND_INDIVIDUAL_LIMIT;
@@ -1364,60 +1689,26 @@ export async function refreshExternalRelationships(
     options.silent === true,
     `Updating ${relationshipLabel}`,
     `Preparing ${relationshipLabel} for ${node.title || node.itemKey}`,
+    options.onCancel,
   );
+  const checkpoint = createCooperativeCheckpoint();
   const existingResult = (): ExternalWork[] =>
     toExternalWorks(
       getStoredRelationshipWorks(node, direction).slice(0, maximum),
       libraryNodes,
     );
+  let refreshStarted = false;
+  let publicationBatchStarted = false;
 
   try {
     const cachedMembership = getStoredRelationshipWorks(node, direction);
     if (!refreshMembership && cachedMembership.length) {
-      progress.setProgress(
-        1,
-        4,
-        `Refreshing metadata for ${cachedMembership.length} cached ${relationshipLabel}`,
-      );
-      const hydrated = await hydrateExternalWorksMetadata(
-        toExternalWorks(cachedMembership, libraryNodes),
-        false,
-        summaryLookupLimit,
-        true,
-        true,
-      );
-      if (isCitationRequestCancellationRequested()) return existingResult();
-      const plan = getProviderPlan(
-        direction === "references" ? "references" : "citations",
-        getProviderPreference(),
-      );
-      progress.setProgress(2, 4, `Validating ${relationshipLabel}`);
-      if (hydrated.length && plan.providers.length) {
-        await persistHydratedRelationshipMetadata(
-          [
-            {
-              node,
-              direction,
-              providers: new Set(plan.providers),
-            },
-          ],
-          relationshipMetadataIndex(hydrated),
-        );
-      }
-      if (isCitationRequestCancellationRequested()) return existingResult();
-      const selected = getStoredRelationshipWorks(node, direction);
-      progress.setProgress(
-        3,
-        4,
-        `Saving ${selected.length} ${relationshipLabel}`,
-      );
-      await synchronizeRelationshipRecord(node, direction, selected);
-      const output = toExternalWorks(selected.slice(0, maximum), libraryNodes);
+      const output = existingResult();
       options.onMembershipResolved?.({
         complete: true,
         provider: null,
         reportedCount: null,
-        identifiedCount: selected.length,
+        identifiedCount: cachedMembership.length,
       });
       if (!progress.isDismissed()) {
         progress.finish(`${output.length} ${relationshipLabel} ready`);
@@ -1425,32 +1716,76 @@ export async function refreshExternalRelationships(
       return output;
     }
 
-    const plan = getProviderPlan(
-      direction === "references" ? "references" : "citations",
-      getProviderPreference(),
+    if (
+      mode === "automatic" &&
+      node.itemID <= 0 &&
+      !normalizeDOI(node.doi) &&
+      !node.providerWorkID?.trim()
+    ) {
+      const output = existingResult();
+      options.onMembershipResolved?.({
+        complete: false,
+        provider: null,
+        reportedCount: null,
+        identifiedCount: output.length,
+      });
+      if (!progress.isDismissed()) {
+        progress.finish(
+          `Cannot update ${relationshipLabel}: no stable paper identifier`,
+        );
+      }
+      return output;
+    }
+
+    refreshStarted = true;
+    beginCitationUpdatePublicationBatch();
+    beginRelationshipPublicationBatch();
+    publicationBatchStarted = true;
+    publishRelationshipState(
+      node,
+      direction,
+      "refresh-started",
+      cachedMembership.length,
+      storedRelationshipReportedCount(node, direction),
+    );
+    const providers = relationshipProviders(
+      node,
+      direction,
+      policy.providerStrategy,
+      policy.providerLimit,
     );
     progress.setProgress(
       1,
       4,
-      `Retrieving ${relationshipLabel} from ${plan.providers.length} provider${plan.providers.length === 1 ? "" : "s"}`,
+      `Retrieving ${relationshipLabel} from ${providers.length} provider${
+        providers.length === 1 ? "" : "s"
+      }`,
     );
-    const results: RelationshipProviderSnapshot[] = [];
-    for (const provider of plan.providers) {
-      if (isCitationRequestCancellationRequested()) break;
-      const snapshot = await fetchProviderRelationshipSnapshot(
-        provider,
-        node,
-        direction,
-        maximum,
-        options.providerWorkIDs,
-      );
-      results.push(snapshot);
-      // A complete authoritative provider already supplies the full membership.
-      // Additional providers would add latency and duplicate edges, so only fall
-      // through when the current provider is unavailable or incomplete.
-      if (snapshot.succeeded && snapshot.complete) break;
-    }
-    if (isCitationRequestCancellationRequested()) return existingResult();
+    const results = await mapBounded(
+      providers,
+      RELATIONSHIP_PROVIDER_PARALLELISM,
+      async (provider): Promise<RelationshipProviderSnapshot> => {
+        if (cancelled()) {
+          return {
+            provider,
+            works: [],
+            reportedCount: null,
+            complete: false,
+            succeeded: false,
+          };
+        }
+        return fetchProviderRelationshipSnapshot(
+          provider,
+          node,
+          direction,
+          maximum,
+          options.providerWorkIDs,
+          { signal: options.signal },
+        );
+      },
+      { yieldAfterEach: true },
+    );
+    if (cancelled()) return existingResult();
 
     const prepared = prepareRelationshipSnapshots(
       results,
@@ -1483,92 +1818,116 @@ export async function refreshExternalRelationships(
       return output;
     }
 
+    // Commit compact membership before metadata hydration. Focus View can now
+    // render the new graph immediately while summaries are enriched in small
+    // yielded batches.
     progress.setProgress(
       2,
       4,
-      `Retrieving summaries for ${selection.works.length} identified ${relationshipLabel}`,
+      `Saving ${selection.works.length} identified ${relationshipLabel}`,
     );
-    const hydratedSelection = selection.works.length
-      ? await hydrateExternalWorksMetadata(
-          toExternalWorks(selection.works, libraryNodes),
-          false,
-          summaryLookupLimit,
-          true,
-        )
-      : [];
-    if (isCitationRequestCancellationRequested()) return existingResult();
-    const metadataIndex = relationshipMetadataIndex(hydratedSelection);
-    const selectedWorks = selection.works.map((work) => {
-      const metadata = metadataForRelationshipWork(work, metadataIndex);
-      return metadata ? mergeMetadata(work, metadata) : work;
-    });
-
-    // Publish only after all selected membership and foreground metadata are
-    // ready, so panels never expose a partial provider result.
-    progress.setProgress(
-      3,
-      4,
-      `Saving ${selectedWorks.length} ${relationshipLabel}`,
-    );
-    const selectedMembership = selectedWorks.map((work) =>
-      compactRelationshipWork(work as ExternalWork),
+    const selectedMembership = await mapCooperatively(
+      selection.works,
+      (work) => compactRelationshipWork(work as ExternalWork),
+      { forceEvery: 25 },
     );
     const committed = await replaceStoredRelationshipSelection(
       node,
       direction,
       selectedMembership,
     );
-    await synchronizeRelationshipRecord(node, direction, selectedWorks, {
+    const reported = {
       count: selection.reportedCount,
       provider: selection.countProvider,
-    });
-
-    for (const snapshot of usable) {
-      if (isCitationRequestCancellationRequested()) break;
-      const providerWorks = snapshot.identifiedWorks.map((work) => {
-        const metadata = metadataForRelationshipWork(work, metadataIndex);
-        return metadata ? mergeMetadata(work, metadata) : work;
-      });
-      if (snapshot.complete) {
-        await cacheProviderRelationshipSnapshot(
-          node,
-          direction,
-          snapshot.provider,
-          providerWorks,
-        );
-      } else {
-        await mergeProviderRelationshipSnapshot(
-          node,
-          direction,
-          snapshot.provider,
-          providerWorks,
-        );
-      }
-    }
-
-    const completeSnapshot =
-      usable.find(
-        (snapshot) =>
-          snapshot.complete && snapshot.provider === selection.countProvider,
-      ) ?? usable.find((snapshot) => snapshot.complete);
+    } satisfies RelationshipReportedCount;
+    const publishedReported = await synchronizeRelationshipSummary(
+      node,
+      direction,
+      committed.length,
+      reported,
+    );
+    publishRelationshipState(
+      node,
+      direction,
+      "membership-published",
+      committed.length,
+      publishedReported,
+    );
     options.onMembershipResolved?.({
-      complete: Boolean(completeSnapshot),
-      provider: completeSnapshot?.provider ?? selection.countProvider,
-      reportedCount: selection.reportedCount,
+      complete: selection.complete,
+      provider: publishedReported.provider,
+      reportedCount: publishedReported.count,
       identifiedCount: committed.length,
     });
 
-    if (
-      queueBackgroundHydration &&
-      committed.length &&
-      !isCitationRequestCancellationRequested()
-    ) {
+    await checkpoint(true);
+    if (cancelled()) return existingResult();
+
+    const foregroundMetadataLimit = relationshipForegroundMetadataLimit(
+      mode,
+      selection.works.length,
+      policy.metadataLimit,
+    );
+    let metadataIndex = new Map<string, RelatedWorkMetadata>();
+    if (foregroundMetadataLimit > 0) {
+      progress.setProgress(
+        3,
+        4,
+        `Retrieving summaries for ${Math.min(
+          selection.works.length,
+          foregroundMetadataLimit,
+        )} visible ${relationshipLabel}`,
+      );
+      metadataIndex = await hydrateRelationshipSelectionInBatches(
+        selection.works,
+        libraryNodes,
+        foregroundMetadataLimit,
+        policy.metadataBatchSize,
+        summaryLookupLimit,
+        options.signal,
+      );
+    } else {
+      progress.setProgress(
+        3,
+        4,
+        `Scheduling ${relationshipLabel} metadata in the background`,
+      );
+    }
+    const selectedWorks = await mapCooperatively(
+      selection.works,
+      (work) => {
+        const metadata = metadataForRelationshipWork(work, metadataIndex);
+        return metadata ? mergeExternalWorkMetadata(work, metadata) : work;
+      },
+      { forceEvery: 25 },
+    );
+    if (metadataIndex.size) options.onMetadataHydrated?.();
+
+    await synchronizeRelationshipRecord(
+      node,
+      direction,
+      selectedWorks,
+      publishedReported,
+    );
+    publishRelationshipState(
+      node,
+      direction,
+      "metadata-published",
+      committed.length,
+      publishedReported,
+    );
+
+    if (queueBackgroundHydration && committed.length && !cancelled()) {
       queueRelationshipMetadataHydration(
         node,
         direction,
-        committed,
+        selectedWorks.slice(
+          Number.isFinite(policy.metadataLimit) ? policy.metadataLimit : 0,
+        ),
         true,
         usable.map((snapshot) => snapshot.provider),
+        options.showBackgroundProgress !== true,
+        options.onMetadataHydrated,
       );
     }
     const output = toExternalWorks(committed.slice(0, maximum), libraryNodes);
@@ -1588,373 +1947,232 @@ export async function refreshExternalRelationships(
     }
     throw error;
   } finally {
-    if (isCitationRequestCancellationRequested() && !progress.isDismissed()) {
+    if (refreshStarted) {
+      const selected = getStoredRelationshipWorks(node, direction);
+      publishRelationshipState(
+        node,
+        direction,
+        "refresh-finished",
+        selected.length,
+        storedRelationshipReportedCount(node, direction),
+      );
+    }
+    if (refreshMembership) {
+      activeRelationshipMembershipRefreshes = Math.max(
+        0,
+        activeRelationshipMembershipRefreshes - 1,
+      );
+      scheduleRelationshipMetadataHydrationRun();
+    }
+    if (cancelled() && !progress.isDismissed()) {
       progress.dismiss();
+    }
+    if (publicationBatchStarted) {
+      // Release graph/listeners while the pane/column repaint remains held so
+      // every surface observes the same final relationship snapshot.
+      endRelationshipPublicationBatch();
+      endCitationUpdatePublicationBatch({
+        refreshGraph: false,
+        refreshColumns: true,
+        refreshItemPanes: true,
+      });
     }
   }
 }
 
+function relationshipRefreshOperationKey(
+  node: CitationGraphNode,
+  direction: "references" | "cited-by",
+): string {
+  return `${nodeLibraryID(node)}:${node.itemKey.toLocaleUpperCase()}:${direction}`;
+}
+
+function requestedRelationshipMaximum(
+  options: ExternalRelationshipRefreshOptions,
+): number {
+  const mode = options.mode ?? "manual";
+  const requested =
+    options.maximum ?? relationshipRefreshPolicy(mode).membershipLimit;
+  return Number.isFinite(requested)
+    ? Math.max(0, Math.floor(requested))
+    : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Coalesce refreshes for one paper and direction. A broader manual refresh is
+ * serialized after an existing automatic refresh instead of competing with it
+ * for providers, metadata resolution, SQLite, and Zotero's UI thread.
+ */
+export function refreshExternalRelationships(
+  node: CitationGraphNode,
+  libraryNodes: readonly LibraryWorkIdentity[],
+  direction: "references" | "cited-by",
+  options: ExternalRelationshipRefreshOptions = {
+    maximum: Number.POSITIVE_INFINITY,
+  },
+): Promise<ExternalWork[]> {
+  if (!externalDiscoveryRunning) {
+    return Promise.resolve(cachedRelationshipResults(node, direction));
+  }
+  const key = relationshipRefreshOperationKey(node, direction);
+  const mode = options.mode ?? "manual";
+  const maximum = requestedRelationshipMaximum(options);
+  const existing = activeRelationshipRefreshOperations.get(key);
+  if (existing) {
+    const unsubscribeCallerCancellation = options.signal?.subscribe(() =>
+      existing.cancel(),
+    );
+    const needsBroaderFollowUp = relationshipRefreshRequiresFollowUp(
+      { mode: existing.mode, membershipLimit: existing.maximum },
+      { mode, membershipLimit: maximum },
+      options.refreshMembership === true,
+    );
+    if (needsBroaderFollowUp) {
+      return existing.promise
+        .catch(() => undefined)
+        .then(() =>
+          refreshExternalRelationships(node, libraryNodes, direction, options),
+        )
+        .finally(() => unsubscribeCallerCancellation?.());
+    }
+    if (options.onMembershipResolved) {
+      existing.membershipCallbacks.add(options.onMembershipResolved);
+      if (existing.lastResolution) {
+        invokeRefreshCallback(
+          options.onMembershipResolved,
+          existing.lastResolution,
+        );
+      }
+    }
+    if (options.onMetadataHydrated) {
+      existing.metadataCallbacks.add(options.onMetadataHydrated);
+      if (existing.metadataHydrated) {
+        invokeRefreshSignal(options.onMetadataHydrated);
+      }
+    }
+    return existing.promise
+      .then((works) => works.slice(0, maximum))
+      .finally(() => unsubscribeCallerCancellation?.());
+  }
+
+  const membershipCallbacks = new Set<
+    (resolution: RelationshipRefreshResolution) => void
+  >();
+  const metadataCallbacks = new Set<() => void>();
+  if (options.onMembershipResolved) {
+    membershipCallbacks.add(options.onMembershipResolved);
+  }
+  if (options.onMetadataHydrated) {
+    metadataCallbacks.add(options.onMetadataHydrated);
+  }
+  const operation: ActiveRelationshipRefresh = {
+    promise: Promise.resolve([]),
+    cancel: () => undefined,
+    maximum,
+    mode,
+    lastResolution: null,
+    metadataHydrated: false,
+    membershipCallbacks,
+    metadataCallbacks,
+  };
+  const requestScope = createCancellationScope(
+    `${direction} relationship refresh for ${node.itemKey}`,
+  );
+  const unsubscribeCallerCancellation = options.signal?.subscribe(() =>
+    requestScope.cancel(),
+  );
+  operation.cancel = () => requestScope.cancel();
+  const coordinatedOptions: ExternalRelationshipRefreshOptions = {
+    ...options,
+    signal: requestScope.signal,
+    onCancel: () => requestScope.cancel(),
+    onMembershipResolved: (resolution) => {
+      operation.lastResolution = resolution;
+      for (const callback of membershipCallbacks) {
+        invokeRefreshCallback(callback, resolution);
+      }
+    },
+    onMetadataHydrated: () => {
+      operation.metadataHydrated = true;
+      for (const callback of metadataCallbacks) invokeRefreshSignal(callback);
+    },
+  };
+  const promise = runExternalRelationshipRefresh(
+    node,
+    libraryNodes,
+    direction,
+    coordinatedOptions,
+  ).finally(() => {
+    unsubscribeCallerCancellation?.();
+    if (activeRelationshipRefreshOperations.get(key) === operation) {
+      activeRelationshipRefreshOperations.delete(key);
+    }
+  });
+  operation.promise = promise;
+  activeRelationshipRefreshOperations.set(key, operation);
+  return promise;
+}
+
+export function startExternalDiscoveryRuntime(): void {
+  externalDiscoveryGeneration += 1;
+  externalDiscoveryRunning = true;
+}
+
+export function stopExternalDiscoveryRuntime(): void {
+  externalDiscoveryGeneration += 1;
+  externalDiscoveryRunning = false;
+  if (relationshipMetadataHydrationTimer !== null) {
+    clearTimeout(relationshipMetadataHydrationTimer);
+    relationshipMetadataHydrationTimer = null;
+  }
+  relationshipMetadataHydrationQueue.clear();
+  relationshipMetadataAttemptedThisSession.clear();
+  relationshipRecordSynchronizations.clear();
+  activeExternalMetadataResolutions.clear();
+  clearRelatedWorkSummaryCaches();
+  for (const operation of activeRelationshipRefreshOperations.values()) {
+    operation.cancel();
+  }
+  activeRelationshipRefreshOperations.clear();
+  activeRelationshipMembershipRefreshes = 0;
+}
+
 export async function getExternalReferences(
   node: CitationGraphNode,
-  libraryNodes: CitationGraphNode[],
+  libraryNodes: readonly LibraryWorkIdentity[],
   maximum = 100,
   offset = 0,
   forceRefresh = false,
-  _expandCoverage = forceRefresh,
 ): Promise<ExternalWork[]> {
   if (forceRefresh || !selectedRelationshipCacheIsFresh(node, "references")) {
-    await refreshExternalRelationships(
-      node,
-      libraryNodes,
-      "references",
-      2500,
-      true,
-    );
+    await refreshExternalRelationships(node, libraryNodes, "references", {
+      maximum: Math.max(50, maximum + offset),
+      refreshMembership: true,
+      mode: "automatic",
+      metadataHydrationLimit: maximum,
+      queueBackgroundHydration: true,
+    });
   }
   return getCachedExternalReferences(node, libraryNodes, maximum, offset);
 }
 
 export async function getExternalCitedBy(
   node: CitationGraphNode,
-  libraryNodes: CitationGraphNode[],
+  libraryNodes: readonly LibraryWorkIdentity[],
   maximum = 100,
   offset = 0,
   forceRefresh = false,
-  _expandCoverage = forceRefresh,
 ): Promise<ExternalWork[]> {
   if (forceRefresh || !selectedRelationshipCacheIsFresh(node, "cited-by")) {
-    await refreshExternalRelationships(
-      node,
-      libraryNodes,
-      "cited-by",
-      2500,
-      true,
-    );
-  }
-  return getCachedExternalCitedBy(node, libraryNodes, maximum, offset);
-}
-
-interface RecommendationCandidate {
-  work: RelatedWorkMetadata;
-  score: number;
-  connectedNodeKeys: Set<string>;
-}
-
-function addRecommendationCandidate(
-  candidates: Map<string, RecommendationCandidate>,
-  indexes: ReturnType<typeof localIndexes>,
-  node: CitationGraphNode,
-  work: RelatedWorkMetadata,
-  weight: number,
-): void {
-  const doi = normalizeDOI(work.doi);
-  const title = normalizeExactTitle(work.title);
-  if (
-    (doi && indexes.byDOI.has(doi)) ||
-    (title && indexes.byTitle.has(title))
-  ) {
-    return;
-  }
-  const identity = externalWorkCacheIdentity(work);
-  if (!identity) return;
-  const current = candidates.get(identity) ?? {
-    work,
-    score: 0,
-    connectedNodeKeys: new Set<string>(),
-  };
-  current.score += weight;
-  current.connectedNodeKeys.add(node.key);
-  current.work = mergeMetadata(current.work, work);
-  candidates.set(identity, current);
-}
-
-function identifiersForExternalWork(
-  work: RelatedWorkMetadata,
-): WorkIdentifiers {
-  return {
-    doi: normalizeDOI(work.doi),
-    pmid: String(work.pmid ?? "").trim() || null,
-    arxiv: String(work.arxiv ?? "").trim() || null,
-    isbn: String(work.isbn ?? "").trim() || null,
-    title: String(work.title ?? "").trim(),
-    normalizedTitle: normalizeExactTitle(work.title),
-    year: work.year,
-    authors: work.authors,
-    sourceTitle: work.sourceTitle ?? null,
-  };
-}
-
-async function citingWorksForReference(
-  reference: RelatedWorkMetadata,
-  maximum: number,
-): Promise<RelatedWorkMetadata[]> {
-  const preference = getProviderPreference();
-  const plan = getProviderPlan("citations", preference);
-  const identifiers = identifiersForExternalWork(reference);
-
-  for (const providerID of plan.providers) {
-    const provider = getCitationProvider(providerID);
-    const fetcher = provider.fetchCitingWorks;
-    if (!fetcher) continue;
-    try {
-      let providerWorkID =
-        providerID === reference.provider
-          ? reference.providerWorkID?.trim() || null
-          : null;
-      if (!providerWorkID && providerID === "opencitations") {
-        providerWorkID = normalizeDOI(reference.doi);
-      }
-      if (!providerWorkID) {
-        const lookup = provider.lookupForRelations ?? provider.lookup;
-        let result = provider.supports(identifiers)
-          ? await lookup(identifiers)
-          : null;
-        if (
-          (!result || result.status !== "success") &&
-          provider.searchExactTitle &&
-          identifiers.normalizedTitle
-        ) {
-          result = await provider.searchExactTitle(identifiers);
-        }
-        if (result?.status === "success") {
-          providerWorkID = result.providerWorkID;
-        }
-      }
-      if (!providerWorkID) continue;
-      const works = stampProviderWorks(
-        await fetcher(providerWorkID, maximum, 0),
-        providerID,
-      );
-      if (works.length) return works;
-    } catch (error) {
-      Zotero.debug(
-        `Citation Map: bibliographic-coupling lookup failed through ${providerID}: ${String(error)}`,
-      );
-    }
-  }
-  return [];
-}
-
-async function runBounded<T>(
-  items: T[],
-  concurrency: number,
-  task: (item: T) => Promise<void>,
-): Promise<void> {
-  let nextIndex = 0;
-  async function worker(): Promise<void> {
-    while (nextIndex < items.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      await task(items[index]);
-    }
-  }
-  await Promise.all(
-    Array.from(
-      { length: Math.min(Math.max(1, concurrency), items.length) },
-      () => worker(),
-    ),
-  );
-}
-
-/** Find papers that cite several of the same references as the seed. This is
- * bibliographic coupling: candidates need not cite the seed or be cited by it. */
-async function bibliographicCouplingRecommendations(
-  visibleNodes: CitationGraphNode[],
-  libraryNodes: CitationGraphNode[],
-  maximum: number,
-): Promise<ExternalWork[]> {
-  const indexes = localIndexes(libraryNodes);
-  const candidates = new Map<string, RecommendationCandidate>();
-  let sampledReferenceCount = 0;
-
-  for (const node of visibleNodes.slice(0, 5)) {
-    const references = (
-      await getExternalReferences(node, libraryNodes, 20, 0, false, false)
-    )
-      .filter((work) =>
-        Boolean(
-          work.doi || work.providerWorkID || normalizeExactTitle(work.title),
-        ),
-      )
-      .slice(0, 12);
-    sampledReferenceCount += references.length;
-
-    await runBounded(references, 2, async (reference) => {
-      const citing = await citingWorksForReference(reference, 25);
-      const seen = new Set<string>();
-      for (const work of citing) {
-        const identity = externalWorkCacheIdentity(work);
-        if (!identity || seen.has(identity)) continue;
-        seen.add(identity);
-        addRecommendationCandidate(candidates, indexes, node, work, 1);
-      }
+    await refreshExternalRelationships(node, libraryNodes, "cited-by", {
+      maximum: Math.max(50, maximum + offset),
+      refreshMembership: true,
+      mode: "automatic",
+      metadataHydrationLimit: maximum,
+      queueBackgroundHydration: true,
     });
   }
-
-  if (!candidates.size) return [];
-  const values = [...candidates.values()];
-  const hasStrongCoupling = values.some((candidate) => candidate.score >= 2);
-  return values
-    .filter((candidate) => !hasStrongCoupling || candidate.score >= 2)
-    .map((candidate) => {
-      const denominator = Math.sqrt(
-        Math.max(1, sampledReferenceCount) *
-          Math.max(
-            candidate.score,
-            candidate.work.referenceCount ?? candidate.score,
-          ),
-      );
-      return {
-        ...toExternal(candidate.work, indexes.byDOI, indexes.byTitle),
-        recommendationScore: candidate.score / denominator,
-        citingNodeKeys: [...candidate.connectedNodeKeys],
-      };
-    })
-    .sort(
-      (left, right) =>
-        (right.recommendationScore ?? 0) - (left.recommendationScore ?? 0) ||
-        (right.citationCount ?? -1) - (left.citationCount ?? -1) ||
-        (right.year ?? -1) - (left.year ?? -1),
-    )
-    .slice(0, Math.max(maximum, Math.min(maximum * 2, 100)));
-}
-
-async function citationNeighbourFallback(
-  visibleNodes: CitationGraphNode[],
-  libraryNodes: CitationGraphNode[],
-  maximum: number,
-  minimumConnections: number,
-): Promise<ExternalWork[]> {
-  const indexes = localIndexes(libraryNodes);
-  const candidates = new Map<string, RecommendationCandidate>();
-  const seedLimit = Math.min(visibleNodes.length, 25);
-  const perSeedLimit = Math.min(100, Math.max(25, maximum * 2));
-
-  for (const node of visibleNodes.slice(0, seedLimit)) {
-    let references = cachedReferenceWorks(node);
-    if (!references.length && visibleNodes.length === 1) {
-      references = await getExternalReferences(
-        node,
-        libraryNodes,
-        perSeedLimit,
-        0,
-        true,
-        false,
-      );
-    }
-    for (const reference of references.slice(0, perSeedLimit)) {
-      addRecommendationCandidate(candidates, indexes, node, reference, 2);
-    }
-
-    const citing =
-      visibleNodes.length === 1
-        ? await getExternalCitedBy(
-            node,
-            libraryNodes,
-            Math.min(50, perSeedLimit),
-            0,
-            false,
-            false,
-          )
-        : getCachedExternalCitedBy(
-            node,
-            libraryNodes,
-            Math.min(50, perSeedLimit),
-            0,
-          );
-    for (const work of citing) {
-      addRecommendationCandidate(candidates, indexes, node, work, 1);
-    }
-  }
-
-  const requiredConnections =
-    visibleNodes.length <= 1
-      ? 1
-      : Math.min(Math.max(1, minimumConnections), visibleNodes.length);
-  return [...candidates.values()]
-    .filter(
-      (candidate) => candidate.connectedNodeKeys.size >= requiredConnections,
-    )
-    .map((candidate) => ({
-      ...toExternal(candidate.work, indexes.byDOI, indexes.byTitle),
-      recommendationScore: candidate.score,
-      citingNodeKeys: [...candidate.connectedNodeKeys],
-    }))
-    .sort(
-      (left, right) =>
-        (right.citingNodeKeys?.length ?? 0) -
-          (left.citingNodeKeys?.length ?? 0) ||
-        (right.recommendationScore ?? 0) - (left.recommendationScore ?? 0) ||
-        (right.citationCount ?? -1) - (left.citationCount ?? -1) ||
-        (right.year ?? -1) - (left.year ?? -1) ||
-        String(left.title).localeCompare(String(right.title)),
-    )
-    .slice(0, Math.max(maximum, Math.min(maximum * 2, 100)));
-}
-
-/** Find genuinely similar papers through provider-native recommendation
- * systems. A title alone is sufficient for seed resolution. Direct references
- * and citing papers are retained only as a bounded fallback for providers that
- * expose no recommendation endpoint or when recommendation services fail. */
-export async function getMissingPaperRecommendations(
-  visibleNodes: CitationGraphNode[],
-  libraryNodes: CitationGraphNode[],
-  maximum = 50,
-  minimumConnections = 2,
-): Promise<ExternalWork[]> {
-  if (!visibleNodes.length || maximum <= 0) return [];
-  const indexes = localIndexes(libraryNodes);
-  const seeds = visibleNodes
-    .slice(0, 25)
-    .map(identifiersForNode)
-    .filter((identifiers) =>
-      Boolean(
-        identifiers.doi ||
-        identifiers.pmid ||
-        identifiers.arxiv ||
-        identifiers.isbn ||
-        identifiers.normalizedTitle,
-      ),
-    );
-
-  const recommended = await discoverSimilarWorks(
-    seeds,
-    getProviderPreference(),
-    Math.min(500, Math.max(maximum * 3, 100)),
-  );
-  const providerResults = recommended
-    .map((work) => ({
-      ...toExternal(work, indexes.byDOI, indexes.byTitle),
-      recommendationScore: work.recommendationScore,
-      recommendationSources: work.recommendationSources,
-    }))
-    .filter((work) => !work.inLibraryItemKey)
-    .slice(0, Math.max(maximum, Math.min(maximum * 2, 100)));
-
-  if (providerResults.length) {
-    const hydrated = await hydrateExternalWorksMetadata(providerResults);
-    return hydrated
-      .filter((work) => Boolean(externalWorkDisplayTitle(work)))
-      .slice(0, maximum);
-  }
-
-  const coupled = await bibliographicCouplingRecommendations(
-    visibleNodes,
-    libraryNodes,
-    maximum,
-  );
-  const fallback = coupled.length
-    ? coupled
-    : await citationNeighbourFallback(
-        visibleNodes,
-        libraryNodes,
-        maximum,
-        minimumConnections,
-      );
-  const hydrated = await hydrateExternalWorksMetadata(fallback);
-  return hydrated
-    .filter((work) => Boolean(externalWorkDisplayTitle(work)))
-    .slice(0, maximum);
+  return getCachedExternalCitedBy(node, libraryNodes, maximum, offset);
 }
 
 export async function importExternalWork(

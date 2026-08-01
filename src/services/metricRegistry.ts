@@ -1,4 +1,5 @@
 import type { CitationGraphNode, MetricID } from "../domain/graphTypes";
+import { publicationYearOrNull } from "../domain/valueNormalization";
 
 export type MetricGroup =
   "Core" | "Impact" | "Source" | "Library" | "Bibliography" | "Data quality";
@@ -74,7 +75,28 @@ export const METRIC_DEFINITIONS: MetricDefinition[] = [
     column: false,
     itemPane: false,
     graph: { ...graphLinear, nodeSize: false },
-    value: (node) => node.year,
+    value: (node) => publicationYearOrNull(node.year),
+  },
+  {
+    id: "citation-sequence",
+    label: "Citation sequence",
+    group: "Core",
+    description:
+      "Ordinal publication order in the current graph. In Focus View, the primary seed is 0, references are negative steps and citing papers are positive steps.",
+    interpretation:
+      "Equal spacing represents one paper in sequence, not a fixed amount of elapsed time. Full dates are used when available; year-only ties are ordered deterministically.",
+    valueType: "integer",
+    allowsNegative: true,
+    column: false,
+    itemPane: false,
+    graph: {
+      axis: true,
+      logarithmic: false,
+      nodeSize: false,
+      nodeColor: true,
+      filter: false,
+    },
+    value: (node) => node.citationSequence,
   },
   {
     id: "citations",
@@ -369,25 +391,10 @@ export const SUPPLEMENTARY_PROPERTY_DEFINITIONS: SupplementaryPropertyDefinition
   ];
 
 const BY_ID = new Map(METRIC_DEFINITIONS.map((metric) => [metric.id, metric]));
-const PROPERTY_BY_ID = new Map<
-  string,
-  MetricDefinition | SupplementaryPropertyDefinition
->();
-for (const property of METRIC_DEFINITIONS) {
-  PROPERTY_BY_ID.set(property.id, property);
-}
-for (const property of SUPPLEMENTARY_PROPERTY_DEFINITIONS) {
-  PROPERTY_BY_ID.set(property.id, property);
-}
-
 export function getMetricDefinition(id: MetricID): MetricDefinition {
   const metric = BY_ID.get(id);
   if (!metric) throw new Error(`Unknown Citation Map metric: ${id}`);
   return metric;
-}
-
-export function getPropertyDefinition(id: string) {
-  return PROPERTY_BY_ID.get(id) ?? null;
 }
 
 export function metricValue(
@@ -415,11 +422,12 @@ export function formatMetricValue(
   if (definition.valueType === "days") {
     return `${new Intl.NumberFormat(undefined, { useGrouping: false, maximumFractionDigits: 0 }).format(value)} d`;
   }
-  return new Intl.NumberFormat(undefined, {
+  const formatted = new Intl.NumberFormat(undefined, {
     useGrouping: false,
     maximumFractionDigits:
       definition.valueType === "integer" ? 0 : (definition.decimals ?? 2),
   }).format(value);
+  return id === "citation-sequence" && value > 0 ? `+${formatted}` : formatted;
 }
 
 export function metricTooltip(id: MetricID): string {

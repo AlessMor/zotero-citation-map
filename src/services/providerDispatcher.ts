@@ -2,41 +2,18 @@ import type {
   CitationProviderID,
   RelatedWorkMetadata,
 } from "../domain/citationTypes";
-import {
-  relationshipAdapterFor,
-  type PreparedRelationshipProviderSnapshot,
-  type RelationshipDirection,
-  type RelationshipProviderSnapshot,
-  type SelectedRelationshipMembership,
-} from "../providers/relationshipAdapters";
-import { mergeRelatedWorkMetadata } from "../providers/registry";
+import type {
+  PreparedRelationshipProviderSnapshot,
+  RelationshipDirection,
+  RelationshipProviderSnapshot,
+  SelectedRelationshipMembership,
+} from "../providers/relationshipPolicy";
+import { mergeRelatedWorkMetadata } from "../domain/relatedWorkMetadata";
 import {
   enrichIdentifiedRelationshipWorks,
   partitionRelationshipCandidates,
   resolveSparseCandidatesAgainstIdentified,
 } from "./relationshipIdentityService";
-
-export function relationshipPageSizeForProvider(
-  provider: CitationProviderID,
-): number {
-  return relationshipAdapterFor(provider).relationshipPageSize;
-}
-
-export function metadataBatchSizeForProvider(
-  provider: CitationProviderID,
-): number {
-  return relationshipAdapterFor(provider).metadataBatchSize;
-}
-
-/**
- * Providers run concurrently; each provider's HTTP scheduler remains isolated.
- */
-export async function dispatchRelationshipProviders<T>(
-  providers: CitationProviderID[],
-  task: (provider: CitationProviderID) => Promise<T>,
-): Promise<T[]> {
-  return Promise.all(providers.map((provider) => task(provider)));
-}
 
 function prepareInitialSnapshot(
   snapshot: RelationshipProviderSnapshot,
@@ -79,34 +56,6 @@ export function prepareRelationshipSnapshots(
   });
 }
 
-function consistencyDistance(
-  snapshot: PreparedRelationshipProviderSnapshot,
-): number {
-  if (snapshot.reportedCount == null) return 1;
-  return (
-    Math.abs(snapshot.rawRetrievedCount - snapshot.reportedCount) /
-    Math.max(1, snapshot.reportedCount)
-  );
-}
-
-function compareReferenceAuthority(
-  left: PreparedRelationshipProviderSnapshot,
-  right: PreparedRelationshipProviderSnapshot,
-): number {
-  if (left.complete !== right.complete) return left.complete ? -1 : 1;
-  const leftDistance = consistencyDistance(left);
-  const rightDistance = consistencyDistance(right);
-  if (leftDistance !== rightDistance) return leftDistance - rightDistance;
-  const leftPriority = relationshipAdapterFor(
-    left.provider,
-  ).referenceAuthorityPriority;
-  const rightPriority = relationshipAdapterFor(
-    right.provider,
-  ).referenceAuthorityPriority;
-  if (leftPriority !== rightPriority) return rightPriority - leftPriority;
-  return right.identifiedWorks.length - left.identifiedWorks.length;
-}
-
 function maximumReportedCount(
   snapshots: PreparedRelationshipProviderSnapshot[],
 ): { count: number | null; provider: CitationProviderID | null } {
@@ -147,38 +96,16 @@ export function selectRelationshipMembership(
     };
   }
 
-  if (direction === "cited-by") {
-    const reported = maximumReportedCount(usable);
-    return {
-      works: mergeLists(...usable.map((snapshot) => snapshot.identifiedWorks)),
-      reportedCount: reported.count,
-      countProvider: reported.provider,
-      authorityProvider: null,
-      complete: usable.every((snapshot) => snapshot.complete),
-      providerSnapshots: snapshots,
-    };
-  }
-
-  const authority = [...usable].sort(compareReferenceAuthority)[0];
-  const incomplete =
-    !authority.complete ||
-    (authority.reportedCount != null &&
-      authority.rawRetrievedCount < authority.reportedCount);
-  const works = incomplete
-    ? mergeLists(
-        authority.identifiedWorks,
-        ...usable
-          .filter((snapshot) => snapshot.provider !== authority.provider)
-          .map((snapshot) => snapshot.identifiedWorks),
-      )
-    : mergeLists(authority.identifiedWorks);
-
+  void direction;
+  const reported = maximumReportedCount(usable);
   return {
-    works,
-    reportedCount: authority.reportedCount,
-    countProvider: authority.provider,
-    authorityProvider: authority.provider,
-    complete: authority.complete,
+    works: mergeLists(...usable.map((snapshot) => snapshot.identifiedWorks)),
+    reportedCount: reported.count,
+    countProvider: reported.provider,
+    authorityProvider: null,
+    complete:
+      snapshots.length > 0 &&
+      snapshots.every((snapshot) => snapshot.succeeded && snapshot.complete),
     providerSnapshots: snapshots,
   };
 }

@@ -5,11 +5,17 @@ import type {
 } from "../domain/citationTypes";
 import { fetchOpenAlexWorksBatch } from "../providers/openAlexProvider";
 import {
+  openAlexIdentifierForWork,
+  semanticScholarIdentifierForWork,
+} from "../providers/providerIdentifiers";
+import {
   fetchSemanticScholarPapersBatch,
   SEMANTIC_SCHOLAR_BATCH_LIMIT,
 } from "../providers/semanticScholarProvider";
-import { mergeRelatedWorkMetadata } from "../providers/registry";
+import { mergeRelatedWorkMetadata } from "../domain/relatedWorkMetadata";
 import { isCitationRequestCancellationRequested } from "../providers/http";
+import type { ProviderRequestOptions } from "../providers/types";
+import { cancellationRequested } from "./cancellationScope";
 import { saveCitationMetricRecord } from "./citationMetricsStore";
 import { getOpenAlexAPIKey, isProviderEnabled } from "./citationPreferences";
 import {
@@ -18,6 +24,12 @@ import {
 } from "./providerExecutionPolicy";
 import type { ProviderIdentityHints } from "./libraryCoreBatchService";
 import { mergeRelatedWorkLists } from "./relationshipStoreService";
+import {
+  createCooperativeCheckpoint,
+  mapCooperatively,
+  settleBounded,
+} from "./backgroundTaskService";
+import { normalizeDOI } from "../domain/workIdentity";
 
 export interface BatchEnrichmentProgress {
   completed: number;
@@ -62,9 +74,7 @@ function chunked<T>(items: T[], size: number): T[][] {
 }
 
 function recordIdentity(record: CitationMetricRecord): string {
-  const doi = String(record.doi ?? "")
-    .trim()
-    .toLocaleLowerCase();
+  const doi = normalizeDOI(record.doi);
   if (doi) return `doi:${doi}`;
   const providerID = String(record.providerWorkID ?? "").trim();
   if (providerID) return `${record.provider}:${providerID.toLocaleLowerCase()}`;
@@ -158,26 +168,6 @@ function mergeProviderMetadata(
   if (metadata.providerWorkID) {
     target.providerWorkIDs[provider] = metadata.providerWorkID;
   }
-}
-
-function semanticScholarIdentifier(work: RelatedWorkMetadata): string | null {
-  if (work.provider === "semantic-scholar" && work.providerWorkID?.trim()) {
-    return work.providerWorkID.trim();
-  }
-  const doi = String(work.doi ?? "").trim();
-  if (doi) return `DOI:${doi}`;
-  if (work.pmid?.trim()) return `PMID:${work.pmid.trim()}`;
-  if (work.arxiv?.trim()) return `ARXIV:${work.arxiv.trim()}`;
-  if (work.isbn?.trim()) return `ISBN:${work.isbn.trim()}`;
-  return null;
-}
-
-function openAlexIdentifier(work: RelatedWorkMetadata): string | null {
-  if (work.provider === "openalex" && work.providerWorkID?.trim()) {
-    return work.providerWorkID.trim();
-  }
-  const doi = String(work.doi ?? "").trim();
-  return doi ? `DOI:${doi}` : null;
 }
 
 function needsSemanticScholarEnrichment(work: RelatedWorkMetadata): boolean {
@@ -326,45 +316,17 @@ function enrichmentSignature(record: CitationMetricRecord): string {
   ]);
 }
 
-async function runBounded<T>(
-  tasks: Array<() => Promise<T>>,
-  parallelism: number,
-): Promise<Array<PromiseSettledResult<T>>> {
-  const results: Array<PromiseSettledResult<T>> = new Array(tasks.length);
-  let nextIndex = 0;
-
-  async function worker(): Promise<void> {
-    while (nextIndex < tasks.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      try {
-        results[index] = {
-          status: "fulfilled",
-          value: await tasks[index](),
-        };
-      } catch (reason) {
-        results[index] = { status: "rejected", reason };
-      }
-    }
-  }
-
-  await Promise.all(
-    Array.from(
-      { length: Math.min(Math.max(1, parallelism), tasks.length) },
-      () => worker(),
-    ),
-  );
-  return results;
-}
-
-function providerTasks(targets: UniqueWorkTarget[]): ProviderBatchTask[] {
+function providerTasks(
+  targets: UniqueWorkTarget[],
+  requestOptions?: ProviderRequestOptions,
+): ProviderBatchTask[] {
   const tasks: ProviderBatchTask[] = [];
 
   if (isProviderEnabled("semantic-scholar")) {
     const candidates: IndexedIdentifier[] = targets
       .map((target, targetIndex) => ({
         targetIndex,
-        identifier: semanticScholarIdentifier(target.work),
+        identifier: semanticScholarIdentifierForWork(target.work),
       }))
       .filter(
         (candidate): candidate is IndexedIdentifier =>
@@ -383,6 +345,7 @@ function providerTasks(targets: UniqueWorkTarget[]): ProviderBatchTask[] {
         run: async () => {
           const metadata = await fetchSemanticScholarPapersBatch(
             batch.map((candidate) => candidate.identifier),
+            requestOptions,
           );
           for (const [index, candidate] of batch.entries()) {
             const entry = metadata[index];
@@ -403,7 +366,7 @@ function providerTasks(targets: UniqueWorkTarget[]): ProviderBatchTask[] {
     const candidates: IndexedIdentifier[] = targets
       .map((target, targetIndex) => ({
         targetIndex,
-        identifier: openAlexIdentifier(target.work),
+        identifier: openAlexIdentifierForWork(target.work),
       }))
       .filter(
         (candidate): candidate is IndexedIdentifier =>
@@ -421,6 +384,7 @@ function providerTasks(targets: UniqueWorkTarget[]): ProviderBatchTask[] {
         run: async () => {
           const metadata = await fetchOpenAlexWorksBatch(
             batch.map((candidate) => candidate.identifier),
+            requestOptions,
           );
           for (const [index, candidate] of batch.entries()) {
             const entry = metadata[index];
@@ -452,9 +416,10 @@ async function runProviderTaskGroups(
   }
   const groupResults = await Promise.all(
     [...groups].map(async ([provider, providerTasks]) =>
-      runBounded(
-        providerTasks.map((task) => () => execute(task)),
+      settleBounded(
+        providerTasks,
         providerExecutionPolicy(provider).requestParallelism,
+        execute,
       ),
     ),
   );
@@ -469,8 +434,13 @@ async function runProviderTaskGroups(
 export async function enrichCitationMetricRecords(
   input: CitationMetricRecord[],
   onProgress?: (progress: BatchEnrichmentProgress) => void,
+  requestOptions?: ProviderRequestOptions,
 ): Promise<BatchEnrichmentResult> {
-  if (!input.length || isCitationRequestCancellationRequested()) {
+  if (
+    !input.length ||
+    isCitationRequestCancellationRequested() ||
+    cancellationRequested(requestOptions?.signal)
+  ) {
     return {
       records: input,
       enriched: 0,
@@ -480,16 +450,21 @@ export async function enrichCitationMetricRecords(
     };
   }
 
-  const records: CitationMetricRecord[] = input.map((record) => ({
-    ...record,
-    authors: [...record.authors],
-    citationCountsByYear: [...record.citationCountsByYear],
-    references: record.references.map((reference) => ({
-      ...reference,
-      authors: [...reference.authors],
-      authorIDs: [...(reference.authorIDs ?? [])],
-    })),
-  }));
+  const checkpoint = createCooperativeCheckpoint();
+  const records: CitationMetricRecord[] = await mapCooperatively(
+    input,
+    (record) => ({
+      ...record,
+      authors: [...record.authors],
+      citationCountsByYear: [...record.citationCountsByYear],
+      references: record.references.map((reference) => ({
+        ...reference,
+        authors: [...reference.authors],
+        authorIDs: [...(reference.authorIDs ?? [])],
+      })),
+    }),
+    { forceEvery: 20 },
+  );
   const uniqueByIdentity = new Map<string, UniqueWorkTarget>();
   for (const [recordIndex, record] of records.entries()) {
     const identity = recordIdentity(record);
@@ -508,16 +483,22 @@ export async function enrichCitationMetricRecords(
           : {},
       });
     }
+    await checkpoint();
   }
 
   const uniqueTargets = [...uniqueByIdentity.values()];
-  const tasks = providerTasks(uniqueTargets);
+  const tasks = providerTasks(uniqueTargets, requestOptions);
   const total = tasks.length;
   let completed = 0;
   let activeBatches = 0;
 
   const executableTasks = tasks.map((task) => async (): Promise<void> => {
-    if (isCitationRequestCancellationRequested()) return;
+    if (
+      isCitationRequestCancellationRequested() ||
+      cancellationRequested(requestOptions?.signal)
+    ) {
+      return;
+    }
     activeBatches += 1;
     onProgress?.({
       completed,
@@ -536,6 +517,7 @@ export async function enrichCitationMetricRecords(
         activeBatches,
         message: `${completed}/${total} provider batches complete${activeBatches ? ` · ${activeBatches} active` : ""}`,
       });
+      await checkpoint(true);
     }
   });
 
@@ -553,6 +535,7 @@ export async function enrichCitationMetricRecords(
         target,
       );
     }
+    await checkpoint();
   }
 
   let enriched = 0;
@@ -562,7 +545,12 @@ export async function enrichCitationMetricRecords(
   );
   const writeBatchSize = CITATION_RECORD_WRITE_CHUNK_SIZE;
   for (const writeBatch of chunked(records, writeBatchSize)) {
-    if (isCitationRequestCancellationRequested()) break;
+    if (
+      isCitationRequestCancellationRequested() ||
+      cancellationRequested(requestOptions?.signal)
+    ) {
+      break;
+    }
     const changed: CitationMetricRecord[] = [];
     for (const record of writeBatch) {
       const original = originalByKey.get(
@@ -581,7 +569,7 @@ export async function enrichCitationMetricRecords(
       changed.map((record) => saveCitationMetricRecord(record)),
     );
     enriched += changed.length;
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await checkpoint(true);
   }
 
   const providerIdentitiesByItemKey = new Map<string, ProviderIdentityHints>();
@@ -591,6 +579,7 @@ export async function enrichCitationMetricRecords(
         ...target.providerWorkIDs,
       });
     }
+    await checkpoint();
   }
 
   return {

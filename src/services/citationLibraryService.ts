@@ -1,13 +1,11 @@
+import { positiveInteger } from "../domain/valueNormalization";
+import { getUpdateLibraryIDs } from "./citationPreferences";
+
 export interface CitationLibraryOption {
   libraryID: number;
   name: string;
   libraryType: string;
   isUserLibrary: boolean;
-}
-
-function positiveInteger(value: unknown): number | null {
-  const number = Number(value);
-  return Number.isInteger(number) && number > 0 ? number : null;
 }
 
 /**
@@ -86,4 +84,12 @@ export function getAvailableCitationLibraries(
       sensitivity: "base",
     });
   });
+}
+
+/** Return configured update libraries that are still available in Zotero. */
+export function getSelectedCitationUpdateLibraryIDs(): number[] {
+  const available = new Set(
+    getAvailableCitationLibraries().map((library) => library.libraryID),
+  );
+  return getUpdateLibraryIDs().filter((libraryID) => available.has(libraryID));
 }

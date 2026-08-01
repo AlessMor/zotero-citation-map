@@ -86,6 +86,7 @@ export function projectRelatedWorkSummary<T extends RelatedWorkMetadata>(
     isbn: work.isbn ?? null,
     title: work.title,
     year: work.year,
+    publicationDate: work.publicationDate ?? null,
     authors: [...work.authors],
     authorIDs: [...(work.authorIDs ?? [])],
     sourceTitle: work.sourceTitle ?? null,

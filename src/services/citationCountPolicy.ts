@@ -20,10 +20,27 @@ export function richestCountAttribution(
 ): CitationCountAttribution {
   let richest: CitationCountAttribution = { count: null, provider: null };
   for (const candidate of candidates) {
-    if (candidate.count === null || !Number.isFinite(candidate.count)) continue;
+    if (
+      candidate.count === null ||
+      !Number.isFinite(candidate.count) ||
+      candidate.count < 0
+    ) {
+      continue;
+    }
     if (richest.count === null || candidate.count > richest.count) {
       richest = candidate;
     }
   }
   return richest;
+}
+
+/**
+ * Reference totals are provider-dependent coverage indicators. Keep the
+ * largest valid value so a later provider with narrower coverage cannot make
+ * the displayed count move backwards.
+ */
+export function authoritativeReferenceCountAttribution(
+  candidates: readonly CitationCountAttribution[],
+): CitationCountAttribution {
+  return richestCountAttribution(candidates);
 }

@@ -1,16 +1,12 @@
 import { config } from "../../package.json";
-import {
-  cancelPendingCitationRequests,
-  resetCitationRequestCancellation,
-} from "../providers/http";
 
 const HTML_NS = "http://www.w3.org/1999/xhtml";
 const ICON = `chrome://${config.addonRef}/content/icons/network.svg`;
 const SPINNER_STYLE_ID = `${config.addonRef}-update-spinner-style`;
-const CANCELLATION_RESET_DELAY_MS = 1500;
 const DEFAULT_FINISH_CLOSE_MS = 3500;
 const DEFAULT_FAILURE_CLOSE_MS = 7000;
 const EMPTY_ACTIVITY_GRACE_MS = 1500;
+const PROGRESS_RENDER_DELAY_MS = 16;
 
 export interface UpdateProgressOptions {
   document?: Document | null;
@@ -67,6 +63,8 @@ const cancellationHandlers = new Set<() => void>();
 let nextActivityID = 1;
 let progressWindow: ProgressWindow | null = null;
 let minimizedPreference = false;
+let progressRenderTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingRenderDocument: Document | null | undefined;
 
 function element<K extends keyof HTMLElementTagNameMap>(
   document: Document,
@@ -109,8 +107,16 @@ function clearCloseTimer(): void {
   progressWindow.timer = null;
 }
 
+function clearProgressRenderTimer(): void {
+  if (progressRenderTimer === null) return;
+  clearTimeout(progressRenderTimer);
+  progressRenderTimer = null;
+}
+
 function cleanupWindow(clearActivities: boolean): void {
   clearCloseTimer();
+  clearProgressRenderTimer();
+  pendingRenderDocument = undefined;
   progressWindow?.root.remove();
   progressWindow = null;
   if (clearActivities) {
@@ -162,15 +168,7 @@ function cancelAllUpdates(): void {
       );
     }
   }
-  cancelPendingCitationRequests();
   cleanupWindow(true);
-
-  // Provider cancellation is global in the current request layer. Let the
-  // cancelled operation drain before permitting a later independent update.
-  setTimeout(
-    () => resetCitationRequestCancellation(),
-    CANCELLATION_RESET_DELAY_MS,
-  );
 }
 
 function makeButton(document: Document, text: string): HTMLButtonElement {
@@ -374,7 +372,7 @@ function scheduleWindowClose(milliseconds: number): void {
   progressWindow.timer = setTimeout(() => cleanupWindow(true), milliseconds);
 }
 
-function render(preferred?: Document | null): void {
+function renderNow(preferred?: Document | null): void {
   const window = ensureWindow(preferred);
   if (!window) return;
   clearCloseTimer();
@@ -438,6 +436,17 @@ function render(preferred?: Document | null): void {
   );
 }
 
+function scheduleProgressRender(preferred?: Document | null): void {
+  if (preferred !== undefined) pendingRenderDocument = preferred;
+  if (progressRenderTimer !== null) return;
+  progressRenderTimer = setTimeout(() => {
+    progressRenderTimer = null;
+    const document = pendingRenderDocument;
+    pendingRenderDocument = undefined;
+    renderNow(document);
+  }, PROGRESS_RENDER_DELAY_MS);
+}
+
 /**
  * Register work that must be cleared when the user closes the singleton update
  * window. The returned function unregisters the handler.
@@ -470,14 +479,14 @@ export function createUpdateProgress(
     autoCloseMs: DEFAULT_FINISH_CLOSE_MS,
   };
   activities.set(id, activity);
-  render(options.document);
+  renderNow(options.document);
 
   const update = (operation: (current: ProgressActivity) => void): void => {
     const current = activities.get(id);
     if (!current || current.status === "dismissed") return;
     operation(current);
     current.updatedAt = Date.now();
-    render(options.document);
+    scheduleProgressRender(options.document);
   };
 
   return {
@@ -520,7 +529,7 @@ export function createUpdateProgress(
       if (!current) return;
       current.status = "dismissed";
       activities.delete(id);
-      render(options.document);
+      scheduleProgressRender(options.document);
     },
     isDismissed: () => !activities.has(id),
     isMinimized: () => progressWindow?.minimized ?? false,

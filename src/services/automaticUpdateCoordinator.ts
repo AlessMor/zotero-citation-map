@@ -1,18 +1,16 @@
-import {
-  isCitationRequestCancellationRequested,
-  resetCitationRequestCancellation,
-} from "../providers/http";
-import { getAvailableCitationLibraries } from "./citationLibraryService";
+import { positiveInteger } from "../domain/valueNormalization";
+import { getSelectedCitationUpdateLibraryIDs } from "./citationLibraryService";
 import { registerUpdateCancellationHandler } from "./updateProgressService";
 import {
   getAutomaticUpdatesEnabled,
   getCheckStaleOnStartupEnabled,
-  getUpdateLibraryIDs,
   getUpdateModifiedItemsEnabled,
   getUpdateNewItemsEnabled,
 } from "./citationPreferences";
 import {
-  unregisterAutomaticCitationUpdates as unregisterCoreAutomaticCitationUpdates,
+  cancelActiveCitationUpdate,
+  startCitationUpdateRuntime,
+  stopCitationUpdateRuntime,
   updateCitationDataForItems,
   waitForCitationUpdates as waitForCoreCitationUpdates,
 } from "./citationUpdateService";
@@ -27,11 +25,6 @@ let shuttingDown = false;
 let unregisterCancellationHandler: (() => void) | null = null;
 let cancellationGeneration = 0;
 let automaticUpdateTail: Promise<void> = Promise.resolve();
-
-function positiveInteger(value: unknown): number | null {
-  const number = Number(value);
-  return Number.isInteger(number) && number > 0 ? number : null;
-}
 
 function reportBackgroundError(context: string, error: unknown): void {
   const detail = error instanceof Error ? error : new Error(String(error));
@@ -61,10 +54,6 @@ function startVisibleUpdate(
       if (!(await waitUntilCoreUpdateIsIdle(generation))) return;
       if (shuttingDown || generation !== cancellationGeneration) return;
 
-      // Reset cancellation only when this operation is actually about to start.
-      // Resetting while another operation is draining allows an older queued task
-      // to reopen the progress window after the user has closed it.
-      resetCitationRequestCancellation();
       await operation();
     });
   automaticUpdateTail = scheduled.catch((error: unknown) => {
@@ -94,39 +83,26 @@ function groupItemsByLibrary(items: Zotero.Item[]): Zotero.Item[][] {
     .map(([, group]) => group);
 }
 
-function selectedUpdateLibraryIDs(): number[] {
-  const available = new Set(
-    getAvailableCitationLibraries().map((library) => library.libraryID),
-  );
-  return getUpdateLibraryIDs().filter((libraryID) => available.has(libraryID));
-}
-
 async function updateLibraryGroups(groups: Zotero.Item[][]): Promise<void> {
   for (const items of groups) {
-    if (
-      shuttingDown ||
-      isCitationRequestCancellationRequested() ||
-      !items.length
-    ) {
+    if (shuttingDown || !items.length) {
       break;
     }
     await updateCitationDataForItems(items, {
       silent: false,
-      includeRelationships: false,
     });
   }
 }
 
 async function updateSelectedLibrariesAtStartup(): Promise<void> {
-  for (const libraryID of selectedUpdateLibraryIDs()) {
-    if (shuttingDown || isCitationRequestCancellationRequested()) break;
+  for (const libraryID of getSelectedCitationUpdateLibraryIDs()) {
+    if (shuttingDown) break;
     const items = regularItems(
       (await Zotero.Items.getAll(libraryID)) as Zotero.Item[],
     );
     if (!items.length) continue;
     await updateCitationDataForItems(items, {
       silent: false,
-      includeRelationships: false,
     });
   }
 }
@@ -138,7 +114,7 @@ function schedulePendingItems(): void {
     if (shuttingDown) return;
     const ids = [...pendingItemIDs];
     pendingItemIDs.clear();
-    const selectedLibraryIDs = new Set(selectedUpdateLibraryIDs());
+    const selectedLibraryIDs = new Set(getSelectedCitationUpdateLibraryIDs());
     if (!selectedLibraryIDs.size) return;
     const items = regularItems(ids.map((id) => Zotero.Items.get(id))).filter(
       (item) => selectedLibraryIDs.has(Number(item.libraryID)),
@@ -160,10 +136,11 @@ function schedulePendingItems(): void {
  */
 export function registerAutomaticCitationUpdates(): void {
   shuttingDown = false;
-  resetCitationRequestCancellation();
+  startCitationUpdateRuntime();
   if (notifierID) return;
   unregisterCancellationHandler = registerUpdateCancellationHandler(() => {
     cancellationGeneration += 1;
+    cancelActiveCitationUpdate();
     if (pendingTimer) clearTimeout(pendingTimer);
     if (startupTimer) clearTimeout(startupTimer);
     pendingTimer = null;
@@ -217,10 +194,21 @@ export function unregisterAutomaticCitationUpdates(): void {
   unregisterCancellationHandler?.();
   unregisterCancellationHandler = null;
 
-  // Reuse the core shutdown path for request cancellation and progress cleanup.
-  unregisterCoreAutomaticCitationUpdates();
+  stopCitationUpdateRuntime();
 }
 
-export function waitForCitationUpdates(timeoutMs?: number): Promise<boolean> {
-  return waitForCoreCitationUpdates(timeoutMs);
+export async function waitForCitationUpdates(
+  timeoutMs = 5000,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timedOut = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+  });
+  const completed = Promise.allSettled([
+    automaticUpdateTail,
+    waitForCoreCitationUpdates(timeoutMs),
+  ]).then(() => true as const);
+  const result = await Promise.race([completed, timedOut]);
+  if (timer) clearTimeout(timer);
+  return result;
 }

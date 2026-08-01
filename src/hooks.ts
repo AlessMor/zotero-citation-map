@@ -1,5 +1,4 @@
 import { config } from "../package.json";
-import "./services/transientGhostRendererService";
 import {
   closeCitationMetricsStore,
   initCitationMetricsStore,
@@ -9,17 +8,29 @@ import {
   initExternalWorkCache,
 } from "./services/externalWorkCacheService";
 import {
+  startProviderResponseCache,
+  stopProviderResponseCache,
+  waitForProviderResponseCache,
+} from "./services/providerResponseCacheService";
+import { subscribeToCitationUpdates } from "./services/citationUpdateEvents";
+import {
+  startExternalDiscoveryRuntime,
+  stopExternalDiscoveryRuntime,
+} from "./services/externalDiscoveryService";
+import {
   registerAutomaticCitationUpdates,
   unregisterAutomaticCitationUpdates,
   waitForCitationUpdates,
-} from "./services/visibleAutomaticUpdateService";
+} from "./services/automaticUpdateCoordinator";
 import {
   installCitationColumnTooltips,
+  refreshCitationColumns,
   registerCitationColumns,
   uninstallCitationColumnTooltips,
   unregisterCitationColumns,
 } from "./services/itemTreeColumnService";
 import {
+  refreshCitationItemPanes,
   registerCitationItemPane,
   unregisterCitationItemPane,
 } from "./services/itemPaneService";
@@ -30,15 +41,19 @@ import {
   unregisterCitationMapPreferenceObservers,
 } from "./services/preferencePaneService";
 import {
+  cancelPendingCitationMapRefreshes,
   closeCitationMapForWindow,
   closeCitationMapWindow,
   installCitationMapTabHooks,
+  refreshOpenCitationMapViews,
 } from "./services/windowService";
 
 const MAIN_STYLESHEET_ID = `${config.addonRef}-main-stylesheet`;
 const TAB_ICON_STYLESHEET_ID = `${config.addonRef}-tab-icon-stylesheet`;
 const TEARDOWN_MARKER = `__${config.addonRef}RuntimeTeardownListener`;
 let teardownStarted = false;
+let unsubscribeUpdateListener: (() => void) | null = null;
+const VIEW_REFRESH_DEADLINE_MS = 5000;
 
 function installStyles(win: _ZoteroTypes.MainWindow): void {
   const stylesheets: Array<[string, string]> = [
@@ -75,10 +90,57 @@ function syncMetricTooltipVisibility(win: _ZoteroTypes.MainWindow): void {
   }
 }
 
+function withDeadline<T>(
+  operation: Promise<T>,
+  milliseconds: number,
+  label: string,
+  onTimeout?: () => void,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      onTimeout?.();
+      reject(new Error(`${label} timed out after ${milliseconds} ms`));
+    }, milliseconds);
+    operation.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function installUpdateRefreshListener(): void {
+  if (unsubscribeUpdateListener) return;
+  unsubscribeUpdateListener = subscribeToCitationUpdates(async (event) => {
+    // Trigger all requested presentation surfaces from the same event-loop
+    // turn. Each surface reads the same completed metric-store snapshot.
+    if (event.refreshColumns) refreshCitationColumns();
+    if (event.refreshItemPanes) refreshCitationItemPanes();
+    if (event.refreshGraph) {
+      await withDeadline(
+        refreshOpenCitationMapViews(),
+        VIEW_REFRESH_DEADLINE_MS,
+        "Graph view refresh",
+        cancelPendingCitationMapRefreshes,
+      );
+    }
+  });
+}
+
 function beginTeardown(closeGraphTab = true): void {
   if (teardownStarted) return;
   teardownStarted = true;
   addon.data.alive = false;
+  unsubscribeUpdateListener?.();
+  unsubscribeUpdateListener = null;
+  stopProviderResponseCache();
+  stopExternalDiscoveryRuntime();
+  cancelPendingCitationMapRefreshes();
   for (const action of [
     unregisterAutomaticCitationUpdates,
     unregisterCitationMapPreferenceObservers,
@@ -107,6 +169,9 @@ async function onStartup(): Promise<void> {
   // both persistent stores before waiting for uiReady so no restored tab can
   // read from, or write to, an uninitialized external-work cache.
   await Promise.all([initCitationMetricsStore(), initExternalWorkCache()]);
+  startExternalDiscoveryRuntime();
+  startProviderResponseCache();
+  installUpdateRefreshListener();
   await Zotero.uiReadyPromise;
   for (const win of Zotero.getMainWindows()) await onMainWindowLoad(win);
   await registerCitationColumns();
@@ -168,6 +233,7 @@ async function onMainWindowUnload(win: _ZoteroTypes.MainWindow): Promise<void> {
 async function onShutdown(): Promise<void> {
   beginTeardown();
   await waitForCitationUpdates();
+  await waitForProviderResponseCache();
   await closeExternalWorkCache().catch((error: unknown) =>
     Zotero.logError(error instanceof Error ? error : new Error(String(error))),
   );

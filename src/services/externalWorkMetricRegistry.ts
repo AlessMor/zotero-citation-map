@@ -1,70 +1,48 @@
-import type {
-  CitationProviderID,
-  RelatedWorkMetadata,
-} from "../domain/citationTypes";
+import type { RelatedWorkMetadata } from "../domain/citationTypes";
 import type { GraphNodeLabelMode } from "../domain/graphTypes";
+import { mergeRelatedWorkMetadata } from "../domain/relatedWorkMetadata";
+import { publicationYearOrNull } from "../domain/valueNormalization";
+import { resolveRelatedWorksMetadata } from "../providers/relatedWorkResolutionService";
 import {
-  mergeRelatedWorkMetadata,
-  resolveRelatedWorksMetadata,
-} from "../providers/registry";
-import { normalizeDOI, normalizeExactTitle } from "./citationIdentifiers";
-import { getProviderPreference } from "./citationPreferences";
+  externalWorkLookupIdentity,
+  normalizeDOI,
+  relationshipStableAliases,
+} from "../domain/workIdentity";
 
 export type ExternalMetricValueMap = Record<string, number | null | undefined>;
 
 const valuesByAlias = new Map<string, ExternalMetricValueMap>();
 const workByAlias = new Map<string, RelatedWorkMetadata>();
 const hydrationByAlias = new Map<string, Promise<void>>();
-const hydrationAttempted = new Set<string>();
+const hydrationFailures = new Map<
+  string,
+  { attempts: number; nextRetryAt: number }
+>();
+const HYDRATION_RETRY_DELAYS_MS = [60000, 300000, 3600000] as const;
 
 function finite(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function normalizedAliases(value: string | null | undefined): string[] {
-  const raw = String(value ?? "").trim();
-  if (!raw) return [];
-  const lower = raw.toLocaleLowerCase();
-  return lower === raw ? [raw] : [raw, lower];
-}
-
 function aliasesForWork(work: RelatedWorkMetadata): string[] {
-  const aliases = new Set<string>();
-  for (const alias of normalizedAliases(work.providerWorkID))
-    aliases.add(alias);
-  for (const alias of normalizedAliases(work.zoteroItemKey)) aliases.add(alias);
-  for (const alias of normalizedAliases(work.inLibraryItemKey))
-    aliases.add(alias);
-
-  const rawDOI = String(work.doi ?? "").trim();
-  for (const alias of normalizedAliases(rawDOI)) aliases.add(alias);
-  const doi = normalizeDOI(work.doi);
-  if (doi) {
-    aliases.add(doi);
-    aliases.add(`doi:${doi}`);
-  }
-
-  const rawTitle = String(work.title ?? "").trim();
-  for (const alias of normalizedAliases(rawTitle)) aliases.add(alias);
-  const title = normalizeExactTitle(work.title);
-  if (title) {
-    aliases.add(title);
-    aliases.add(`title:${title}`);
-  }
-  return [...aliases];
+  const identity = externalWorkLookupIdentity(work);
+  return [
+    ...new Set([
+      ...relationshipStableAliases(work),
+      identity,
+      `focus:${identity}`,
+    ]),
+  ];
 }
 
 function aliasesForKey(key: string): string[] {
-  const aliases = new Set(normalizedAliases(key));
+  const normalized = key.trim();
+  if (!normalized) return [];
+  const aliases = new Set([normalized, normalized.toLocaleLowerCase()]);
+  if (normalized.startsWith("focus:")) aliases.add(normalized.slice(6));
   const doi = normalizeDOI(key);
   if (doi) {
-    aliases.add(doi);
     aliases.add(`doi:${doi}`);
-  }
-  const title = normalizeExactTitle(key);
-  if (title) {
-    aliases.add(title);
-    aliases.add(`title:${title}`);
   }
   return [...aliases];
 }
@@ -201,7 +179,7 @@ function metricValuesForWork(
   const derived = derivedReferenceMetrics(work);
 
   return {
-    year: finite(work.year),
+    year: publicationYearOrNull(work.year),
     citations: finite(work.citationCount),
     references: referenceCount,
     "citations-last-year": finite(work.citationsLastYear),
@@ -289,6 +267,7 @@ export function getExternalWorkNodeLabel(
   key: string,
   mode: GraphNodeLabelMode,
   fallbackTitle: string,
+  fallbackAuthors: string[],
   fallbackYear: number | null,
 ): string {
   if (mode === "none") return "";
@@ -296,52 +275,52 @@ export function getExternalWorkNodeLabel(
   if (mode === "title") {
     return String(work?.title ?? fallbackTitle).trim() || fallbackTitle;
   }
-  const firstAuthor = work?.authors[0];
+  const firstAuthor = work?.authors[0] ?? fallbackAuthors[0];
   const name = firstAuthor?.trim().split(/\s+/).at(-1) ?? "Unknown";
   const year = work?.year ?? fallbackYear;
   return `${name}${year ? ` (${year})` : ""}`;
 }
 
-export function getExternalWorkProvider(
-  key: string,
-): CitationProviderID | null {
-  const provider = getExternalWorkMetadata(key)?.provider;
-  return provider && provider !== "manual" && provider !== "zotero"
-    ? provider
-    : null;
-}
-
 export async function ensureExternalWorkMetrics(key: string): Promise<void> {
   const aliases = aliasesForKey(key);
   const primary = aliases.find((alias) => workByAlias.has(alias));
-  if (!primary || hydrationAttempted.has(primary)) return;
+  if (!primary) return;
+  const failure = hydrationFailures.get(primary);
+  if (failure && failure.nextRetryAt > Date.now()) return;
   const existing = hydrationByAlias.get(primary);
   if (existing) return existing;
   const work = workByAlias.get(primary);
   if (!work) return;
 
-  hydrationAttempted.add(primary);
   const operation = (async () => {
     try {
       const [resolved] = await resolveRelatedWorksMetadata(
         [work],
-        getProviderPreference(),
+        "auto",
         true,
       );
-      if (resolved) registerExternalWorkMetrics(resolved);
+      if (resolved) {
+        registerExternalWorkMetrics(resolved);
+        hydrationFailures.delete(primary);
+      }
     } catch (error) {
-      Zotero.debug(
-        `Citation Map: ghost metric hydration failed for ${key}: ${String(error)}`,
+      const attempts = (hydrationFailures.get(primary)?.attempts ?? 0) + 1;
+      const delay =
+        HYDRATION_RETRY_DELAYS_MS[
+          Math.min(attempts - 1, HYDRATION_RETRY_DELAYS_MS.length - 1)
+        ];
+      hydrationFailures.set(primary, {
+        attempts,
+        nextRetryAt: Date.now() + delay,
+      });
+      Zotero.logError(
+        new Error(
+          `Citation Map: external metric hydration failed for ${key}; retry ${attempts} is delayed by ${delay} ms.`,
+          { cause: error },
+        ),
       );
     }
   })().finally(() => hydrationByAlias.delete(primary));
   hydrationByAlias.set(primary, operation);
   return operation;
-}
-
-export function clearExternalWorkMetricRegistry(): void {
-  valuesByAlias.clear();
-  workByAlias.clear();
-  hydrationByAlias.clear();
-  hydrationAttempted.clear();
 }

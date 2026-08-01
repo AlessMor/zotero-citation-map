@@ -1,5 +1,6 @@
 import type { GraphAxisMetric, GraphScaleType } from "../domain/graphTypes";
 import { getMetricDefinition } from "./metricRegistry";
+import { clamp, inverseScaleValue, niceStep } from "./graphMetricScale";
 
 export interface GraphAxisViewport {
   canvasWidth: number;
@@ -14,25 +15,6 @@ const WORLD_PLOT = {
   top: 60,
   bottom: 675,
 };
-
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.max(minimum, Math.min(maximum, value));
-}
-
-function inverseScaleValue(
-  normalized: number,
-  domain: [number, number],
-  scale: GraphScaleType,
-): number {
-  const t = clamp(normalized, 0, 1);
-  if (scale === "log") {
-    if (domain[0] <= 0 || domain[1] <= 0) return domain[0];
-    return Math.exp(
-      Math.log(domain[0]) + t * (Math.log(domain[1]) - Math.log(domain[0])),
-    );
-  }
-  return domain[0] + t * (domain[1] - domain[0]);
-}
 
 export function visibleMetricDomain(
   viewport: GraphAxisViewport,
@@ -76,17 +58,6 @@ export function visibleMetricDomain(
   const first = inverseScaleValue(firstNormalized, fullDomain, scale);
   const second = inverseScaleValue(secondNormalized, fullDomain, scale);
   return first <= second ? [first, second] : [second, first];
-}
-
-function niceStep(span: number, target: number, integer: boolean): number {
-  if (!Number.isFinite(span) || span <= 0) return 1;
-  const raw = span / Math.max(1, target);
-  const magnitude = 10 ** Math.floor(Math.log10(raw));
-  const normalized = raw / magnitude;
-  const multiplier =
-    normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
-  const step = multiplier * magnitude;
-  return integer ? Math.max(1, Math.ceil(step)) : step;
 }
 
 function linearTicks(

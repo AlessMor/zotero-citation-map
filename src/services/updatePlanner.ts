@@ -10,7 +10,7 @@ import {
   getCitationMetricRecord,
   shouldRefreshCitationMetrics,
 } from "./citationMetricsStore";
-import { getCacheDays } from "./citationPreferences";
+import { getCacheDays, isProviderEnabled } from "./citationPreferences";
 import {
   getStoredRelationshipEntry,
   type RelationshipStoreSubject,
@@ -103,11 +103,13 @@ function relationshipFirstHopIsCurrent(
   if (values.status === "complete" || values.complete) return Boolean(entry);
   if (values.status === "first-hop-ready") return Boolean(entry);
 
-  // Legacy state from the first one-hop implementation: any fresh attempted
-  // result is accepted even when no selected cache row was written or provider
-  // deduplication returned fewer than the nominal page size. It can be retried
-  // after the normal cache interval instead of at every startup.
-  return true;
+  // Lazily migrate the first one-hop format. A confirmed empty result remains
+  // current, but non-empty legacy state is current only when the selected
+  // relationship row actually exists. The next completion refresh persists
+  // the explicit status fields and removes this compatibility path naturally.
+  if (values.reportedCount === 0 && (values.loadedCount ?? 0) === 0)
+    return true;
+  return Boolean(entry);
 }
 
 function hasCurrentLibraryUpdate(
@@ -162,8 +164,15 @@ export function createCitationUpdatePlan(
     const libraryID = Number(item.libraryID);
     const itemKey = String(item.key);
     const previous = getCitationMetricRecord(libraryID, itemKey);
+    const storedCountProviderDisabled = Boolean(
+      (previous?.citationCountProvider &&
+        !isProviderEnabled(previous.citationCountProvider)) ||
+      (previous?.referenceCountProvider &&
+        !isProviderEnabled(previous.referenceCountProvider)),
+    );
     const needsCoreRefresh =
       force ||
+      storedCountProviderDisabled ||
       shouldRefreshCitationMetrics(
         libraryID,
         itemKey,

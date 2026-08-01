@@ -7,6 +7,7 @@ export interface ZoteroPaper {
   title: string;
   authors: string[];
   year: number | null;
+  publicationDate: string | null;
   doi: string | null;
   abstract: string | null;
   sourceTitle: string | null;

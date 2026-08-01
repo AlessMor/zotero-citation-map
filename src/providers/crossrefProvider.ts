@@ -5,43 +5,19 @@ import type {
   WorkIdentifiers,
 } from "../domain/citationTypes";
 import {
-  metadataIsNonContradictory,
+  matchWorkIdentifiers,
   normalizeDOI,
   normalizeExactTitle,
-} from "../services/citationIdentifiers";
+} from "../domain/workIdentity";
 import { requestJSON } from "./http";
-import type { CitationProvider } from "./types";
+import {
+  crossrefReferenceMetadata,
+  crossrefWorkMetadata,
+  type CrossrefWork,
+} from "./crossrefMapper";
+import type { CitationProvider, ProviderRequestOptions } from "./types";
 import { failureStatusFromHTTP, numberOrNull, stringOrNull } from "./types";
 
-interface CrossrefAuthor {
-  given?: string;
-  family?: string;
-  name?: string;
-}
-interface CrossrefReference {
-  DOI?: string;
-  doi?: string;
-  "article-title"?: string;
-  author?: string;
-  year?: string;
-  "journal-title"?: string;
-}
-interface CrossrefWork {
-  DOI?: string;
-  title?: string[];
-  author?: CrossrefAuthor[];
-  published?: { "date-parts"?: number[][] };
-  issued?: { "date-parts"?: number[][] };
-  "container-title"?: string[];
-  abstract?: string;
-  type?: string;
-  "is-referenced-by-count"?: number;
-  "reference-count"?: number;
-  reference?: CrossrefReference[];
-  license?: Array<{ URL?: string; "delay-in-days"?: number }>;
-  "update-to"?: Array<{ type?: string; DOI?: string; label?: string }>;
-  relation?: Record<string, Array<{ id?: string; "id-type"?: string }>>;
-}
 interface CrossrefSingleResponse {
   status?: string;
   message?: CrossrefWork;
@@ -51,89 +27,13 @@ interface CrossrefListResponse {
   message?: { items?: CrossrefWork[] };
 }
 
-function yearFromWork(work: CrossrefWork): number | null {
-  const parts = work.published?.["date-parts"] ?? work.issued?.["date-parts"];
-  const year = parts?.[0]?.[0];
-  return Number.isFinite(year) ? Number(year) : null;
-}
-
-function authorNames(work: CrossrefWork): string[] {
-  return (work.author ?? [])
-    .map((author) =>
-      String(
-        author.name ?? [author.given, author.family].filter(Boolean).join(" "),
-      ).trim(),
-    )
-    .filter(Boolean);
-}
-
-function stripMarkup(value: unknown): string | null {
-  const text = String(value ?? "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s+/g, " ")
-    .trim();
-  return text || null;
-}
-
-function relationIsRetraction(work: CrossrefWork): boolean {
-  if (
-    (work["update-to"] ?? []).some((entry) =>
-      /retract/i.test(`${entry.type ?? ""} ${entry.label ?? ""}`),
-    )
-  ) {
-    return true;
-  }
-  return Object.keys(work.relation ?? {}).some((key) => /retract/i.test(key));
-}
-
-function referenceMetadata(reference: CrossrefReference): RelatedWorkMetadata {
-  const year = Number(reference.year);
-  return {
-    provider: "crossref",
-    providerWorkID: normalizeDOI(reference.DOI ?? reference.doi),
-    doi: normalizeDOI(reference.DOI ?? reference.doi),
-    title: stringOrNull(reference["article-title"]),
-    year: Number.isFinite(year) ? year : null,
-    authors: reference.author ? [reference.author] : [],
-    sourceTitle: stringOrNull(reference["journal-title"]),
-  };
-}
-
-function workToRelated(work: CrossrefWork): RelatedWorkMetadata | null {
-  const title = stringOrNull(work.title?.[0]);
-  if (!title) return null;
-  return {
-    provider: "crossref",
-    providerWorkID: normalizeDOI(work.DOI),
-    doi: normalizeDOI(work.DOI),
-    title,
-    year: yearFromWork(work),
-    authors: authorNames(work),
-    sourceTitle: stringOrNull(work["container-title"]?.[0]),
-    abstract: stripMarkup(work.abstract),
-    citationCount: numberOrNull(work["is-referenced-by-count"]),
-    referenceCount: numberOrNull(work["reference-count"]),
-    isRetracted: relationIsRetraction(work),
-    isOpenAccess: (work.license ?? []).some(
-      (license) =>
-        license["delay-in-days"] === 0 ||
-        /creativecommons|open/i.test(String(license.URL ?? "")),
-    ),
-  };
-}
-
 function successFromWork(
   work: CrossrefWork,
   matchedBy: "doi" | "isbn" | "title",
   confidence: number,
 ): ProviderLookupSuccess {
-  const related = workToRelated(work);
-  const references = (work.reference ?? []).map(referenceMetadata);
+  const related = crossrefWorkMetadata(work);
+  const references = (work.reference ?? []).map(crossrefReferenceMetadata);
   return {
     status: "success",
     provider: "crossref",
@@ -143,6 +43,7 @@ function successFromWork(
     doi: normalizeDOI(work.DOI),
     title: related?.title ?? null,
     year: related?.year ?? null,
+    publicationDate: related?.publicationDate ?? null,
     authors: related?.authors ?? [],
     sourceTitle: related?.sourceTitle ?? null,
     abstract: related?.abstract ?? null,
@@ -171,10 +72,14 @@ function successFromWork(
   };
 }
 
-async function fetchDOI(doi: string): Promise<ProviderLookupResult> {
+async function fetchDOI(
+  doi: string,
+  options?: ProviderRequestOptions,
+): Promise<ProviderLookupResult> {
   const response = await requestJSON<CrossrefSingleResponse>(
     "crossref",
     `https://api.crossref.org/works/${encodeURIComponent(doi)}`,
+    { signal: options?.signal },
   );
   if (!response.ok || !response.data?.message) {
     return {
@@ -190,6 +95,7 @@ async function searchWorks(
   identifiers: WorkIdentifiers,
   query: string,
   matchedBy: "isbn" | "title",
+  options?: ProviderRequestOptions,
 ): Promise<ProviderLookupResult> {
   const select = [
     "DOI",
@@ -210,6 +116,7 @@ async function searchWorks(
   const response = await requestJSON<CrossrefListResponse>(
     "crossref",
     `https://api.crossref.org/works?query=${encodeURIComponent(query)}&rows=10&select=${encodeURIComponent(select)}`,
+    { signal: options?.signal },
   );
   if (!response.ok || !response.data?.message) {
     return {
@@ -219,14 +126,15 @@ async function searchWorks(
     };
   }
   const candidates = (response.data.message.items ?? [])
-    .map(workToRelated)
+    .map(crossrefWorkMetadata)
     .filter((work): work is RelatedWorkMetadata => Boolean(work));
   const exact = candidates.filter(
     (candidate) =>
       normalizeExactTitle(candidate.title) === identifiers.normalizedTitle,
   );
-  const compatible = exact.filter((candidate) =>
-    metadataIsNonContradictory(identifiers, candidate),
+  const compatible = exact.filter(
+    (candidate) =>
+      matchWorkIdentifiers(identifiers, candidate).decision === "same-work",
   );
   if (compatible.length === 1) {
     const item = (response.data.message.items ?? []).find(
@@ -276,10 +184,10 @@ export const crossrefProvider: CitationProvider = {
     sourceMetrics: false,
   },
   supports: (identifiers) => Boolean(identifiers.doi || identifiers.isbn),
-  lookup: async (identifiers) => {
-    if (identifiers.doi) return fetchDOI(identifiers.doi);
+  lookup: async (identifiers, options) => {
+    if (identifiers.doi) return fetchDOI(identifiers.doi, options);
     if (identifiers.isbn) {
-      return searchWorks(identifiers, identifiers.isbn, "isbn");
+      return searchWorks(identifiers, identifiers.isbn, "isbn", options);
     }
     return {
       status: "no-identifier",
@@ -287,6 +195,6 @@ export const crossrefProvider: CitationProvider = {
       message: "Crossref needs a DOI or ISBN.",
     };
   },
-  searchExactTitle: (identifiers) =>
-    searchWorks(identifiers, identifiers.title, "title"),
+  searchExactTitle: (identifiers, options) =>
+    searchWorks(identifiers, identifiers.title, "title", options),
 };

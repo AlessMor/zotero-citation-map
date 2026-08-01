@@ -4,6 +4,7 @@ import {
   isProviderEnabled,
 } from "../services/citationPreferences";
 import { providerExecutionPolicy } from "../services/providerExecutionPolicy";
+import type { CancellationSignal } from "../services/cancellationScope";
 
 export interface HTTPResult<T> {
   ok: boolean;
@@ -27,6 +28,9 @@ export interface JSONRequestOptions {
   method?: "GET" | "POST";
   body?: unknown;
   headers?: Record<string, string>;
+  signal?: CancellationSignal;
+  /** Override the normal bounded retry count for latency-sensitive batches. */
+  retryLimit?: number;
 }
 
 interface ZoteroHTTPResponse {
@@ -35,9 +39,14 @@ interface ZoteroHTTPResponse {
   getResponseHeader?: (name: string) => string | null;
 }
 
+type ZoteroHTTPRequestOptions = NonNullable<
+  Parameters<typeof Zotero.HTTP.request>[2]
+>;
+
 interface ProviderQueueEntry {
   start: () => Promise<void>;
   cancel: () => void;
+  signal?: CancellationSignal;
 }
 
 interface ProviderQueueState {
@@ -81,6 +90,10 @@ function cancelledResult<T>(): HTTPResult<T> {
     data: null,
     message: "Citation Map request cancelled during shutdown",
   };
+}
+
+function requestWasCancelled(signal?: CancellationSignal): boolean {
+  return cancellationRequested || signal?.cancelled === true;
 }
 
 function disabledProviderResult<T>(
@@ -134,6 +147,13 @@ function pumpProviderQueue(
     return;
   }
 
+  for (let index = state.queue.length - 1; index >= 0; index -= 1) {
+    const entry = state.queue[index];
+    if (!entry.signal?.cancelled) continue;
+    state.queue.splice(index, 1);
+    entry.cancel();
+  }
+
   const limit = providerParallelism(provider);
   while (state.active < limit && state.queue.length) {
     const remaining = state.nextStartAt - Date.now();
@@ -167,20 +187,25 @@ function postponeProvider(
 function runInProviderQueue<T>(
   provider: CitationProviderID,
   task: () => Promise<T>,
+  signal?: CancellationSignal,
 ): Promise<T | null> {
-  if (cancellationRequested) return Promise.resolve(null);
+  if (requestWasCancelled(signal)) return Promise.resolve(null);
   const state = queueState(provider);
   return new Promise<T | null>((resolve, reject) => {
     let settled = false;
+    let unsubscribe = (): void => undefined;
     const settleCancelled = (): void => {
       if (settled) return;
       settled = true;
+      unsubscribe();
       resolve(null);
     };
+    unsubscribe = signal?.subscribe(settleCancelled) ?? unsubscribe;
     state.queue.push({
       cancel: settleCancelled,
+      signal,
       start: async (): Promise<void> => {
-        if (settled || cancellationRequested) {
+        if (settled || requestWasCancelled(signal)) {
           settleCancelled();
           return;
         }
@@ -188,11 +213,13 @@ function runInProviderQueue<T>(
           const value = await task();
           if (!settled) {
             settled = true;
+            unsubscribe();
             resolve(value);
           }
         } catch (error) {
           if (!settled) {
             settled = true;
+            unsubscribe();
             reject(error);
           }
         }
@@ -283,12 +310,19 @@ export function cancelPendingCitationRequests(): void {
 export async function requestJSON<T>(
   provider: CitationProviderID,
   url: string,
-  options: JSONRequestOptions = {},
+  options: JSONRequestOptions,
 ): Promise<HTTPResult<T>> {
   if (!isProviderEnabled(provider)) return disabledProviderResult<T>(provider);
 
-  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
-    if (cancellationRequested) return cancelledResult<T>();
+  const requestedRetryLimit = Number.isFinite(options.retryLimit)
+    ? Math.floor(options.retryLimit!)
+    : RETRY_DELAYS_MS.length;
+  const retryLimit = Math.min(
+    RETRY_DELAYS_MS.length,
+    Math.max(0, requestedRetryLimit),
+  );
+  for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
+    if (requestWasCancelled(options.signal)) return cancelledResult<T>();
     try {
       const response = await runInProviderQueue(
         provider,
@@ -312,7 +346,7 @@ export async function requestJSON<T>(
                 : typeof options.body === "string"
                   ? options.body
                   : JSON.stringify(options.body);
-            return (await Zotero.HTTP.request(options.method ?? "GET", url, {
+            const requestOptions: ZoteroHTTPRequestOptions = {
               headers,
               body,
               responseType: "text",
@@ -321,23 +355,42 @@ export async function requestJSON<T>(
               cancellerReceiver: (cancel: () => void) => {
                 requestCanceller = cancel;
                 activeRequestCancellers.add(cancel);
-                if (cancellationRequested) cancel();
+                if (requestWasCancelled(options.signal)) cancel();
               },
-            } as any)) as unknown as ZoteroHTTPResponse;
+            };
+            const unsubscribe = options.signal?.subscribe(() => {
+              try {
+                requestCanceller?.();
+              } catch {
+                // The request may already have settled.
+              }
+            });
+            try {
+              return await Zotero.HTTP.request(
+                options.method ?? "GET",
+                url,
+                requestOptions,
+              );
+            } finally {
+              unsubscribe?.();
+            }
           } finally {
             if (requestCanceller) {
               activeRequestCancellers.delete(requestCanceller);
             }
           }
         },
+        options.signal,
       );
-      if (!response || cancellationRequested) return cancelledResult<T>();
+      if (!response || requestWasCancelled(options.signal)) {
+        return cancelledResult<T>();
+      }
 
       const retryable =
         response.status === 0 ||
         response.status === 429 ||
         response.status >= 500;
-      if (retryable && attempt < RETRY_DELAYS_MS.length) {
+      if (retryable && attempt < retryLimit) {
         const retryAfter = parseRetryAfter(response);
         // A long Retry-After should fail this interactive update promptly
         // instead of freezing every request queued for the provider. The next
@@ -359,8 +412,8 @@ export async function requestJSON<T>(
       }
       return parsed;
     } catch (error) {
-      if (cancellationRequested) return cancelledResult<T>();
-      if (attempt < RETRY_DELAYS_MS.length) {
+      if (requestWasCancelled(options.signal)) return cancelledResult<T>();
+      if (attempt < retryLimit) {
         postponeProvider(provider, RETRY_DELAYS_MS[attempt]);
         continue;
       }

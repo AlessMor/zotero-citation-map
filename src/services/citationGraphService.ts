@@ -16,17 +16,13 @@ import {
   getIgnoredRelations,
   getManualRelations,
 } from "./citationMetricsStore";
-import {
-  getLocalRelationsEnabled,
-  getNoteExtractionEnabled,
-  getPDFExtractionEnabled,
-} from "./citationPreferences";
-import { normalizeDOI } from "./citationIdentifiers";
+import { normalizeDOI } from "../domain/workIdentity";
 import {
   getStoredRelationshipWorks,
   mergeRelatedWorkLists,
   type RelationshipStoreSubject,
 } from "./relationshipStoreService";
+import { assignGraphCitationSequence } from "./citationSequenceService";
 
 const graphCacheByLibrary = new Map<number, CitationGraphModel>();
 
@@ -86,48 +82,42 @@ function getLocalCitationRelations(
   for (const paper of snapshot.papers) {
     const item = Zotero.Items.get(paper.itemID) as Zotero.Item | null;
     if (!item) continue;
-    if (getLocalRelationsEnabled()) {
-      const relations = item.getRelations?.() ?? {};
-      for (const [predicate, rawValues] of Object.entries(relations)) {
-        const values = Array.isArray(rawValues) ? rawValues : [rawValues];
-        for (const value of values) {
-          const relatedKey = relationItemKey(value);
-          if (!relatedKey) continue;
-          if (/iscitedby/i.test(predicate)) {
-            add(relatedKey, paper.itemKey, "zotero-relation");
-          } else if (/cites|references/i.test(predicate)) {
-            add(paper.itemKey, relatedKey, "zotero-relation");
-          }
+    const relations = item.getRelations?.() ?? {};
+    for (const [predicate, rawValues] of Object.entries(relations)) {
+      const values = Array.isArray(rawValues) ? rawValues : [rawValues];
+      for (const value of values) {
+        const relatedKey = relationItemKey(value);
+        if (!relatedKey) continue;
+        if (/iscitedby/i.test(predicate)) {
+          add(relatedKey, paper.itemKey, "zotero-relation");
+        } else if (/cites|references/i.test(predicate)) {
+          add(paper.itemKey, relatedKey, "zotero-relation");
         }
       }
     }
-    if (getNoteExtractionEnabled()) {
-      for (const noteID of item.getNotes?.() ?? []) {
-        const note = Zotero.Items.get(noteID);
-        const content = String(note?.getNote?.() ?? "");
+    for (const noteID of item.getNotes?.() ?? []) {
+      const note = Zotero.Items.get(noteID);
+      const content = String(note?.getNote?.() ?? "");
+      for (const doi of extractDOIs(content)) {
+        const target = keyByDOI.get(doi);
+        if (target) add(paper.itemKey, target, "note-extraction");
+      }
+    }
+    for (const attachmentID of item.getAttachments?.() ?? []) {
+      try {
+        const attachment = Zotero.Items.get(attachmentID);
+        const cacheFile = (Zotero.Fulltext as any)?.getItemCacheFile?.(
+          attachment,
+        );
+        const content = cacheFile
+          ? String((Zotero.File as any)?.getContents?.(cacheFile) ?? "")
+          : "";
         for (const doi of extractDOIs(content)) {
           const target = keyByDOI.get(doi);
-          if (target) add(paper.itemKey, target, "note-extraction");
+          if (target) add(paper.itemKey, target, "pdf-extraction");
         }
-      }
-    }
-    if (getPDFExtractionEnabled()) {
-      for (const attachmentID of item.getAttachments?.() ?? []) {
-        try {
-          const attachment = Zotero.Items.get(attachmentID);
-          const cacheFile = (Zotero.Fulltext as any)?.getItemCacheFile?.(
-            attachment,
-          );
-          const content = cacheFile
-            ? String((Zotero.File as any)?.getContents?.(cacheFile) ?? "")
-            : "";
-          for (const doi of extractDOIs(content)) {
-            const target = keyByDOI.get(doi);
-            if (target) add(paper.itemKey, target, "pdf-extraction");
-          }
-        } catch {
-          // Full-text cache is optional and may be unavailable for an attachment.
-        }
+      } catch {
+        // Full-text cache is optional and may be unavailable for an attachment.
       }
     }
   }
@@ -179,6 +169,7 @@ export function buildCitationGraph(
       doi: record?.doi ?? paper.doi,
       title: record?.title?.trim() || paper.title,
       year: record?.year ?? paper.year,
+      authors: record?.authors.length ? record.authors : paper.authors,
       provider: record?.provider ?? paper.metrics.provider,
       providerWorkID: record?.providerWorkID ?? null,
     };
@@ -198,11 +189,6 @@ export function buildCitationGraph(
     const local = network.get(paper.itemKey) ?? {
       incoming: 0,
       outgoing: 0,
-      pageRank: 0,
-      betweennessCentrality: 0,
-      eigenvectorCentrality: 0,
-      componentSize: 1,
-      citationChainDepth: 0,
       isIsolated: true,
     };
     const metrics = paper.metrics;
@@ -225,11 +211,16 @@ export function buildCitationGraph(
       key: paper.itemKey,
       itemID: paper.itemID,
       itemKey: paper.itemKey,
+      kind: "local",
+      focusRole: null,
+      externalWork: null,
       title: paper.title,
       abstract: paper.abstract,
       sourceTitle: paper.sourceTitle ?? record?.sourceTitle ?? null,
       authors: paper.authors,
       year: paper.year,
+      publicationDate: paper.publicationDate,
+      citationSequence: null,
       doi: record?.doi ?? paper.doi,
       tags: paper.tags,
       collectionIDs: paper.collectionIDs,
@@ -277,11 +268,6 @@ export function buildCitationGraph(
           : local.incoming === 0 && metrics.citationCount === 0
             ? 1
             : null,
-      pageRank: local.pageRank,
-      betweennessCentrality: local.betweennessCentrality,
-      eigenvectorCentrality: local.eigenvectorCentrality,
-      componentSize: local.componentSize,
-      citationChainDepth: local.citationChainDepth,
       isIsolated: local.isIsolated,
       referenceAgeMean: derived?.referenceAgeMean ?? null,
       referenceAgeSpread: derived?.referenceAgeSpread ?? null,
@@ -301,6 +287,7 @@ export function buildCitationGraph(
       isolatedNodes: nodes.filter((node) => node.isIsolated).length,
     },
   };
+  assignGraphCitationSequence(model.nodes);
   graphCacheByLibrary.set(snapshot.libraryID, model);
   return model;
 }

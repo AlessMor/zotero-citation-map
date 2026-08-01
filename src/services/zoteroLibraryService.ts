@@ -4,12 +4,17 @@ import type {
   LibraryStatistics,
   ZoteroPaper,
 } from "../domain/types";
-import { normalizeDOI } from "./citationIdentifiers";
+import { normalizeDOI } from "../domain/workIdentity";
 import { getItemCitationMetrics } from "./citationMetricsStore";
 
 function extractYear(value: unknown): number | null {
   const match = String(value ?? "").match(/\b(1[5-9]\d{2}|20\d{2}|21\d{2})\b/);
   return match ? Number(match[0]) : null;
+}
+
+function publicationDate(value: unknown): string | null {
+  const text = String(value ?? "").trim();
+  return text || null;
 }
 
 function title(item: any): string {
@@ -80,6 +85,7 @@ function toPaper(item: any): ZoteroPaper {
     title: title(item),
     authors: authors(item),
     year: extractYear(item.getField?.("date")),
+    publicationDate: publicationDate(item.getField?.("date")),
     doi: normalizeDOI(item.getField?.("DOI")),
     abstract: String(item.getField?.("abstractNote") ?? "").trim() || null,
     sourceTitle:

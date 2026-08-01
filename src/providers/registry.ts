@@ -2,37 +2,12 @@ import type {
   CitationProviderID,
   CitationProviderPreference,
   ProviderLookupFailure,
-  ProviderLookupResult,
-  ProviderLookupSuccess,
-  RelatedWorkMetadata,
-  WorkIdentifiers,
 } from "../domain/citationTypes";
-import {
-  metadataIsNonContradictory,
-  normalizeDOI,
-  normalizeExactTitle,
-} from "../services/citationIdentifiers";
-import {
-  maximumKnownCount,
-  richestCountAttribution,
-} from "../services/citationCountPolicy";
-import { getOpenAlexAPIKey } from "../services/citationPreferences";
-import { fetchCrossrefRelatedWorks } from "./crossrefDiscovery";
 import { crossrefProvider } from "./crossrefProvider";
 import { inspireProvider } from "./inspireProvider";
-import {
-  fetchOpenAlexRelatedWorks,
-  fetchOpenAlexWorksBatch,
-  openAlexProvider,
-} from "./openAlexProvider";
+import { openAlexProvider } from "./openAlexProvider";
 import { openCitationsProvider } from "./openCitationsProvider";
-import {
-  fetchSemanticScholarPapersBatch,
-  fetchSemanticScholarRecommendations,
-  SEMANTIC_SCHOLAR_BATCH_LIMIT,
-  semanticScholarProvider,
-} from "./semanticScholarProvider";
-import { relationshipAdapterFor } from "./relationshipAdapters";
+import { semanticScholarProvider } from "./semanticScholarProvider";
 import type { CitationProvider } from "./types";
 
 const PROVIDERS: Record<CitationProviderID, CitationProvider> = {
@@ -115,12 +90,15 @@ const AUTOMATIC_PROVIDER_ORDERS: Record<
   "source-metrics": ["openalex"],
 };
 
-const sessionUnavailableProviders = new Set<CitationProviderID>();
-const SEMANTIC_SCHOLAR_RESOLUTION_BATCH_SIZE = Math.min(
-  relationshipAdapterFor("semantic-scholar").metadataBatchSize,
-  SEMANTIC_SCHOLAR_BATCH_LIMIT,
-);
-const METADATA_RESOLUTION_CONCURRENCY = 2;
+interface ProviderHealthState {
+  consecutiveProviderErrors: number;
+  unavailableUntil: number;
+}
+
+const providerHealth = new Map<CitationProviderID, ProviderHealthState>();
+const RATE_LIMIT_COOLDOWN_MS = 60_000;
+const PROVIDER_ERROR_THRESHOLD = 3;
+const PROVIDER_ERROR_COOLDOWN_MS = 5 * 60_000;
 
 export function getCitationProvider(
   providerID: CitationProviderID,
@@ -128,24 +106,18 @@ export function getCitationProvider(
   return PROVIDERS[providerID];
 }
 
-export function getAllCitationProviders(): CitationProvider[] {
-  return AUTOMATIC_PROVIDER_ORDERS["work-lookup"].map(
-    (providerID) => PROVIDERS[providerID],
-  );
-}
-
-export function getAutomaticProviderLabel(): string {
-  return "Automatic — combine available providers";
-}
-
 export function resetCitationProviderSessionState(): void {
-  sessionUnavailableProviders.clear();
+  providerHealth.clear();
 }
 
-function automaticProviderIsConfigured(
-  providerID: CitationProviderID,
-): boolean {
-  return providerID !== "openalex" || Boolean(getOpenAlexAPIKey());
+function automaticProviderIsAvailable(providerID: CitationProviderID): boolean {
+  const state = providerHealth.get(providerID);
+  if (!state) return true;
+  if (state.unavailableUntil <= Date.now()) {
+    providerHealth.delete(providerID);
+    return true;
+  }
+  return false;
 }
 
 function providerSupportsOperation(
@@ -172,10 +144,11 @@ function providerSupportsOperation(
 }
 
 /**
- * Return the single central provider policy used by field updates,
- * relationship discovery, Similar, and incomplete-metadata resolution.
- * Concrete preferences never fall through to another provider. Automatic mode
- * excludes OpenAlex unless an API key is configured.
+ * Return the central provider policy used by field updates, relationship
+ * discovery, Similar, and incomplete-metadata resolution. Concrete
+ * preferences never fall through to another provider. Automatic mode returns
+ * the available capability order; the request layer and relationship caller
+ * apply the provider selection stored in Settings.
  */
 export function getProviderPlan(
   operation: ProviderOperation,
@@ -198,8 +171,7 @@ export function getProviderPlan(
 
   const providers = AUTOMATIC_PROVIDER_ORDERS[operation].filter(
     (providerID) =>
-      !sessionUnavailableProviders.has(providerID) &&
-      automaticProviderIsConfigured(providerID) &&
+      automaticProviderIsAvailable(providerID) &&
       providerSupportsOperation(PROVIDERS[providerID], operation, offset),
   );
   return {
@@ -211,719 +183,33 @@ export function getProviderPlan(
   };
 }
 
-export function providerResultAllowed(
-  provider: RelatedWorkMetadata["provider"],
-  preference: CitationProviderPreference,
-): boolean {
-  return (
-    preference === "auto" ||
-    provider === "manual" ||
-    provider === "zotero" ||
-    provider === preference
-  );
-}
-
-function chooseFailure(
-  failures: ProviderLookupFailure[],
-): ProviderLookupFailure {
-  const priorities: ProviderLookupFailure["status"][] = [
-    "ambiguous-match",
-    "rate-limited",
-    "network-error",
-    "provider-error",
-    "not-found",
-    "no-identifier",
-  ];
-  for (const status of priorities) {
-    const match = failures.find((failure) => failure.status === status);
-    if (match) return match;
-  }
-  return {
-    status: "not-found",
-    provider: "crossref",
-    message: "No citation provider returned a matching work.",
-  };
-}
-
-function shouldDisableForSession(failure: ProviderLookupFailure): boolean {
-  return (
-    failure.status === "rate-limited" || failure.status === "provider-error"
-  );
-}
-
-function recordProviderFailure(
+export function recordProviderFailure(
   preference: CitationProviderPreference,
   failure: ProviderLookupFailure,
 ): void {
-  if (preference === "auto" && shouldDisableForSession(failure)) {
-    sessionUnavailableProviders.add(failure.provider);
-  }
-}
-
-function richerReferences(
-  left: ProviderLookupSuccess,
-  right: ProviderLookupSuccess,
-): ProviderLookupSuccess {
-  const leftResolved =
-    maximumKnownCount([left.resolvedReferenceCount, left.references.length]) ??
-    0;
-  const rightResolved =
-    maximumKnownCount([
-      right.resolvedReferenceCount,
-      right.references.length,
-    ]) ?? 0;
-  const selected = rightResolved > leftResolved ? right : left;
-  const leftHasReportedCount = left.referenceCount !== null;
-  return {
-    ...left,
-    referenceCount: leftHasReportedCount
-      ? left.referenceCount
-      : right.referenceCount,
-    referenceCountProvider: leftHasReportedCount
-      ? left.referenceCountProvider
-      : right.referenceCountProvider,
-    resolvedReferenceCount:
-      maximumKnownCount([
-        selected.resolvedReferenceCount,
-        selected.references.length,
-      ]) ?? 0,
-    references: selected.references,
+  if (preference !== "auto") return;
+  const previous = providerHealth.get(failure.provider) ?? {
+    consecutiveProviderErrors: 0,
+    unavailableUntil: 0,
   };
-}
-
-function mergeEnrichment(
-  canonical: ProviderLookupSuccess,
-  enrichment: ProviderLookupSuccess,
-): ProviderLookupSuccess {
-  const references = richerReferences(canonical, enrichment);
-  const citationCount = richestCountAttribution([
-    {
-      count: canonical.citationCount,
-      provider: canonical.citationCountProvider,
-    },
-    {
-      count: enrichment.citationCount,
-      provider: enrichment.citationCountProvider,
-    },
-  ]);
-  const canonicalTitle = String(canonical.title ?? "").trim();
-  return {
-    ...references,
-    doi: canonical.doi ?? enrichment.doi,
-    title: canonicalTitle ? canonical.title : enrichment.title,
-    year: canonical.year ?? enrichment.year,
-    authors:
-      canonical.authors.length > 0 ? canonical.authors : enrichment.authors,
-    sourceTitle: canonical.sourceTitle ?? enrichment.sourceTitle,
-    abstract: canonical.abstract ?? enrichment.abstract,
-    citationCount: citationCount.count,
-    citationCountProvider:
-      citationCount.provider ?? canonical.citationCountProvider,
-    fwci: canonical.fwci ?? enrichment.fwci ?? null,
-    citationPercentile:
-      canonical.citationPercentile ?? enrichment.citationPercentile ?? null,
-    isTop1Percent: canonical.isTop1Percent ?? enrichment.isTop1Percent ?? null,
-    isTop10Percent:
-      canonical.isTop10Percent ?? enrichment.isTop10Percent ?? null,
-    citationCountsByYear: canonical.citationCountsByYear?.length
-      ? canonical.citationCountsByYear
-      : (enrichment.citationCountsByYear ?? []),
-    citationsLastYear:
-      canonical.citationsLastYear ?? enrichment.citationsLastYear ?? null,
-    citationVelocity:
-      canonical.citationVelocity ?? enrichment.citationVelocity ?? null,
-    citationAcceleration:
-      canonical.citationAcceleration ?? enrichment.citationAcceleration ?? null,
-    influentialCitationCount:
-      canonical.influentialCitationCount ??
-      enrichment.influentialCitationCount ??
-      null,
-    isRetracted: canonical.isRetracted ?? enrichment.isRetracted ?? null,
-    openAccessStatus:
-      canonical.openAccessStatus ?? enrichment.openAccessStatus ?? null,
-    isOpenAccess: canonical.isOpenAccess ?? enrichment.isOpenAccess ?? null,
-    publicationType:
-      canonical.publicationType ?? enrichment.publicationType ?? null,
-    sourceMetrics: canonical.sourceMetrics ?? enrichment.sourceMetrics ?? null,
-  };
-}
-
-async function providerLookup(
-  provider: CitationProvider,
-  identifiers: WorkIdentifiers,
-  allowTitleFallback: boolean,
-  forRelationships = false,
-): Promise<ProviderLookupResult> {
-  const lookup =
-    forRelationships && provider.lookupForRelations
-      ? provider.lookupForRelations
-      : provider.lookup;
-  if (provider.supports(identifiers)) return lookup(identifiers);
-  if (
-    allowTitleFallback &&
-    provider.searchExactTitle &&
-    identifiers.normalizedTitle
-  ) {
-    return provider.searchExactTitle(identifiers);
+  if (failure.status === "rate-limited") {
+    providerHealth.set(failure.provider, {
+      consecutiveProviderErrors: previous.consecutiveProviderErrors,
+      unavailableUntil: Date.now() + RATE_LIMIT_COOLDOWN_MS,
+    });
+    return;
   }
-  return {
-    status: "no-identifier",
-    provider: provider.id,
-    message: `${provider.label} cannot resolve the available identifiers.`,
-  };
+  if (failure.status !== "provider-error") return;
+  const consecutiveProviderErrors = previous.consecutiveProviderErrors + 1;
+  providerHealth.set(failure.provider, {
+    consecutiveProviderErrors,
+    unavailableUntil:
+      consecutiveProviderErrors >= PROVIDER_ERROR_THRESHOLD
+        ? Date.now() + PROVIDER_ERROR_COOLDOWN_MS
+        : previous.unavailableUntil,
+  });
 }
 
-async function enrichAutomaticResult(
-  canonical: ProviderLookupSuccess,
-  identifiers: WorkIdentifiers,
-  allowTitleFallback: boolean,
-): Promise<ProviderLookupSuccess> {
-  let result = canonical;
-  const plan = getProviderPlan("field-enrichment", "auto");
-  const enrichments = await Promise.all(
-    plan.providers
-      .filter((providerID) => providerID !== canonical.provider)
-      .map(async (providerID) => {
-        const provider = PROVIDERS[providerID];
-        try {
-          return {
-            provider,
-            candidate: await providerLookup(
-              provider,
-              identifiers,
-              allowTitleFallback,
-            ),
-          };
-        } catch (error) {
-          Zotero.debug(
-            "Citation Map: optional " +
-              `${provider.label} enrichment failed: ${String(error)}`,
-          );
-          return null;
-        }
-      }),
-  );
-  // Merge in provider-plan order so concurrent execution remains deterministic.
-  for (const enrichment of enrichments) {
-    if (!enrichment) continue;
-    if (enrichment.candidate.status === "success") {
-      result = mergeEnrichment(result, enrichment.candidate);
-    } else {
-      recordProviderFailure("auto", enrichment.candidate);
-    }
-  }
-  return result;
-}
-
-export async function lookupCitationMetrics(
-  preference: CitationProviderPreference,
-  identifiers: WorkIdentifiers,
-  allowTitleFallback = true,
-  includeOptionalEnrichment = false,
-): Promise<ProviderLookupResult> {
-  const plan = getProviderPlan("work-lookup", preference);
-  if (!plan.providers.length) {
-    const selected =
-      preference === "auto" ? "configured providers" : preference;
-    return {
-      status: "no-identifier",
-      provider: preference === "auto" ? "crossref" : preference,
-      message: `No ${selected} can perform this lookup.`,
-    };
-  }
-
-  const failures: ProviderLookupFailure[] = [];
-  for (const providerID of plan.providers) {
-    const provider = PROVIDERS[providerID];
-    let result: ProviderLookupResult;
-    try {
-      result = await providerLookup(provider, identifiers, allowTitleFallback);
-    } catch (error) {
-      result = {
-        status: "provider-error",
-        provider: providerID,
-        message: `${provider.label} lookup failed: ${String(error)}`,
-      };
-    }
-    if (result.status === "success") {
-      // A concrete provider means exactly that provider. Cross-provider
-      // completion is reserved for Automatic mode.
-      return preference === "auto" && includeOptionalEnrichment
-        ? enrichAutomaticResult(result, identifiers, allowTitleFallback)
-        : result;
-    }
-    failures.push(result);
-    recordProviderFailure(preference, result);
-    if (result.status === "ambiguous-match") return result;
-  }
-
-  return failures.length
-    ? chooseFailure(failures)
-    : {
-        status: "no-identifier",
-        provider: preference === "auto" ? "crossref" : preference,
-        message:
-          "No supported DOI, PMID, arXiv ID, ISBN, or exact normalized " +
-          "title was found.",
-      };
-}
-
-function relatedWorkNeedsMetadata(
-  work: RelatedWorkMetadata,
-  includeSecondaryMetrics = false,
-): boolean {
-  const basicMissing =
-    !String(work.title ?? "").trim() ||
-    work.year === null ||
-    work.authors.length === 0 ||
-    !String(work.sourceTitle ?? "").trim();
-  if (basicMissing || !includeSecondaryMetrics) return basicMissing;
-
-  // A ghost preview can use any graph metric, so its on-demand hydration walks
-  // the provider plan while useful secondary values remain absent. Normal list
-  // hydration keeps the cheaper basic-metadata behavior.
-  return (
-    work.citationCount == null ||
-    work.referenceCount == null ||
-    work.fwci == null ||
-    work.citationPercentile == null ||
-    work.citationsLastYear == null ||
-    work.citationVelocity == null ||
-    work.citationAcceleration == null ||
-    work.influentialCitationCount == null ||
-    work.publicationType == null ||
-    work.sourceMetrics == null ||
-    work.isOpenAccess == null ||
-    work.isRetracted == null ||
-    !work.references?.length
-  );
-}
-
-function identifiersForRelatedWork(work: RelatedWorkMetadata): WorkIdentifiers {
-  return {
-    doi: normalizeDOI(work.doi),
-    pmid: String(work.pmid ?? "").trim() || null,
-    arxiv: String(work.arxiv ?? "").trim() || null,
-    isbn: String(work.isbn ?? "").trim() || null,
-    title: String(work.title ?? "").trim(),
-    normalizedTitle: normalizeExactTitle(work.title),
-    year: work.year,
-    authors: work.authors,
-    sourceTitle: work.sourceTitle ?? null,
-  };
-}
-
-function relatedFromLookup(result: ProviderLookupSuccess): RelatedWorkMetadata {
-  return {
-    provider: result.provider,
-    providerWorkID: result.providerWorkID,
-    doi: result.doi,
-    title: result.title,
-    year: result.year,
-    authors: result.authors,
-    sourceTitle: result.sourceTitle,
-    abstract: result.abstract,
-    citationCount: result.citationCount,
-    referenceCount: result.referenceCount,
-    citationCountsByYear: result.citationCountsByYear ?? [],
-    references: result.references,
-    resolvedReferenceCount: result.resolvedReferenceCount,
-    fwci: result.fwci ?? null,
-    citationPercentile: result.citationPercentile ?? null,
-    isTop1Percent: result.isTop1Percent ?? null,
-    isTop10Percent: result.isTop10Percent ?? null,
-    citationsLastYear: result.citationsLastYear ?? null,
-    citationVelocity: result.citationVelocity ?? null,
-    citationAcceleration: result.citationAcceleration ?? null,
-    influentialCitationCount: result.influentialCitationCount ?? null,
-    publicationType: result.publicationType ?? null,
-    sourceMetrics: result.sourceMetrics ?? null,
-    isOpenAccess: result.isOpenAccess ?? null,
-    openAccessStatus: result.openAccessStatus ?? null,
-    isRetracted: result.isRetracted ?? null,
-    dataSources: [result.provider],
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-export function mergeRelatedWorkMetadata<T extends RelatedWorkMetadata>(
-  work: T,
-  metadata: RelatedWorkMetadata | null,
-): T {
-  if (!metadata) return work;
-  const metadataMatches = metadataIsNonContradictory(
-    identifiersForRelatedWork(work),
-    metadata,
-  );
-  if (!metadataMatches && (work.title || work.year || work.authors.length)) {
-    return work;
-  }
-  const sources = new Set<CitationProviderID>(work.dataSources ?? []);
-  if (work.provider !== "manual" && work.provider !== "zotero") {
-    sources.add(work.provider);
-  }
-  for (const source of metadata.dataSources ?? []) sources.add(source);
-  if (metadata.provider !== "manual" && metadata.provider !== "zotero") {
-    sources.add(metadata.provider);
-  }
-  const timestamps = [work.updatedAt, metadata.updatedAt]
-    .filter((value): value is string => Boolean(value))
-    .sort((left, right) => Date.parse(left) - Date.parse(right));
-  return {
-    ...work,
-    doi: work.doi ?? metadata.doi,
-    pmid: work.pmid ?? metadata.pmid,
-    arxiv: work.arxiv ?? metadata.arxiv,
-    isbn: work.isbn ?? metadata.isbn,
-    title: String(work.title ?? "").trim() ? work.title : metadata.title,
-    year: work.year ?? metadata.year,
-    authors: work.authors.length ? work.authors : metadata.authors,
-    sourceTitle: work.sourceTitle ?? metadata.sourceTitle,
-    abstract: work.abstract ?? metadata.abstract,
-    citationCount: maximumKnownCount([
-      work.citationCount,
-      metadata.citationCount,
-    ]),
-    referenceCount: maximumKnownCount([
-      work.referenceCount,
-      metadata.referenceCount,
-    ]),
-    citationCountsByYear: work.citationCountsByYear?.length
-      ? work.citationCountsByYear
-      : metadata.citationCountsByYear,
-    references:
-      (work.references?.length ?? 0) >= (metadata.references?.length ?? 0)
-        ? work.references
-        : metadata.references,
-    resolvedReferenceCount: maximumKnownCount([
-      work.resolvedReferenceCount,
-      metadata.resolvedReferenceCount,
-      work.references?.length,
-      metadata.references?.length,
-    ]),
-    fwci: work.fwci ?? metadata.fwci,
-    citationPercentile: work.citationPercentile ?? metadata.citationPercentile,
-    isTop1Percent: work.isTop1Percent ?? metadata.isTop1Percent,
-    isTop10Percent: work.isTop10Percent ?? metadata.isTop10Percent,
-    citationsLastYear: work.citationsLastYear ?? metadata.citationsLastYear,
-    citationVelocity: work.citationVelocity ?? metadata.citationVelocity,
-    citationAcceleration:
-      work.citationAcceleration ?? metadata.citationAcceleration,
-    influentialCitationCount:
-      work.influentialCitationCount ?? metadata.influentialCitationCount,
-    publicationType: work.publicationType ?? metadata.publicationType,
-    sourceMetrics: work.sourceMetrics ?? metadata.sourceMetrics,
-    referenceAgeMean: work.referenceAgeMean ?? metadata.referenceAgeMean,
-    referenceAgeSpread: work.referenceAgeSpread ?? metadata.referenceAgeSpread,
-    selfCitationEstimate:
-      work.selfCitationEstimate ?? metadata.selfCitationEstimate,
-    futureReferenceCount:
-      work.futureReferenceCount ?? metadata.futureReferenceCount,
-    metadataCompleteness:
-      work.metadataCompleteness ?? metadata.metadataCompleteness,
-    isOpenAccess: work.isOpenAccess ?? metadata.isOpenAccess,
-    openAccessStatus: work.openAccessStatus ?? metadata.openAccessStatus,
-    isRetracted: work.isRetracted ?? metadata.isRetracted,
-    zoteroItemKey: work.zoteroItemKey ?? metadata.zoteroItemKey,
-    inLibraryItemKey:
-      work.inLibraryItemKey ?? metadata.inLibraryItemKey ?? null,
-    dataSources: [...sources],
-    updatedAt: timestamps.at(-1) ?? new Date().toISOString(),
-  };
-}
-
-function semanticScholarIdentifier(work: RelatedWorkMetadata): string | null {
-  if (work.provider === "semantic-scholar" && work.providerWorkID?.trim()) {
-    return work.providerWorkID.trim();
-  }
-  const doi = normalizeDOI(work.doi);
-  if (doi) return `DOI:${doi}`;
-  if (work.pmid?.trim()) return `PMID:${work.pmid.trim()}`;
-  if (work.arxiv?.trim()) return `ARXIV:${work.arxiv.trim()}`;
-  if (work.isbn?.trim()) return `ISBN:${work.isbn.trim()}`;
-  return null;
-}
-
-function openAlexIdentifier(work: RelatedWorkMetadata): string | null {
-  if (work.provider === "openalex" && work.providerWorkID?.trim()) {
-    return work.providerWorkID.trim();
-  }
-  const doi = normalizeDOI(work.doi);
-  return doi ? `DOI:${doi}` : null;
-}
-
-async function runBounded<T>(
-  items: T[],
-  concurrency: number,
-  task: (item: T, index: number) => Promise<void>,
-): Promise<void> {
-  let nextIndex = 0;
-  async function worker(): Promise<void> {
-    while (nextIndex < items.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      await task(items[index], index);
-    }
-  }
-  await Promise.all(
-    Array.from(
-      { length: Math.min(Math.max(1, concurrency), items.length) },
-      () => worker(),
-    ),
-  );
-}
-
-async function applySemanticScholarBatch(
-  works: RelatedWorkMetadata[],
-): Promise<boolean[]> {
-  const resolved = works.map(() => false);
-  const candidates = works
-    .map((work, index) => ({
-      index,
-      identifier: semanticScholarIdentifier(work),
-    }))
-    .filter((candidate): candidate is { index: number; identifier: string } =>
-      Boolean(candidate.identifier),
-    );
-  for (
-    let start = 0;
-    start < candidates.length;
-    start += SEMANTIC_SCHOLAR_RESOLUTION_BATCH_SIZE
-  ) {
-    const batch = candidates.slice(
-      start,
-      start + SEMANTIC_SCHOLAR_RESOLUTION_BATCH_SIZE,
-    );
-    const metadata = await fetchSemanticScholarPapersBatch(
-      batch.map((candidate) => candidate.identifier),
-    );
-    for (const [batchIndex, candidate] of batch.entries()) {
-      const entry = metadata[batchIndex];
-      if (!entry) continue;
-      works[candidate.index] = mergeRelatedWorkMetadata(
-        works[candidate.index],
-        entry,
-      );
-      resolved[candidate.index] = true;
-    }
-  }
-  return resolved;
-}
-
-async function applyOpenAlexBatch(
-  works: RelatedWorkMetadata[],
-): Promise<boolean[]> {
-  const resolved = works.map(() => false);
-  const candidates = works
-    .map((work, index) => ({ index, identifier: openAlexIdentifier(work) }))
-    .filter((candidate): candidate is { index: number; identifier: string } =>
-      Boolean(candidate.identifier),
-    );
-  for (let start = 0; start < candidates.length; start += 100) {
-    const batch = candidates.slice(start, start + 100);
-    const metadata = await fetchOpenAlexWorksBatch(
-      batch.map((candidate) => candidate.identifier),
-    );
-    for (const [batchIndex, candidate] of batch.entries()) {
-      const entry = metadata[batchIndex];
-      if (!entry) continue;
-      works[candidate.index] = mergeRelatedWorkMetadata(
-        works[candidate.index],
-        entry,
-      );
-      resolved[candidate.index] = true;
-    }
-  }
-  return resolved;
-}
-
-export interface RelatedWorkResolutionOptions {
-  /** Maximum non-batch lookups across all providers. Batch lookups are not
-   * counted. Use zero for latency-sensitive relationship refreshes. */
-  individualLookupLimit?: number;
-}
-
-/** Resolve incomplete external-paper records through the same user-selected
- * provider policy used by updates and relationship discovery. Batch-capable
- * providers run first. Per-work fallbacks are capped so a large bibliography
- * cannot turn one refresh into hundreds or thousands of sequential requests. */
-export async function resolveRelatedWorksMetadata(
-  input: RelatedWorkMetadata[],
-  preference: CitationProviderPreference,
-  includeSecondaryMetrics = false,
-  options: RelatedWorkResolutionOptions = {},
-): Promise<RelatedWorkMetadata[]> {
-  const works = input.map((work) => ({ ...work, authors: [...work.authors] }));
-  const plan = getProviderPlan("metadata-resolution", preference);
-  let remainingIndividualLookups = Math.max(
-    0,
-    options.individualLookupLimit ?? Number.POSITIVE_INFINITY,
-  );
-
-  for (const providerID of plan.providers) {
-    const unresolvedIndexes = works
-      .map((work, index) => ({ work, index }))
-      .filter(({ work }) =>
-        relatedWorkNeedsMetadata(work, includeSecondaryMetrics),
-      )
-      .map(({ index }) => index);
-    if (!unresolvedIndexes.length) break;
-
-    const subset = unresolvedIndexes.map((index) => works[index]);
-    const batchEligible = subset.map((work) =>
-      providerID === "semantic-scholar"
-        ? Boolean(semanticScholarIdentifier(work))
-        : providerID === "openalex"
-          ? Boolean(openAlexIdentifier(work))
-          : false,
-    );
-    try {
-      if (providerID === "semantic-scholar") {
-        await applySemanticScholarBatch(subset);
-      } else if (providerID === "openalex") {
-        await applyOpenAlexBatch(subset);
-      }
-    } catch (error) {
-      Zotero.debug(
-        "Citation Map: " +
-          `${PROVIDERS[providerID].label} batch metadata resolution failed: ` +
-          String(error),
-      );
-    }
-    for (const [subsetIndex, originalIndex] of unresolvedIndexes.entries()) {
-      works[originalIndex] = subset[subsetIndex];
-    }
-
-    if (remainingIndividualLookups <= 0) continue;
-    const provider = PROVIDERS[providerID];
-    const genericCandidates = unresolvedIndexes
-      .filter(
-        (_, subsetIndex) =>
-          !batchEligible[subsetIndex] &&
-          relatedWorkNeedsMetadata(
-            works[unresolvedIndexes[subsetIndex]],
-            includeSecondaryMetrics,
-          ),
-      )
-      .slice(0, remainingIndividualLookups);
-    remainingIndividualLookups -= genericCandidates.length;
-    await runBounded(
-      genericCandidates,
-      METADATA_RESOLUTION_CONCURRENCY,
-      async (workIndex) => {
-        const identifiers = identifiersForRelatedWork(works[workIndex]);
-        try {
-          const result = await providerLookup(
-            provider,
-            identifiers,
-            true,
-            true,
-          );
-          if (result.status === "success") {
-            works[workIndex] = mergeRelatedWorkMetadata(
-              works[workIndex],
-              relatedFromLookup(result),
-            );
-          } else {
-            recordProviderFailure(preference, result);
-          }
-        } catch (error) {
-          Zotero.debug(
-            "Citation Map: " +
-              `${provider.label} metadata resolution failed: ${String(error)}`,
-          );
-        }
-      },
-    );
-  }
-
-  return works;
-}
-
-export interface SimilarWorkResult extends RelatedWorkMetadata {
-  recommendationScore: number;
-  recommendationSources: CitationProviderID[];
-}
-
-function recommendationIdentity(work: RelatedWorkMetadata): string | null {
-  const doi = normalizeDOI(work.doi);
-  if (doi) return `doi:${doi}`;
-  const title = normalizeExactTitle(work.title);
-  if (title) return `title:${title}:year:${work.year ?? "unknown"}`;
-  if (work.providerWorkID?.trim()) {
-    return `${work.provider}:${work.providerWorkID.trim().toLocaleLowerCase()}`;
-  }
-  return null;
-}
-
-/** Discover genuinely recommended/related papers through provider-native
- * recommendation systems. Citation-neighbour fallbacks remain outside this
- * function and are used only when the selected providers return no actual
- * recommendations. */
-export async function discoverSimilarWorks(
-  seeds: WorkIdentifiers[],
-  preference: CitationProviderPreference,
-  maximum = 100,
-): Promise<SimilarWorkResult[]> {
-  const plan = getProviderPlan("similar", preference);
-  const candidates = new Map<
-    string,
-    {
-      work: RelatedWorkMetadata;
-      score: number;
-      sources: Set<CitationProviderID>;
-    }
-  >();
-  const requested = Math.min(500, Math.max(1, maximum));
-
-  for (const providerID of plan.providers) {
-    let works: RelatedWorkMetadata[];
-    try {
-      if (providerID === "semantic-scholar") {
-        works = await fetchSemanticScholarRecommendations(seeds, requested);
-      } else if (providerID === "crossref") {
-        works = await fetchCrossrefRelatedWorks(seeds, requested);
-      } else if (providerID === "openalex") {
-        works = await fetchOpenAlexRelatedWorks(seeds, requested);
-      } else {
-        continue;
-      }
-    } catch (error) {
-      Zotero.debug(
-        `Citation Map: ${PROVIDERS[providerID].label} similar-paper discovery failed: ${String(error)}`,
-      );
-      continue;
-    }
-
-    for (const [rank, work] of works.entries()) {
-      const identity = recommendationIdentity(work);
-      if (!identity) continue;
-      const current = candidates.get(identity) ?? {
-        work,
-        score: 0,
-        sources: new Set<CitationProviderID>(),
-      };
-      current.work = mergeRelatedWorkMetadata(current.work, work);
-      // Reciprocal-rank fusion combines recommendation lists without assuming
-      // that provider-specific scores use compatible scales.
-      current.score += 1 / (60 + rank + 1);
-      current.sources.add(providerID);
-      candidates.set(identity, current);
-    }
-  }
-
-  return [...candidates.values()]
-    .map((candidate) => ({
-      ...candidate.work,
-      recommendationScore: candidate.score,
-      recommendationSources: [...candidate.sources],
-    }))
-    .sort(
-      (left, right) =>
-        right.recommendationScore - left.recommendationScore ||
-        (right.citationCount ?? -1) - (left.citationCount ?? -1) ||
-        (right.year ?? -1) - (left.year ?? -1) ||
-        String(left.title ?? "").localeCompare(String(right.title ?? "")),
-    )
-    .slice(0, requested);
+export function recordProviderSuccess(providerID: CitationProviderID): void {
+  providerHealth.delete(providerID);
 }

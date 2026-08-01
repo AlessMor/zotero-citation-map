@@ -7,19 +7,26 @@ import type {
   WorkIdentifiers,
 } from "../domain/citationTypes";
 import { fetchOpenAlexWorksBatch } from "../providers/openAlexProvider";
-import { lookupCitationMetrics } from "../providers/registry";
+import {
+  openAlexIdentifierForIdentifiers,
+  semanticScholarIdentifierForIdentifiers,
+} from "../providers/providerIdentifiers";
+import { lookupCitationMetrics } from "../providers/providerLookupService";
 import {
   fetchSemanticScholarPapersBatch,
   SEMANTIC_SCHOLAR_BATCH_LIMIT,
 } from "../providers/semanticScholarProvider";
 import { isCitationRequestCancellationRequested } from "../providers/http";
+import type { ProviderRequestOptions } from "../providers/types";
+import { cancellationRequested } from "./cancellationScope";
 import { getOpenAlexAPIKey, isProviderEnabled } from "./citationPreferences";
-import { normalizeDOI } from "./citationIdentifiers";
+import { normalizeDOI } from "../domain/workIdentity";
 import {
   LIBRARY_CORE_FALLBACK_PARALLELISM,
   providerExecutionPolicy,
 } from "./providerExecutionPolicy";
 import type { PlannedCitationItem } from "./updatePlanner";
+import { mapBounded } from "./backgroundTaskService";
 
 export type ProviderIdentityHints = Partial<Record<CitationProviderID, string>>;
 
@@ -45,41 +52,6 @@ function chunked<T>(items: T[], size: number): T[][] {
     result.push(items.slice(start, start + size));
   }
   return result;
-}
-
-async function runBounded<T>(
-  items: T[],
-  concurrency: number,
-  task: (item: T) => Promise<void>,
-): Promise<void> {
-  let nextIndex = 0;
-  async function worker(): Promise<void> {
-    while (nextIndex < items.length) {
-      const index = nextIndex;
-      nextIndex += 1;
-      await task(items[index]);
-    }
-  }
-  await Promise.all(
-    Array.from(
-      { length: Math.min(Math.max(1, concurrency), items.length) },
-      () => worker(),
-    ),
-  );
-}
-
-function semanticScholarIdentifier(
-  identifiers: WorkIdentifiers,
-): string | null {
-  if (identifiers.doi) return `DOI:${identifiers.doi}`;
-  if (identifiers.pmid) return `PMID:${identifiers.pmid}`;
-  if (identifiers.arxiv) return `ARXIV:${identifiers.arxiv}`;
-  if (identifiers.isbn) return `ISBN:${identifiers.isbn}`;
-  return null;
-}
-
-function openAlexIdentifier(identifiers: WorkIdentifiers): string | null {
-  return identifiers.doi ? `DOI:${identifiers.doi}` : null;
 }
 
 function matchedBy(
@@ -210,8 +182,8 @@ function batchCandidates(
   for (const index of unresolved) {
     const identifier =
       provider === "semantic-scholar"
-        ? semanticScholarIdentifier(pending[index].identifiers)
-        : openAlexIdentifier(pending[index].identifiers);
+        ? semanticScholarIdentifierForIdentifiers(pending[index].identifiers)
+        : openAlexIdentifierForIdentifiers(pending[index].identifiers);
     if (!identifier) continue;
     const indexes = grouped.get(identifier) ?? [];
     indexes.push(index);
@@ -227,6 +199,7 @@ async function resolveProviderBatches(
   lookups: Array<ProviderLookupResult | null>,
   hints: Map<string, ProviderIdentityHints>,
   onProgress?: (progress: LibraryCoreBatchProgress) => void,
+  requestOptions?: ProviderRequestOptions,
 ): Promise<void> {
   const candidates = batchCandidates(pending, unresolved, provider);
   if (!candidates.length) return;
@@ -237,43 +210,55 @@ async function resolveProviderBatches(
       : policy.batchSize;
   const batches = chunked(candidates, batchSize);
   let completedBatches = 0;
-  await runBounded(batches, policy.requestParallelism, async (batch) => {
-    if (isCitationRequestCancellationRequested()) return;
-    try {
-      const metadata =
-        provider === "semantic-scholar"
-          ? await fetchSemanticScholarPapersBatch(
-              batch.map((candidate) => candidate.identifier),
-            )
-          : await fetchOpenAlexWorksBatch(
-              batch.map((candidate) => candidate.identifier),
-            );
-      for (const [batchIndex, candidate] of batch.entries()) {
-        const entry = metadata[batchIndex];
-        if (!entry) continue;
-        for (const index of candidate.indexes) {
-          lookups[index] = successFromMetadata(
-            entry,
-            pending[index].identifiers,
-          );
-          unresolved.delete(index);
-          addIdentityHint(hints, pending[index].itemKey, entry);
-        }
+  await mapBounded(
+    batches,
+    policy.requestParallelism,
+    async (batch) => {
+      if (
+        isCitationRequestCancellationRequested() ||
+        cancellationRequested(requestOptions?.signal)
+      ) {
+        return;
       }
-    } catch (error) {
-      Zotero.debug(
-        `Citation Map: ${provider} core batch failed; unresolved works will use fallback lookup: ${String(error)}`,
-      );
-    }
-    completedBatches += 1;
-    onProgress?.({
-      completed: pending.length - unresolved.size,
-      total: pending.length,
-      message:
-        `${provider === "semantic-scholar" ? "Semantic Scholar" : "OpenAlex"} ` +
-        `batch ${completedBatches}/${batches.length}`,
-    });
-  });
+      try {
+        const metadata =
+          provider === "semantic-scholar"
+            ? await fetchSemanticScholarPapersBatch(
+                batch.map((candidate) => candidate.identifier),
+                requestOptions,
+              )
+            : await fetchOpenAlexWorksBatch(
+                batch.map((candidate) => candidate.identifier),
+                requestOptions,
+              );
+        for (const [batchIndex, candidate] of batch.entries()) {
+          const entry = metadata[batchIndex];
+          if (!entry) continue;
+          for (const index of candidate.indexes) {
+            lookups[index] = successFromMetadata(
+              entry,
+              pending[index].identifiers,
+            );
+            unresolved.delete(index);
+            addIdentityHint(hints, pending[index].itemKey, entry);
+          }
+        }
+      } catch (error) {
+        Zotero.debug(
+          `Citation Map: ${provider} core batch failed; unresolved works will use fallback lookup: ${String(error)}`,
+        );
+      }
+      completedBatches += 1;
+      onProgress?.({
+        completed: pending.length - unresolved.size,
+        total: pending.length,
+        message:
+          `${provider === "semantic-scholar" ? "Semantic Scholar" : "OpenAlex"} ` +
+          `batch ${completedBatches}/${batches.length}`,
+      });
+    },
+    { yieldAfterEach: true },
+  );
 }
 
 /**
@@ -286,6 +271,7 @@ export async function resolveLibraryCoreLookups(
   preference: CitationProviderPreference,
   allowTitleFallback: boolean,
   onProgress?: (progress: LibraryCoreBatchProgress) => void,
+  requestOptions?: ProviderRequestOptions,
 ): Promise<LibraryCoreBatchResult> {
   const lookups: Array<ProviderLookupResult | null> = pending.map(() => null);
   const unresolved = new Set(pending.map((_, index) => index));
@@ -330,7 +316,13 @@ export async function resolveLibraryCoreLookups(
   }
 
   for (const provider of batchProviders) {
-    if (!unresolved.size || isCitationRequestCancellationRequested()) break;
+    if (
+      !unresolved.size ||
+      isCitationRequestCancellationRequested() ||
+      cancellationRequested(requestOptions?.signal)
+    ) {
+      break;
+    }
     await resolveProviderBatches(
       provider,
       pending,
@@ -338,6 +330,7 @@ export async function resolveLibraryCoreLookups(
       lookups,
       providerIdentitiesByItemKey,
       onProgress,
+      requestOptions,
     );
   }
 
@@ -353,17 +346,23 @@ export async function resolveLibraryCoreLookups(
     indexes.push(index);
     fallbackGroups.set(key, indexes);
   }
-  await runBounded(
+  await mapBounded(
     [...fallbackGroups.values()],
     LIBRARY_CORE_FALLBACK_PARALLELISM,
     async (indexes) => {
-      if (isCitationRequestCancellationRequested()) return;
+      if (
+        isCitationRequestCancellationRequested() ||
+        cancellationRequested(requestOptions?.signal)
+      ) {
+        return;
+      }
       const representative = indexes[0];
       const result = await lookupCitationMetrics(
         preference,
         pending[representative].identifiers,
         allowTitleFallback,
         false,
+        requestOptions,
       );
       for (const index of indexes) {
         lookups[index] = result;
@@ -382,6 +381,7 @@ export async function resolveLibraryCoreLookups(
         message: `Resolving unmatched papers · ${pending.length - unresolved.size}/${pending.length}`,
       });
     },
+    { yieldAfterEach: true },
   );
 
   return {

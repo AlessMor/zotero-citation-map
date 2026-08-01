@@ -137,11 +137,6 @@ function build(libraryID: number): Map<string, CitationDerivedAnalytics> {
     const metrics = network.get(record.itemKey) ?? {
       incoming: 0,
       outgoing: 0,
-      pageRank: 0,
-      betweennessCentrality: 0,
-      eigenvectorCentrality: 0,
-      componentSize: 1,
-      citationChainDepth: 0,
       isIsolated: true,
     };
     const age = referenceAgeStats(record);

@@ -1,18 +1,25 @@
 import type {
-  CitationYearCount,
   ProviderLookupResult,
   RelatedWorkMetadata,
   SourceMetrics,
   WorkIdentifiers,
 } from "../domain/citationTypes";
 import {
-  metadataIsNonContradictory,
+  matchWorkIdentifiers,
   normalizeDOI,
   normalizeExactTitle,
-} from "../services/citationIdentifiers";
+} from "../domain/workIdentity";
 import { getOpenAlexAPIKey } from "../services/citationPreferences";
 import { requestJSON, type HTTPResult } from "./http";
-import type { CitationProvider } from "./types";
+import {
+  openAlexWorkMetadata as toRelated,
+  openAlexYearlyMetrics as yearlyMetrics,
+  type OpenAlexList,
+  type OpenAlexSource,
+  type OpenAlexWork,
+} from "./openAlexMapper";
+import { shortOpenAlexID as shortID } from "./providerIdentifiers";
+import type { CitationProvider, ProviderRequestOptions } from "./types";
 import { failureStatusFromHTTP, numberOrNull, stringOrNull } from "./types";
 
 const OPENALEX_BASE_URL = "https://api.openalex.org";
@@ -21,53 +28,6 @@ const BACKGROUND_REFERENCE_LIMIT = 200;
 const ON_DEMAND_REFERENCE_LIMIT = 100;
 const sourceMetricsCache = new Map<string, SourceMetrics | null>();
 const workByIDCache = new Map<string, Promise<OpenAlexWork | null>>();
-
-interface OpenAlexAuthor {
-  author?: { id?: string; display_name?: string; orcid?: string | null };
-}
-interface OpenAlexSource {
-  id?: string;
-  display_name?: string;
-  summary_stats?: {
-    "2yr_mean_citedness"?: number;
-    h_index?: number;
-    i10_index?: number;
-  };
-}
-interface OpenAlexWork {
-  id?: string;
-  doi?: string | null;
-  display_name?: string;
-  title?: string;
-  publication_year?: number;
-  cited_by_count?: number;
-  referenced_works_count?: number;
-  referenced_works?: string[];
-  related_works?: string[];
-  relevance_score?: number;
-  authorships?: OpenAlexAuthor[];
-  counts_by_year?: Array<{ year?: number; cited_by_count?: number }>;
-  fwci?: number | null;
-  citation_normalized_percentile?: {
-    value?: number;
-    is_in_top_1_percent?: boolean;
-    is_in_top_10_percent?: boolean;
-  };
-  is_retracted?: boolean;
-  open_access?: { is_oa?: boolean; oa_status?: string };
-  type?: string;
-  abstract_inverted_index?: Record<string, number[]> | null;
-  primary_location?: { source?: OpenAlexSource | null };
-}
-interface OpenAlexList {
-  results?: OpenAlexWork[];
-}
-
-function shortID(value: unknown): string | null {
-  const text = String(value ?? "").trim();
-  if (!text) return null;
-  return text.replace(/^https:\/\/openalex\.org\//i, "");
-}
 
 function openAlexURL(
   path: string,
@@ -86,6 +46,7 @@ function openAlexURL(
 async function requestOpenAlex<T>(
   path: string,
   parameters: Record<string, string | number> = {},
+  options?: ProviderRequestOptions,
 ): Promise<HTTPResult<T>> {
   if (!getOpenAlexAPIKey()) {
     return {
@@ -96,7 +57,9 @@ async function requestOpenAlex<T>(
         "OpenAlex API key is not configured. Add it in Settings → Citation Map.",
     };
   }
-  return requestJSON<T>("openalex", openAlexURL(path, parameters));
+  return requestJSON<T>("openalex", openAlexURL(path, parameters), {
+    signal: options?.signal,
+  });
 }
 
 function failureMessage<T>(response: HTTPResult<T>, fallback: string): string {
@@ -106,78 +69,10 @@ function failureMessage<T>(response: HTTPResult<T>, fallback: string): string {
   return response.message || fallback;
 }
 
-function abstractFromIndex(
-  index: Record<string, number[]> | null | undefined,
-): string | null {
-  if (!index) return null;
-  const words: Array<[number, string]> = [];
-  for (const [word, positions] of Object.entries(index)) {
-    for (const position of positions) words.push([position, word]);
-  }
-  words.sort((a, b) => a[0] - b[0]);
-  return words.map((entry) => entry[1]).join(" ") || null;
-}
-
-function toRelated(work: OpenAlexWork): RelatedWorkMetadata | null {
-  const id = shortID(work.id);
-  const title = stringOrNull(work.display_name ?? work.title);
-  if (!id || !title) return null;
-  const counts: CitationYearCount[] = (work.counts_by_year ?? [])
-    .map((entry) => ({
-      year: Number(entry.year),
-      count: Number(entry.cited_by_count),
-    }))
-    .filter(
-      (entry) => Number.isFinite(entry.year) && Number.isFinite(entry.count),
-    );
-  const trend = yearlyMetrics(counts);
-  return {
-    provider: "openalex",
-    providerWorkID: id,
-    doi: normalizeDOI(work.doi),
-    title,
-    year: numberOrNull(work.publication_year),
-    authors: (work.authorships ?? [])
-      .map((entry) => String(entry.author?.display_name ?? "").trim())
-      .filter(Boolean),
-    authorIDs: [
-      ...(work.authorships ?? []).map((entry) =>
-        String(entry.author?.orcid ?? "").trim(),
-      ),
-      ...(work.authorships ?? []).map((entry) =>
-        String(entry.author?.id ?? "")
-          .replace(/^https:\/\/openalex\.org\//i, "")
-          .trim(),
-      ),
-    ].filter(Boolean),
-    sourceTitle: stringOrNull(work.primary_location?.source?.display_name),
-    abstract: abstractFromIndex(work.abstract_inverted_index),
-    citationCount: numberOrNull(work.cited_by_count),
-    referenceCount: numberOrNull(work.referenced_works_count),
-    citationCountsByYear: counts,
-    fwci: numberOrNull(work.fwci),
-    citationPercentile: numberOrNull(
-      work.citation_normalized_percentile?.value,
-    ),
-    isTop1Percent:
-      work.citation_normalized_percentile?.is_in_top_1_percent ?? null,
-    isTop10Percent:
-      work.citation_normalized_percentile?.is_in_top_10_percent ?? null,
-    citationsLastYear: trend.lastYear,
-    citationVelocity: trend.velocity,
-    citationAcceleration: trend.acceleration,
-    publicationType: stringOrNull(work.type),
-    isOpenAccess:
-      typeof work.open_access?.is_oa === "boolean"
-        ? work.open_access.is_oa
-        : null,
-    openAccessStatus: stringOrNull(work.open_access?.oa_status),
-    isRetracted:
-      typeof work.is_retracted === "boolean" ? work.is_retracted : null,
-  };
-}
-
-async function fetchWorkByID(id: string): Promise<OpenAlexWork | null> {
+async function fetchWorkByID(
+  id: string,
+  options?: ProviderRequestOptions,
+): Promise<OpenAlexWork | null> {
   const normalizedID = shortID(id);
   if (!normalizedID) return null;
   const key = normalizedID.toLocaleUpperCase();
@@ -185,8 +80,10 @@ async function fetchWorkByID(id: string): Promise<OpenAlexWork | null> {
   if (existing) return existing;
   const request = requestOpenAlex<OpenAlexWork>(
     `/works/${encodeURIComponent(normalizedID)}`,
+    {},
+    options,
   ).then((response) => (response.ok && response.data ? response.data : null));
-  workByIDCache.set(key, request);
+  if (!options?.signal) workByIDCache.set(key, request);
   return request;
 }
 
@@ -217,6 +114,7 @@ function openAlexBatchIdentifier(
  */
 export async function fetchOpenAlexWorksBatch(
   identifiers: string[],
+  options?: ProviderRequestOptions,
 ): Promise<Array<RelatedWorkMetadata | null>> {
   if (!identifiers.length) return [];
 
@@ -237,10 +135,14 @@ export async function fetchOpenAlexWorksBatch(
     for (let start = 0; start < unique.length; start += OPENALEX_MAX_PER_PAGE) {
       const batch = unique.slice(start, start + OPENALEX_MAX_PER_PAGE);
       const filterName = kind === "openalex" ? "ids.openalex" : "doi";
-      const response = await requestOpenAlex<OpenAlexList>("/works", {
-        filter: `${filterName}:${batch.join("|")}`,
-        per_page: batch.length,
-      });
+      const response = await requestOpenAlex<OpenAlexList>(
+        "/works",
+        {
+          filter: `${filterName}:${batch.join("|")}`,
+          per_page: batch.length,
+        },
+        options,
+      );
       if (!response.ok || !response.data) {
         throw new Error(
           failureMessage(response, "OpenAlex batch metadata lookup failed."),
@@ -279,27 +181,9 @@ function resolveReferences(work: OpenAlexWork): RelatedWorkMetadata[] {
     }));
 }
 
-function yearlyMetrics(counts: CitationYearCount[]): {
-  lastYear: number | null;
-  velocity: number | null;
-  acceleration: number | null;
-} {
-  const current = new Date().getFullYear();
-  const byYear = new Map(counts.map((entry) => [entry.year, entry.count]));
-  const previous = byYear.get(current - 1) ?? 0;
-  const before = byYear.get(current - 2) ?? 0;
-  const three = [current - 3, current - 2, current - 1].map(
-    (year) => byYear.get(year) ?? 0,
-  );
-  return {
-    lastYear: previous,
-    velocity: three.reduce((sum, count) => sum + count, 0) / 3,
-    acceleration: previous - before,
-  };
-}
-
 async function sourceMetrics(
   source: OpenAlexSource | null | undefined,
+  options?: ProviderRequestOptions,
 ): Promise<SourceMetrics | null> {
   const id = shortID(source?.id);
   if (!id) return null;
@@ -308,6 +192,8 @@ async function sourceMetrics(
   if (!resolved?.summary_stats) {
     const response = await requestOpenAlex<OpenAlexSource>(
       `/sources/${encodeURIComponent(id)}`,
+      {},
+      options,
     );
     resolved = response.ok ? response.data : resolved;
   }
@@ -334,6 +220,7 @@ async function success(
   work: OpenAlexWork,
   matchedBy: "doi" | "pmid" | "arxiv" | "isbn" | "title",
   confidence: number,
+  options?: ProviderRequestOptions,
 ): Promise<ProviderLookupResult> {
   const related = toRelated(work);
   if (!related) {
@@ -363,6 +250,7 @@ async function success(
     doi: related.doi,
     title: related.title,
     year: related.year,
+    publicationDate: related.publicationDate ?? null,
     authors: related.authors,
     sourceTitle: related.sourceTitle ?? null,
     abstract: related.abstract ?? null,
@@ -387,7 +275,7 @@ async function success(
     openAccessStatus: related.openAccessStatus ?? null,
     isOpenAccess: related.isOpenAccess ?? null,
     publicationType: stringOrNull(work.type),
-    sourceMetrics: await sourceMetrics(work.primary_location?.source),
+    sourceMetrics: await sourceMetrics(work.primary_location?.source, options),
   };
 }
 
@@ -409,6 +297,7 @@ async function listByFilter(
   filter: string,
   maximum: number,
   offset = 0,
+  options?: ProviderRequestOptions,
 ): Promise<RelatedWorkMetadata[]> {
   const requested = Math.max(0, Math.floor(maximum));
   let currentOffset = Math.max(0, Math.floor(offset));
@@ -417,11 +306,15 @@ async function listByFilter(
   while (works.length < requested) {
     const page = Math.floor(currentOffset / OPENALEX_MAX_PER_PAGE) + 1;
     const withinPage = currentOffset % OPENALEX_MAX_PER_PAGE;
-    const response = await requestOpenAlex<OpenAlexList>("/works", {
-      filter,
-      per_page: OPENALEX_MAX_PER_PAGE,
-      page,
-    });
+    const response = await requestOpenAlex<OpenAlexList>(
+      "/works",
+      {
+        filter,
+        per_page: OPENALEX_MAX_PER_PAGE,
+        page,
+      },
+      options,
+    );
     if (!response.ok || !response.data) break;
 
     const pageResults = response.data.results ?? [];
@@ -471,21 +364,28 @@ function titleSimilarity(
 
 async function resolveOpenAlexWork(
   identifiers: WorkIdentifiers,
+  options?: ProviderRequestOptions,
 ): Promise<OpenAlexWork | null> {
   const direct = workURL(identifiers);
   if (direct) {
     const response = await requestOpenAlex<OpenAlexWork>(
       `/works/${encodeURIComponent(direct.id)}`,
+      {},
+      options,
     );
     if (response.ok && response.data) return response.data;
   }
 
   const title = String(identifiers.title ?? "").trim();
   if (!title) return null;
-  const response = await requestOpenAlex<OpenAlexList>("/works", {
-    search: title,
-    per_page: 20,
-  });
+  const response = await requestOpenAlex<OpenAlexList>(
+    "/works",
+    {
+      search: title,
+      per_page: 20,
+    },
+    options,
+  );
   if (!response.ok || !response.data) return null;
   const candidates = response.data.results ?? [];
   const exact = candidates.filter(
@@ -493,14 +393,13 @@ async function resolveOpenAlexWork(
       normalizeExactTitle(work.display_name ?? work.title) ===
       identifiers.normalizedTitle,
   );
-  const compatible = exact.filter((work) =>
-    metadataIsNonContradictory(identifiers, {
-      year: numberOrNull(work.publication_year),
-      authors: (work.authorships ?? []).map((entry) =>
-        String(entry.author?.display_name ?? ""),
-      ),
-    }),
-  );
+  const compatible = exact.filter((work) => {
+    const candidate = toRelated(work);
+    return Boolean(
+      candidate &&
+      matchWorkIdentifiers(identifiers, candidate).decision === "same-work",
+    );
+  });
   if (compatible.length === 1) return compatible[0];
 
   const closest = [...candidates].sort(
@@ -515,14 +414,11 @@ async function resolveOpenAlexWork(
     closest.display_name ?? closest.title,
   );
   if (similarity < 0.72) return null;
+  const closestWork = toRelated(closest);
   if (
     (identifiers.year !== null || identifiers.authors.length > 0) &&
-    !metadataIsNonContradictory(identifiers, {
-      year: numberOrNull(closest.publication_year),
-      authors: (closest.authorships ?? []).map((entry) =>
-        String(entry.author?.display_name ?? ""),
-      ),
-    })
+    (!closestWork ||
+      matchWorkIdentifiers(identifiers, closestWork).decision !== "same-work")
   ) {
     return null;
   }
@@ -534,10 +430,11 @@ async function resolveOpenAlexWork(
 export async function fetchOpenAlexRelatedWorks(
   seeds: WorkIdentifiers[],
   maximum = 100,
+  options?: ProviderRequestOptions,
 ): Promise<RelatedWorkMetadata[]> {
   const relatedIDs: string[] = [];
   for (const seed of seeds.slice(0, 25)) {
-    const work = await resolveOpenAlexWork(seed);
+    const work = await resolveOpenAlexWork(seed, options);
     for (const value of work?.related_works ?? []) {
       const id = shortID(value);
       if (id && !relatedIDs.includes(id)) relatedIDs.push(id);
@@ -548,6 +445,7 @@ export async function fetchOpenAlexRelatedWorks(
   if (!relatedIDs.length) return [];
   const metadata = await fetchOpenAlexWorksBatch(
     relatedIDs.slice(0, Math.max(1, maximum)),
+    options,
   );
   return metadata.filter((work): work is RelatedWorkMetadata =>
     Boolean(work?.title),
@@ -580,7 +478,7 @@ export const openAlexProvider: CitationProvider = {
     sourceMetrics: true,
   },
   supports: (identifiers) => Boolean(workURL(identifiers)),
-  lookup: async (identifiers) => {
+  lookup: async (identifiers, options) => {
     const target = workURL(identifiers);
     if (!target)
       return {
@@ -590,6 +488,8 @@ export const openAlexProvider: CitationProvider = {
       };
     const response = await requestOpenAlex<OpenAlexWork>(
       `/works/${encodeURIComponent(target.id)}`,
+      {},
+      options,
     );
     if (!response.ok || !response.data) {
       return {
@@ -602,13 +502,18 @@ export const openAlexProvider: CitationProvider = {
       response.data,
       target.kind,
       target.kind === "doi" ? 1 : 0.98,
+      options,
     );
   },
-  searchExactTitle: async (identifiers) => {
-    const response = await requestOpenAlex<OpenAlexList>("/works", {
-      search: identifiers.title,
-      per_page: 20,
-    });
+  searchExactTitle: async (identifiers, options) => {
+    const response = await requestOpenAlex<OpenAlexList>(
+      "/works",
+      {
+        search: identifiers.title,
+        per_page: 20,
+      },
+      options,
+    );
     if (!response.ok || !response.data)
       return {
         status: failureStatusFromHTTP(response.status),
@@ -620,15 +525,16 @@ export const openAlexProvider: CitationProvider = {
         normalizeExactTitle(work.display_name ?? work.title) ===
         identifiers.normalizedTitle,
     );
-    const compatible = exact.filter((work) =>
-      metadataIsNonContradictory(identifiers, {
-        year: numberOrNull(work.publication_year),
-        authors: (work.authorships ?? []).map((entry) =>
-          String(entry.author?.display_name ?? ""),
-        ),
-      }),
-    );
-    if (compatible.length === 1) return success(compatible[0], "title", 0.92);
+    const compatible = exact.filter((work) => {
+      const candidate = toRelated(work);
+      return Boolean(
+        candidate &&
+        matchWorkIdentifiers(identifiers, candidate).decision === "same-work",
+      );
+    });
+    if (compatible.length === 1) {
+      return success(compatible[0], "title", 0.92, options);
+    }
     const candidates = exact
       .map(toRelated)
       .filter((work): work is RelatedWorkMetadata => Boolean(work));
@@ -646,12 +552,14 @@ export const openAlexProvider: CitationProvider = {
           message: "OpenAlex did not return a unique exact-title match.",
         };
   },
-  fetchCitingWorks: async (id, maximum, offset) => {
+  fetchCitingWorks: async (id, maximum, offset, options) => {
     const workID = shortID(id);
-    return workID ? listByFilter(`cites:${workID}`, maximum, offset) : [];
+    return workID
+      ? listByFilter(`cites:${workID}`, maximum, offset, options)
+      : [];
   },
-  fetchReferencedWorks: async (id, maximum, offset = 0) => {
-    const work = await fetchWorkByID(id);
+  fetchReferencedWorks: async (id, maximum, offset = 0, options) => {
+    const work = await fetchWorkByID(id, options);
     if (!work) return [];
     return (work.referenced_works ?? [])
       .slice(offset, offset + Math.min(ON_DEMAND_REFERENCE_LIMIT, maximum))
@@ -666,5 +574,5 @@ export const openAlexProvider: CitationProvider = {
         authors: [],
       }));
   },
-  fetchSourceMetrics: async (id) => sourceMetrics({ id }),
+  fetchSourceMetrics: async (id, options) => sourceMetrics({ id }, options),
 };

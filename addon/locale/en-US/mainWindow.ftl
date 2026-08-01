@@ -41,4 +41,34 @@ provider-inspire-command =
     .label = { $marker }INSPIRE-HEP
 
 show-items-command =
-    .label = Show in Citation Map
+    .label = Open in Citation Map
+
+open-focus-view-command =
+    .label = Open in Focus View
+
+refresh-command =
+    .label = Refresh
+
+show-items-new-tab-command =
+    .label = Open in New Citation Map
+
+open-focus-view-new-tab-command =
+    .label = Open Focus View in New Tab
+
+open-in-submenu =
+    .label = Open in
+
+new-citation-map-view-command =
+    .label = New Citation Map View
+
+new-focus-view-command =
+    .label = New Focus View
+
+open-existing-view-command =
+    .label = { $name }
+
+rename-view-command =
+    .label = Rename View…
+
+refresh-library-command =
+    .label = Refresh Library

@@ -1,9 +1,5 @@
 import { config } from "../../package.json";
-import {
-  cancelPendingCitationRequests,
-  isCitationRequestCancellationRequested,
-  resetCitationRequestCancellation,
-} from "../providers/http";
+import { uniquePositiveIntegers } from "../domain/valueNormalization";
 import { clearOpenAlexProviderCache } from "../providers/openAlexProvider";
 import { resetCitationProviderSessionState } from "../providers/registry";
 import {
@@ -11,12 +7,15 @@ import {
   getCitationCacheStatus,
 } from "./citationMetricsStore";
 import {
-  getEnabledProviders,
   getShowMetricTooltipsEnabled,
   getUpdateLibraryIDs,
+  normalizeCitationPreferences,
   setUpdateLibraryIDs,
 } from "./citationPreferences";
-import { getAvailableCitationLibraries } from "./citationLibraryService";
+import {
+  getAvailableCitationLibraries,
+  getSelectedCitationUpdateLibraryIDs,
+} from "./citationLibraryService";
 import { clearExternalWorkCache } from "./externalWorkCacheService";
 import {
   installCitationColumnTooltips,
@@ -24,6 +23,7 @@ import {
 } from "./itemTreeColumnService";
 import { refreshCitationItemPanes } from "./itemPaneService";
 import {
+  cancelActiveCitationUpdate,
   updateCitationDataForItems,
   waitForCitationUpdates,
 } from "./citationUpdateService";
@@ -34,18 +34,6 @@ const observerIDs: Array<string | symbol> = [];
 let refreshAllRequestedGeneration = 0;
 let refreshAllHandledGeneration = 0;
 let refreshAllLoop: Promise<void> | null = null;
-
-function positiveInteger(value: unknown): number | null {
-  const number = Number(value);
-  return Number.isInteger(number) && number > 0 ? number : null;
-}
-
-function selectedUpdateLibraryIDs(): number[] {
-  const available = new Set(
-    getAvailableCitationLibraries().map((library) => library.libraryID),
-  );
-  return getUpdateLibraryIDs().filter((libraryID) => available.has(libraryID));
-}
 
 async function regularItemsInLibrary(
   libraryID: number,
@@ -88,13 +76,9 @@ async function runRefreshAllLoop(): Promise<void> {
       continue;
     }
 
-    resetCitationRequestCancellation();
     refreshAllHandledGeneration = requestedGeneration;
-    for (const libraryID of selectedUpdateLibraryIDs()) {
-      if (
-        requestedGeneration !== refreshAllRequestedGeneration ||
-        isCitationRequestCancellationRequested()
-      ) {
+    for (const libraryID of getSelectedCitationUpdateLibraryIDs()) {
+      if (requestedGeneration !== refreshAllRequestedGeneration) {
         break;
       }
       const items = await regularItemsInLibrary(libraryID);
@@ -102,7 +86,6 @@ async function runRefreshAllLoop(): Promise<void> {
       await updateCitationDataForItems(items, {
         force: true,
         silent: false,
-        includeRelationships: false,
       });
     }
   }
@@ -126,7 +109,7 @@ function restartWholeLibraryUpdate(): void {
   refreshAllRequestedGeneration += 1;
   // A repeated click replaces the active request rather than adding another
   // serialized whole-library job behind it.
-  cancelPendingCitationRequests();
+  cancelActiveCitationUpdate();
   ensureRefreshAllLoop();
 }
 
@@ -155,24 +138,13 @@ function syncMetricTooltipPreference(): void {
 
 function normalizedLibraryIDs(value: unknown): number[] {
   if (!Array.isArray(value)) return [];
-  return [
-    ...new Set(
-      value
-        .map(positiveInteger)
-        .filter((libraryID): libraryID is number => libraryID !== null),
-    ),
-  ];
+  return uniquePositiveIntegers(value);
 }
 
 function exposePreferenceActions(): void {
-  Object.assign(addon.api, {
+  addon.setAPI({
     refreshAll: restartWholeLibraryUpdate,
     clearAllCachedData: (): void => {
-      void runPreferenceAction("clearing all cached data", clearAllCachedData);
-    },
-    // Retain the old API name for compatibility with an already-open
-    // preferences pane during a development reload.
-    clearCache: (): void => {
       void runPreferenceAction("clearing all cached data", clearAllCachedData);
     },
     providerSelectionChanged: (): void => refreshProviderConfiguration(),
@@ -185,21 +157,13 @@ function exposePreferenceActions(): void {
     setUpdateLibraryIDs: (libraryIDs: unknown): void => {
       setUpdateLibraryIDs(normalizedLibraryIDs(libraryIDs));
     },
-    // Compatibility aliases for a preference pane left open during reload.
-    startupLibraries: (): ReturnType<typeof getAvailableCitationLibraries> =>
-      getAvailableCitationLibraries(),
-    startupLibraryIDs: (): number[] => getUpdateLibraryIDs(),
-    setStartupLibraryIDs: (libraryIDs: unknown): void => {
-      setUpdateLibraryIDs(normalizedLibraryIDs(libraryIDs));
-    },
   });
 }
 
 export async function registerCitationMapPreferencePane(): Promise<void> {
   if (registered) return;
   exposePreferenceActions();
-  getEnabledProviders();
-  getUpdateLibraryIDs();
+  normalizeCitationPreferences();
   await Zotero.PreferencePanes.register({
     pluginID: config.addonID,
     id: `${config.addonRef}-preferences`,

@@ -1,20 +1,24 @@
 import type {
   CitationGraphNode,
+  GhostPreview,
   GraphAxisMetric,
   GraphScaleType,
-  MetricID,
 } from "../domain/graphTypes";
+import { publicationYearOrNull } from "../domain/valueNormalization";
 import {
-  CitationGraphRenderer,
-  type GhostPreview,
-} from "./citationGraphRenderer";
-import {
-  ensureExternalWorkMetrics,
   getExternalWorkMetadata,
   getExternalWorkMetricValue,
   getExternalWorkNodeLabel,
 } from "./externalWorkMetricRegistry";
-import { metricValue } from "./metricRegistry";
+import {
+  categoricalColor,
+  clamp,
+  hashString,
+  metricExtent,
+  metricNumber,
+  numericColor,
+  scaleValue,
+} from "./graphMetricScale";
 
 interface Position {
   x: number;
@@ -28,7 +32,7 @@ interface Rectangle {
   bottom: number;
 }
 
-interface RendererInternals {
+export interface RendererSceneContext {
   canvas: HTMLCanvasElement;
   context: CanvasRenderingContext2D;
   layout: {
@@ -44,7 +48,9 @@ interface RendererInternals {
   selectedKey: string | null;
   hoverKey: string | null;
   ghostPreview: GhostPreview | null;
+  layoutNodes(): CitationGraphNode[];
   visibleNodes(): CitationGraphNode[];
+  isNodeGhosted(node: CitationGraphNode): boolean;
   axisScale(
     nodes: CitationGraphNode[],
     axis: "x" | "y",
@@ -68,45 +74,6 @@ const MISSING_Y = PLOT_BOTTOM + 35;
 const NODE_GAP = 7;
 const GRID_CELL_SIZE = 48;
 
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.max(minimum, Math.min(maximum, value));
-}
-
-function hash(value: string): number {
-  let result = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    result ^= value.charCodeAt(index);
-    result = Math.imul(result, 16777619);
-  }
-  return result >>> 0;
-}
-
-function metricNumber(
-  node: CitationGraphNode,
-  metric: GraphAxisMetric | string,
-): number | null {
-  if (metric === "free") return null;
-  const value = metricValue(node, metric as MetricID);
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function scaleValue(
-  value: number,
-  minimum: number,
-  maximum: number,
-  scale: GraphScaleType,
-): number {
-  if (maximum <= minimum) return 0.5;
-  if (scale === "log") {
-    if (value <= 0 || minimum <= 0 || maximum <= 0) return 0;
-    return (
-      (Math.log(value) - Math.log(minimum)) /
-      (Math.log(maximum) - Math.log(minimum))
-    );
-  }
-  return (value - minimum) / (maximum - minimum);
-}
-
 function ghostMetricNumber(
   preview: GhostPreview,
   metric: GraphAxisMetric,
@@ -114,7 +81,7 @@ function ghostMetricNumber(
   if (metric === "free") return null;
   const direct =
     metric === "year"
-      ? preview.year
+      ? publicationYearOrNull(preview.year)
       : metric === "citations"
         ? preview.citationCount
         : metric === "references"
@@ -123,52 +90,15 @@ function ghostMetricNumber(
   return typeof direct === "number" && Number.isFinite(direct) ? direct : null;
 }
 
-interface RGB {
-  r: number;
-  g: number;
-  b: number;
-}
-
-const GHOST_GRADIENT_STOPS: Array<[number, RGB]> = [
-  [0, { r: 37, g: 99, b: 235 }],
-  [0.35, { r: 20, g: 184, b: 211 }],
-  [0.68, { r: 250, g: 204, b: 21 }],
-  [1, { r: 220, g: 38, b: 38 }],
-];
-
-function categoricalColor(value: string | null | undefined): string {
-  if (!value) return "rgba(148, 163, 184, .55)";
-  return `hsl(${hash(value) % 360} 58% 52%)`;
-}
-
-function numericColor(value: number): string {
-  const t = clamp(value, 0, 1);
-  let left = GHOST_GRADIENT_STOPS[0];
-  let right = GHOST_GRADIENT_STOPS.at(-1)!;
-  for (let index = 1; index < GHOST_GRADIENT_STOPS.length; index += 1) {
-    if (t <= GHOST_GRADIENT_STOPS[index][0]) {
-      left = GHOST_GRADIENT_STOPS[index - 1];
-      right = GHOST_GRADIENT_STOPS[index];
-      break;
-    }
-  }
-  const local = (t - left[0]) / Math.max(1e-9, right[0] - left[0]);
-  const mix = (a: number, b: number): number => Math.round(a + (b - a) * local);
-  return `rgb(${mix(left[1].r, right[1].r)} ${mix(left[1].g, right[1].g)} ${mix(left[1].b, right[1].b)})`;
-}
-
 function metricDomain(
   nodes: CitationGraphNode[],
   metric: string,
 ): [number, number] | null {
-  const values = nodes
-    .map((node) => metricNumber(node, metric))
-    .filter((value): value is number => value !== null);
-  return values.length ? [Math.min(...values), Math.max(...values)] : null;
+  return metricExtent(nodes, metric);
 }
 
 function ghostRadius(
-  renderer: RendererInternals,
+  renderer: RendererSceneContext,
   preview: GhostPreview,
   nodes: CitationGraphNode[],
 ): number {
@@ -184,7 +114,7 @@ function ghostRadius(
 }
 
 function ghostColor(
-  renderer: RendererInternals,
+  renderer: RendererSceneContext,
   preview: GhostPreview,
   nodes: CitationGraphNode[],
 ): string {
@@ -192,12 +122,17 @@ function ghostColor(
   const work = getExternalWorkMetadata(preview.key);
   if (metric === "collection") return "rgba(148, 163, 184, .55)";
   if (metric === "publication-type") {
-    return categoricalColor(work?.publicationType);
+    return categoricalColor(work?.publicationType, "rgba(148, 163, 184, .55)");
   }
-  if (metric === "provider") return categoricalColor(work?.provider);
+  if (metric === "provider") {
+    return categoricalColor(work?.provider, "rgba(148, 163, 184, .55)");
+  }
   if (metric === "open-access") {
     return work?.isOpenAccess
-      ? categoricalColor(work.openAccessStatus ?? "open")
+      ? categoricalColor(
+          work.openAccessStatus ?? "open",
+          "rgba(148, 163, 184, .55)",
+        )
       : "rgba(148, 163, 184, .55)";
   }
   if (metric === "retraction") {
@@ -245,7 +180,7 @@ function clampAroundAnchor(
 }
 
 function relaxAnchoredNodes(
-  renderer: RendererInternals,
+  renderer: RendererSceneContext,
   nodes: CitationGraphNode[],
   anchors: Map<string, Position>,
 ): void {
@@ -276,7 +211,7 @@ function relaxAnchoredNodes(
     const position = renderer.positions.get(node.key);
     const anchor = anchors.get(node.key);
     if (!position || !anchor) continue;
-    const seed = hash(node.key);
+    const seed = hashString(node.key);
     const angle = ((seed % 360) * Math.PI) / 180;
     const jitter = 1.5 + ((seed >>> 9) % 35) / 10;
     position.x = anchor.x + Math.cos(angle) * Math.min(jitter, maxX);
@@ -328,7 +263,9 @@ function relaxAnchoredNodes(
             if (distance >= required) continue;
             if (distance < 1e-5) {
               const angle =
-                ((hash(`${node.key}\u001f${other.key}`) % 360) * Math.PI) / 180;
+                ((hashString(`${node.key}\u001f${other.key}`) % 360) *
+                  Math.PI) /
+                180;
               deltaX = Math.cos(angle);
               deltaY = Math.sin(angle);
               distance = 1;
@@ -409,7 +346,9 @@ function relaxAnchoredNodes(
             if (distance >= required - 0.02) continue;
             if (distance < 1e-5) {
               const angle =
-                ((hash(`${node.key}\u001f${other.key}`) % 360) * Math.PI) / 180;
+                ((hashString(`${node.key}\u001f${other.key}`) % 360) *
+                  Math.PI) /
+                180;
               deltaX = Math.cos(angle);
               deltaY = Math.sin(angle);
               distance = 1;
@@ -453,17 +392,15 @@ function withinLabelBounds(rectangle: Rectangle): boolean {
   );
 }
 
-const prototype = CitationGraphRenderer.prototype as unknown as Record<
-  string,
-  (...args: any[]) => any
->;
-
-prototype.projectPositionsToLayout = function projectPositionsToLayout(
+export function projectRendererPositions(
+  renderer: RendererSceneContext,
   preserveFreeX = false,
   preserveFreeY = false,
 ): void {
-  const renderer = this as unknown as RendererInternals;
-  const nodes = renderer.visibleNodes();
+  // Filters must not change the graph's coordinate system. Project every
+  // local node so a selected paper keeps exactly the position it had before
+  // being filtered out.
+  const nodes = renderer.layoutNodes();
   const xScale = renderer.axisScale(nodes, "x");
   const yScale = renderer.axisScale(nodes, "y");
   const anchors = new Map<string, Position>();
@@ -535,18 +472,19 @@ prototype.projectPositionsToLayout = function projectPositionsToLayout(
   ) {
     relaxAnchoredNodes(renderer, nodes, anchors);
   }
-};
+}
 
-prototype.hitTest = function hitTest(
+export function hitTestRenderer(
+  renderer: RendererSceneContext,
   x: number,
   y: number,
 ): CitationGraphNode | null {
-  const renderer = this as unknown as RendererInternals;
   const nodes = renderer.visibleNodes();
   const sizeValues =
     renderer.layout.nodeSizeMetric === "uniform"
       ? []
-      : nodes
+      : renderer
+          .layoutNodes()
           .map((node) => metricNumber(node, renderer.layout.nodeSizeMetric))
           .filter((value): value is number => value !== null);
   const sizeDomain: [number, number] | null = sizeValues.length
@@ -573,13 +511,13 @@ prototype.hitTest = function hitTest(
     }
   }
   return best;
-};
+}
 
-prototype.drawLabels = function drawLabels(
+export function drawRendererLabels(
+  renderer: RendererSceneContext,
   nodes: CitationGraphNode[],
   radii: Map<string, number>,
 ): void {
-  const renderer = this as unknown as RendererInternals;
   if (renderer.layout.nodeLabelMode === "none") return;
   const context = renderer.context;
   const limited = nodes.length > 220;
@@ -705,47 +643,40 @@ prototype.drawLabels = function drawLabels(
       context.stroke();
     }
 
+    const ghosted = renderer.isNodeGhosted(node);
+    context.globalAlpha = ghosted ? 0.58 : 1;
     context.textAlign = chosen.align;
     context.fillStyle = renderer.isDarkMode()
       ? "rgba(248, 250, 252, .94)"
       : "rgba(15, 23, 42, .9)";
     context.fillText(shortened, chosen.x, chosen.y);
+    context.globalAlpha = 1;
   }
   context.restore();
-};
+}
 
-prototype.setGhostPreview = function setGhostPreview(
-  preview: GhostPreview | null,
+export function drawRendererGhost(
+  renderer: RendererSceneContext,
+  preview: GhostPreview,
 ): void {
-  const renderer = this as unknown as RendererInternals;
-  renderer.ghostPreview = preview;
-  renderer.draw();
-  if (!preview) return;
-  void ensureExternalWorkMetrics(preview.key).then(() => {
-    if (renderer.ghostPreview?.key === preview.key) renderer.draw();
-  });
-};
-
-prototype.drawGhost = function drawGhost(): void {
-  const renderer = this as unknown as RendererInternals;
-  const preview = renderer.ghostPreview;
-  if (!preview) return;
   const sources = preview.sourceKeys
     .map((key) => renderer.positions.get(key))
     .filter((position): position is Position => Boolean(position));
-  if (!sources.length) return;
-
-  const centroidX =
-    sources.reduce((sum, source) => sum + source.x, 0) / sources.length;
-  const centroidY =
-    sources.reduce((sum, source) => sum + source.y, 0) / sources.length;
-  const seed = hash(preview.key);
+  const centroidX = sources.length
+    ? sources.reduce((sum, source) => sum + source.x, 0) / sources.length
+    : (PLOT_LEFT + PLOT_RIGHT) / 2;
+  const centroidY = sources.length
+    ? sources.reduce((sum, source) => sum + source.y, 0) / sources.length
+    : (PLOT_TOP + PLOT_BOTTOM) / 2;
+  const seed = hashString(preview.key);
   const angle = ((seed % 360) * Math.PI) / 180;
   const radius = 70 + (seed % 31);
   let x = clamp(centroidX + Math.cos(angle) * radius, PLOT_LEFT, PLOT_RIGHT);
   let y = clamp(centroidY + Math.sin(angle) * radius, PLOT_TOP, PLOT_BOTTOM);
 
-  const nodes = renderer.visibleNodes();
+  // External previews use the same full-graph metric domains as local nodes.
+  // This keeps previews aligned with stable axes while filters are active.
+  const nodes = renderer.layoutNodes();
   const displayedRadius = ghostRadius(renderer, preview, nodes);
   const displayedColor = ghostColor(renderer, preview, nodes);
   const xScale = renderer.axisScale(nodes, "x");
@@ -831,6 +762,7 @@ prototype.drawGhost = function drawGhost(): void {
     preview.key,
     renderer.layout.nodeLabelMode,
     preview.title,
+    preview.authors,
     preview.year,
   );
   if (label) {
@@ -844,6 +776,4 @@ prototype.drawGhost = function drawGhost(): void {
     context.fillText(shortened, x, y + displayedRadius + 13);
   }
   context.restore();
-};
-
-export {};
+}
