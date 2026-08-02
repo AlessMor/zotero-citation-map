@@ -27,6 +27,7 @@ import { completeLibraryItemUpdates } from "./libraryItemCompletionService";
 import {
   saveCitationMetricFailure,
   saveCitationMetricRecord,
+  saveCitationMetricRecords,
 } from "./citationMetricsStore";
 import {
   getDebugLoggingEnabled,
@@ -86,6 +87,7 @@ type UpdateOutcome = "updated" | "cached" | "failed" | "skipped";
 interface CoreUpdateResult {
   outcome: UpdateOutcome;
   record: CitationMetricRecord | null;
+  persistRecord: boolean;
 }
 
 const SHUTDOWN_WAIT_TIMEOUT_MS = 5000;
@@ -206,6 +208,15 @@ function nonEmptyYearCounts<T>(
   return current?.length ? current : (previous ?? []);
 }
 
+function mergeCoreReferences(
+  previous: RelatedWorkMetadata[] | null | undefined,
+  incoming: RelatedWorkMetadata[],
+): RelatedWorkMetadata[] {
+  if (!previous?.length) return incoming;
+  if (!incoming.length) return previous;
+  return mergeRelatedWorkLists(previous, incoming);
+}
+
 function zoteroWork(
   item: Zotero.Item,
   identifiers: WorkIdentifiers,
@@ -290,8 +301,11 @@ function buildMetricRecord(
     result.matchedBy === "doi" ||
     result.matchedBy === "title" ||
     sameConfirmedIdentity;
-  const mergedReferences = mergeRelatedWorkLists(
-    previous?.references ?? [],
+  // A fresh provider bibliography is canonicalized once when it is admitted
+  // to the relationship store. Avoid a second full-list merge here unless an
+  // older fallback list also has to be preserved.
+  const mergedReferences = mergeCoreReferences(
+    previous?.references,
     result.references,
   );
   const previousCitationCount =
@@ -416,10 +430,10 @@ async function persistOneItemCore(
 ): Promise<CoreUpdateResult> {
   const { item, libraryID, itemKey, previous, identifiers } = planned;
   if (!planned.needsCoreRefresh && previous?.status === "success") {
-    return { outcome: "updated", record: previous };
+    return { outcome: "updated", record: previous, persistRecord: false };
   }
   if (updateWasCancelled(scope)) {
-    return { outcome: "skipped", record: null };
+    return { outcome: "skipped", record: null, persistRecord: false };
   }
   if (lookup.status !== "success") {
     await saveCitationMetricFailure(
@@ -432,7 +446,7 @@ async function persistOneItemCore(
       zoteroWork(item, identifiers),
       lookup.candidates ?? [],
     );
-    return { outcome: "failed", record: null };
+    return { outcome: "failed", record: null, persistRecord: false };
   }
 
   const candidate = relatedWorkFromProviderLookup(lookup);
@@ -451,21 +465,21 @@ async function persistOneItemCore(
       zoteroWork(item, identifiers),
       [candidate],
     );
-    return { outcome: "failed", record: null };
+    return { outcome: "failed", record: null, persistRecord: false };
   }
 
   const record = buildMetricRecord(item, previous, identifiers, lookup);
-  await saveCitationMetricRecord(record);
-
+  let storedReferenceCount: number | null = null;
   try {
-    const node = createMetricNodeForItem(item);
-    await storeExternalRelationshipSnapshot(
+    const node = createMetricNodeForItem(item, { includeReferences: false });
+    storedReferenceCount = await storeExternalRelationshipSnapshot(
       node,
       "references",
       record.references,
       {
         provider: lookup.provider,
         reportedCount: lookup.referenceCount,
+        queueBackgroundHydration: false,
       },
     );
   } catch (error) {
@@ -474,7 +488,26 @@ async function persistOneItemCore(
     );
   }
 
-  return { outcome: "updated", record };
+  // Complete relationship membership is retained once in the dedicated
+  // relationship cache. Keeping a second full bibliography in the metric row
+  // substantially increases JSON serialization and SQLite work during bulk
+  // updates. Incomplete provider results remain in the record as a fallback.
+  const persistedRecord =
+    storedReferenceCount === null
+      ? record
+      : {
+          ...record,
+          resolvedReferenceCount: Math.max(
+            record.resolvedReferenceCount,
+            storedReferenceCount,
+          ),
+          references: [],
+        };
+  return {
+    outcome: "updated",
+    record: persistedRecord,
+    persistRecord: true,
+  };
 }
 
 async function runUpdate(
@@ -514,6 +547,7 @@ async function runUpdate(
       );
 
   const updatedRecords: CitationMetricRecord[] = [];
+  const coreRecordsToPersist: CitationMetricRecord[] = [];
   const providerIdentitiesByItemKey = new Map<string, ProviderIdentityHints>();
   let completed = 0;
 
@@ -568,15 +602,41 @@ async function runUpdate(
         core = {
           outcome: shuttingDown ? "skipped" : "failed",
           record: null,
+          persistRecord: false,
         };
       }
       result[core.outcome] += 1;
-      if (core.record) updatedRecords.push(core.record);
+      if (core.record) {
+        updatedRecords.push(core.record);
+        if (core.persistRecord) coreRecordsToPersist.push(core.record);
+      }
       const hints = coreBatch.providerIdentitiesByItemKey.get(planned.itemKey);
       if (hints) providerIdentitiesByItemKey.set(planned.itemKey, hints);
       completed += 1;
       updateCoreProgress(progress, completed, completed, pending.length, title);
       await checkpoint(completed % 10 === 0);
+    }
+    if (coreRecordsToPersist.length && !updateWasCancelled(scope)) {
+      progress?.setProgress(
+        completed,
+        Math.max(1, pending.length),
+        `Saving ${coreRecordsToPersist.length} updated paper${
+          coreRecordsToPersist.length === 1 ? "" : "s"
+        }`,
+      );
+      try {
+        await saveCitationMetricRecords(coreRecordsToPersist);
+      } catch (error) {
+        // Preserve the previous per-item failure isolation only when the bulk
+        // transaction itself fails. The normal path uses one transaction.
+        Zotero.debug(
+          `Citation Map: batched core persistence failed; retrying individually: ${String(error)}`,
+        );
+        for (const [index, record] of coreRecordsToPersist.entries()) {
+          await saveCitationMetricRecord(record);
+          await checkpoint((index + 1) % 10 === 0);
+        }
+      }
     }
     coreCompletedAt = Date.now();
 

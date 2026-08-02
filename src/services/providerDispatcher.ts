@@ -40,6 +40,26 @@ export function prepareRelationshipSnapshots(
   mergeLists: (...groups: RelatedWorkMetadata[][]) => RelatedWorkMetadata[],
 ): PreparedRelationshipProviderSnapshot[] {
   const prepared = snapshots.map(prepareInitialSnapshot);
+  if (prepared.length === 1) {
+    const snapshot = prepared[0];
+    const identifiedWorks = mergeLists(snapshot.identifiedWorks);
+    if (snapshot.unresolvedWorks.length === 0) {
+      return [{ ...snapshot, identifiedWorks }];
+    }
+    const promoted = resolveSparseCandidatesAgainstIdentified(
+      identifiedWorks,
+      snapshot.unresolvedWorks,
+      mergeRelatedWorkMetadata,
+    );
+    return [
+      {
+        ...snapshot,
+        identifiedWorks: promoted.length
+          ? mergeLists(identifiedWorks, promoted)
+          : identifiedWorks,
+      },
+    ];
+  }
   const globallyIdentified = mergeLists(
     ...prepared.map((snapshot) => snapshot.identifiedWorks),
   );

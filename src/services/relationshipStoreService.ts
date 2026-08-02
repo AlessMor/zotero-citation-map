@@ -16,8 +16,11 @@ import {
   cachedExternalWorkMetadata,
   getExternalRelationshipCacheEntry,
   getExternalRelationshipCacheSize,
+  getExternalRelationshipCacheWorks,
+  getExternalRelationshipCacheSummary,
   saveExternalRelationshipCache,
   type ExternalRelationshipCacheEntry,
+  type ExternalRelationshipCacheSummary,
 } from "./externalWorkCacheService";
 
 export type StoredRelationshipDirection = "references" | "cited-by";
@@ -184,8 +187,21 @@ export function getStoredRelationshipEntry(
 export function getStoredRelationshipWorks(
   node: RelationshipStoreSubject,
   direction: StoredRelationshipDirection,
+  maximum = Number.POSITIVE_INFINITY,
 ): RelatedWorkMetadata[] {
-  return getStoredRelationshipEntry(node, direction)?.works ?? [];
+  return getExternalRelationshipCacheWorks(
+    selectedRelationshipStoreKey(node, direction),
+    maximum,
+  );
+}
+
+export function getStoredRelationshipSummary(
+  node: RelationshipStoreSubject,
+  direction: StoredRelationshipDirection,
+): ExternalRelationshipCacheSummary | null {
+  return getExternalRelationshipCacheSummary(
+    selectedRelationshipStoreKey(node, direction),
+  );
 }
 
 export function getStoredRelationshipCount(
@@ -201,11 +217,20 @@ export async function replaceStoredRelationshipSelection(
   node: RelationshipStoreSubject,
   direction: StoredRelationshipDirection,
   works: RelatedWorkMetadata[],
+  options: { alreadyCanonical?: boolean; writeMetadata?: boolean } = {},
 ): Promise<RelatedWorkMetadata[]> {
-  const snapshot = mergeRelatedWorkLists(works);
+  const snapshot = options.alreadyCanonical
+    ? works
+    : mergeRelatedWorkLists(works);
   await saveExternalRelationshipCache(
     selectedRelationshipStoreKey(node, direction),
     snapshot,
+    {
+      alreadyCanonical: true,
+      ...(options.writeMetadata !== undefined
+        ? { writeMetadata: options.writeMetadata }
+        : {}),
+    },
   );
   return snapshot;
 }

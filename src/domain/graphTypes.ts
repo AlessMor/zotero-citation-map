@@ -141,6 +141,18 @@ export interface CitationGraphModel {
   statistics: CitationGraphStatistics;
 }
 
+/**
+ * Read-only lookup indexes derived from a graph snapshot. Views may keep their
+ * own mutable model while sharing these compact indexes for projection work.
+ */
+export interface CitationGraphIndex {
+  nodeByKey: ReadonlyMap<string, CitationGraphNode>;
+  outgoingEdgesByKey: ReadonlyMap<string, readonly CitationGraphEdge[]>;
+  incomingEdgesByKey: ReadonlyMap<string, readonly CitationGraphEdge[]>;
+  edgeByPair: ReadonlyMap<string, CitationGraphEdge>;
+  nodesByAlias: ReadonlyMap<string, readonly CitationGraphNode[]>;
+}
+
 export interface GraphLayoutOptions {
   xMetric: GraphAxisMetric;
   xScale: GraphScaleType;

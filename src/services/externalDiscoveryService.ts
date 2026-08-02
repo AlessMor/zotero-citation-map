@@ -43,6 +43,7 @@ import {
 import {
   getStoredRelationshipCount,
   getStoredRelationshipEntry,
+  getStoredRelationshipSummary,
   getStoredRelationshipWorks,
   mergeRelatedWorkLists,
   replaceStoredRelationshipSelection,
@@ -277,8 +278,8 @@ export function selectedRelationshipCacheIsFresh(
   direction: "references" | "cited-by",
   maxAgeMs?: number,
 ): boolean {
-  const entry = getStoredRelationshipEntry(node, direction);
-  return relationshipSnapshotIsFresh(entry?.fetchedAt, maxAgeMs);
+  const summary = getStoredRelationshipSummary(node, direction);
+  return relationshipSnapshotIsFresh(summary?.fetchedAt, maxAgeMs);
 }
 
 function metadataForRelationshipWork(
@@ -445,79 +446,6 @@ function storedRelationshipReportedCount(
   };
 }
 
-function expandStoredRelationshipMetadata(
-  works: RelatedWorkMetadata[],
-): RelatedWorkMetadata[] {
-  return works.map((work) => {
-    const key = stableExternalWorkIdentity(work);
-    const cached = key ? cachedExternalWorkMetadata(key) : null;
-    const expanded = cached ? mergeExternalWorkMetadata(work, cached) : work;
-    // Citation metric records need a bibliography summary, not a second copy
-    // of abstracts, nested references, source metrics and citation histories
-    // already retained in the external-work cache.
-    return projectRelatedWorkSummary(expanded, false);
-  });
-}
-
-async function synchronizeStoredRelationshipRecord(
-  node: CitationGraphNode,
-  direction: "references" | "cited-by",
-  works: RelatedWorkMetadata[],
-  reported: RelationshipReportedCount | null,
-): Promise<void> {
-  const record = getCitationMetricRecord(nodeLibraryID(node), node.itemKey);
-  if (!record) return;
-  if (direction === "references") {
-    const expandedWorks = expandStoredRelationshipMetadata(works);
-    const previous = retainedStoredCount(
-      record.referenceCount,
-      record.referenceCountProvider,
-    );
-    const referenceCount = richestCountAttribution([
-      previous,
-      {
-        count: reported?.count ?? null,
-        provider: reported?.provider ?? null,
-      },
-    ]);
-    await saveCitationMetricRecord({
-      ...record,
-      referenceCount: referenceCount.count,
-      referenceCountProvider: referenceCount.provider,
-      resolvedReferenceCount: expandedWorks.length,
-      references: expandedWorks,
-    });
-  } else {
-    const previous = retainedStoredCount(
-      record.citationCount,
-      record.citationCountProvider,
-    );
-    const citationCount = richestCountAttribution([
-      previous,
-      {
-        count: reported?.count ?? null,
-        provider: reported?.provider ?? null,
-      },
-    ]);
-    await saveCitationMetricRecord({
-      ...record,
-      citationCount: citationCount.count,
-      citationCountProvider: citationCount.provider,
-    });
-  }
-}
-
-function synchronizeRelationshipRecord(
-  node: CitationGraphNode,
-  direction: "references" | "cited-by",
-  works: RelatedWorkMetadata[],
-  reported: RelationshipReportedCount | null = null,
-): Promise<void> {
-  return queueRelationshipRecordSynchronization(node, () =>
-    synchronizeStoredRelationshipRecord(node, direction, works, reported),
-  );
-}
-
 function synchronizeRelationshipSummary(
   node: CitationGraphNode,
   direction: "references" | "cited-by",
@@ -562,6 +490,7 @@ interface StoreRelationshipSnapshotOptions {
   provider?: CitationProviderID;
   reportedCount?: number | null;
   complete?: boolean;
+  queueBackgroundHydration?: boolean;
 }
 
 export async function storeExternalRelationshipSnapshot(
@@ -569,21 +498,34 @@ export async function storeExternalRelationshipSnapshot(
   direction: "references" | "cited-by",
   works: RelatedWorkMetadata[],
   options: StoreRelationshipSnapshotOptions = {},
-): Promise<void> {
+): Promise<number | null> {
   const provider =
     options.provider ??
     node.provider ??
     works.find(
       (work) => work.provider !== "manual" && work.provider !== "zotero",
     )?.provider;
-  if (!provider || provider === "manual" || provider === "zotero") return;
+  if (!provider || provider === "manual" || provider === "zotero") {
+    return null;
+  }
 
-  const rawSnapshot = mergeRelatedWorkLists(works);
+  const complete =
+    options.complete === true ||
+    options.reportedCount === 0 ||
+    (options.reportedCount != null && works.length >= options.reportedCount);
+  const providerOwnsMembership = works.every(
+    (work) =>
+      work.provider === provider || work.dataSources?.includes(provider),
+  );
+  // Avoid canonicalizing a large partial bibliography that cannot be admitted
+  // as authoritative membership.
+  if (!complete || !providerOwnsMembership) return null;
+
   const prepared = prepareRelationshipSnapshots(
     [
       {
         provider,
-        works: rawSnapshot,
+        works,
         reportedCount: options.reportedCount ?? null,
         complete: options.complete === true,
         succeeded: true,
@@ -591,47 +533,40 @@ export async function storeExternalRelationshipSnapshot(
     ],
     mergeRelatedWorkLists,
   )[0];
-  const complete =
-    options.complete === true ||
-    options.reportedCount === 0 ||
-    (options.reportedCount != null &&
-      rawSnapshot.length >= options.reportedCount);
-  const providerOwnsMembership = rawSnapshot.every(
-    (work) =>
-      work.provider === provider || work.dataSources?.includes(provider),
-  );
-  if (!complete || !providerOwnsMembership) return;
 
   // Never expose an incomplete or cross-provider scalar list as membership.
-  const selectedMembership = prepared.identifiedWorks.map((work) =>
-    compactRelationshipWork(work as ExternalWork),
+  const selectedMembership = await mapCooperatively(
+    prepared.identifiedWorks,
+    (work) => compactRelationshipWork(work as ExternalWork),
+    { forceEvery: 25 },
   );
-  await replaceStoredRelationshipSelection(node, direction, selectedMembership);
+  await replaceStoredRelationshipSelection(
+    node,
+    direction,
+    selectedMembership,
+    { alreadyCanonical: true, writeMetadata: false },
+  );
   const reported = {
     count: options.reportedCount ?? null,
     provider,
   } satisfies RelationshipReportedCount;
-  await synchronizeRelationshipRecord(
-    node,
-    direction,
-    prepared.identifiedWorks,
-    reported,
-  );
-  const publishedReported = storedRelationshipReportedCount(node, direction);
   publishRelationshipState(
     node,
     direction,
     "membership-published",
     prepared.identifiedWorks.length,
-    publishedReported,
+    reported,
   );
-  queueRelationshipMetadataHydration(
-    node,
-    direction,
-    prepared.identifiedWorks,
-    true,
-    [provider],
-  );
+  if (options.queueBackgroundHydration !== false) {
+    queueRelationshipMetadataHydration(
+      node,
+      direction,
+      prepared.identifiedWorks,
+      true,
+      [provider],
+    );
+  }
+  return prepared.identifiedWorks.length;
 }
 
 function needsRelationshipBibliographicMetadata(
@@ -1694,21 +1629,21 @@ async function runExternalRelationshipRefresh(
   const checkpoint = createCooperativeCheckpoint();
   const existingResult = (): ExternalWork[] =>
     toExternalWorks(
-      getStoredRelationshipWorks(node, direction).slice(0, maximum),
+      getStoredRelationshipWorks(node, direction, maximum),
       libraryNodes,
     );
   let refreshStarted = false;
   let publicationBatchStarted = false;
 
   try {
-    const cachedMembership = getStoredRelationshipWorks(node, direction);
-    if (!refreshMembership && cachedMembership.length) {
+    const cachedMembershipCount = getStoredRelationshipCount(node, direction);
+    if (!refreshMembership && cachedMembershipCount) {
       const output = existingResult();
       options.onMembershipResolved?.({
         complete: true,
         provider: null,
         reportedCount: null,
-        identifiedCount: cachedMembership.length,
+        identifiedCount: cachedMembershipCount,
       });
       if (!progress.isDismissed()) {
         progress.finish(`${output.length} ${relationshipLabel} ready`);
@@ -1745,7 +1680,7 @@ async function runExternalRelationshipRefresh(
       node,
       direction,
       "refresh-started",
-      cachedMembership.length,
+      cachedMembershipCount,
       storedRelationshipReportedCount(node, direction),
     );
     const providers = relationshipProviders(
@@ -1761,9 +1696,11 @@ async function runExternalRelationshipRefresh(
         providers.length === 1 ? "" : "s"
       }`,
     );
+    const providerParallelism =
+      mode === "automatic" ? 1 : RELATIONSHIP_PROVIDER_PARALLELISM;
     const results = await mapBounded(
       providers,
-      RELATIONSHIP_PROVIDER_PARALLELISM,
+      providerParallelism,
       async (provider): Promise<RelationshipProviderSnapshot> => {
         if (cancelled()) {
           return {
@@ -1783,7 +1720,10 @@ async function runExternalRelationshipRefresh(
           { signal: options.signal },
         );
       },
-      { yieldAfterEach: true },
+      {
+        yieldAfterEach: true,
+        yieldDelayMs: mode === "automatic" ? 12 : 4,
+      },
     );
     if (cancelled()) return existingResult();
 
@@ -1835,6 +1775,7 @@ async function runExternalRelationshipRefresh(
       node,
       direction,
       selectedMembership,
+      { alreadyCanonical: true, writeMetadata: false },
     );
     const reported = {
       count: selection.reportedCount,
@@ -1903,12 +1844,6 @@ async function runExternalRelationshipRefresh(
     );
     if (metadataIndex.size) options.onMetadataHydrated?.();
 
-    await synchronizeRelationshipRecord(
-      node,
-      direction,
-      selectedWorks,
-      publishedReported,
-    );
     publishRelationshipState(
       node,
       direction,
@@ -1948,12 +1883,12 @@ async function runExternalRelationshipRefresh(
     throw error;
   } finally {
     if (refreshStarted) {
-      const selected = getStoredRelationshipWorks(node, direction);
+      const selectedCount = getStoredRelationshipCount(node, direction);
       publishRelationshipState(
         node,
         direction,
         "refresh-finished",
-        selected.length,
+        selectedCount,
         storedRelationshipReportedCount(node, direction),
       );
     }

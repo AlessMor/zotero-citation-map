@@ -65,6 +65,8 @@ export async function forEachCooperatively<T>(
 export interface BoundedMapOptions {
   /** Yield to Zotero's event loop after every completed item. */
   yieldAfterEach?: boolean;
+  /** Optional quiet interval that lets input and paint work run first. */
+  yieldDelayMs?: number;
 }
 
 /**
@@ -89,7 +91,9 @@ export async function mapBounded<T, R>(
       const index = nextIndex;
       nextIndex += 1;
       output[index] = await mapper(values[index], index);
-      if (options.yieldAfterEach) await yieldToUI();
+      if (options.yieldAfterEach) {
+        await yieldToUI(Math.max(0, options.yieldDelayMs ?? 0));
+      }
     }
   }
 

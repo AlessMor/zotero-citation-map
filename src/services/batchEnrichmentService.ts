@@ -16,7 +16,7 @@ import { mergeRelatedWorkMetadata } from "../domain/relatedWorkMetadata";
 import { isCitationRequestCancellationRequested } from "../providers/http";
 import type { ProviderRequestOptions } from "../providers/types";
 import { cancellationRequested } from "./cancellationScope";
-import { saveCitationMetricRecord } from "./citationMetricsStore";
+import { saveCitationMetricRecords } from "./citationMetricsStore";
 import { getOpenAlexAPIKey, isProviderEnabled } from "./citationPreferences";
 import {
   CITATION_RECORD_WRITE_CHUNK_SIZE,
@@ -28,8 +28,10 @@ import {
   createCooperativeCheckpoint,
   mapCooperatively,
   settleBounded,
+  yieldToUI,
 } from "./backgroundTaskService";
 import { normalizeDOI } from "../domain/workIdentity";
+import { authoritativeReferenceCountAttribution } from "./citationCountPolicy";
 
 export interface BatchEnrichmentProgress {
   completed: number;
@@ -143,11 +145,19 @@ function mergeTargetRecord(
     target.citationCountProvider =
       record.citationCountProvider ?? record.provider;
   }
-  if (chooseLargerCount(target.work.referenceCount, candidate.referenceCount)) {
-    target.referenceCountProvider =
-      record.referenceCountProvider ?? record.provider;
-  }
+  const referenceCount = authoritativeReferenceCountAttribution([
+    {
+      count: target.work.referenceCount ?? null,
+      provider: target.referenceCountProvider,
+    },
+    {
+      count: candidate.referenceCount ?? null,
+      provider: record.referenceCountProvider ?? record.provider,
+    },
+  ]);
   target.work = mergeRelatedWorkMetadata(target.work, candidate);
+  target.work.referenceCount = referenceCount.count;
+  target.referenceCountProvider = referenceCount.provider;
   if (record.providerWorkID) {
     target.providerWorkIDs[record.provider] = record.providerWorkID;
   }
@@ -161,10 +171,16 @@ function mergeProviderMetadata(
   if (chooseLargerCount(target.work.citationCount, metadata.citationCount)) {
     target.citationCountProvider = provider;
   }
-  if (chooseLargerCount(target.work.referenceCount, metadata.referenceCount)) {
-    target.referenceCountProvider = provider;
-  }
+  const referenceCount = authoritativeReferenceCountAttribution([
+    {
+      count: target.work.referenceCount ?? null,
+      provider: target.referenceCountProvider,
+    },
+    { count: metadata.referenceCount ?? null, provider },
+  ]);
   target.work = mergeRelatedWorkMetadata(target.work, metadata);
+  target.work.referenceCount = referenceCount.count;
+  target.referenceCountProvider = referenceCount.provider;
   if (metadata.providerWorkID) {
     target.providerWorkIDs[provider] = metadata.providerWorkID;
   }
@@ -218,16 +234,19 @@ function mergeRecordEnrichment(
     record.citationCount,
     merged.citationCount,
   );
-  const useEnrichedReferenceCount = chooseLargerCount(
-    record.referenceCount,
-    merged.referenceCount,
-  );
+  const referenceCount = authoritativeReferenceCountAttribution([
+    {
+      count: record.referenceCount,
+      provider: record.referenceCountProvider,
+    },
+    {
+      count: merged.referenceCount ?? null,
+      provider: target.referenceCountProvider,
+    },
+  ]);
   const citationCount = useEnrichedCitationCount
     ? (merged.citationCount ?? null)
     : record.citationCount;
-  const referenceCount = useEnrichedReferenceCount
-    ? (merged.referenceCount ?? null)
-    : record.referenceCount;
   const references = mergeRelatedWorkLists(
     record.references,
     merged.references ?? [],
@@ -246,10 +265,8 @@ function mergeRecordEnrichment(
     citationCountProvider: useEnrichedCitationCount
       ? (target.citationCountProvider ?? record.citationCountProvider)
       : record.citationCountProvider,
-    referenceCount,
-    referenceCountProvider: useEnrichedReferenceCount
-      ? (target.referenceCountProvider ?? record.referenceCountProvider)
-      : record.referenceCountProvider,
+    referenceCount: referenceCount.count,
+    referenceCountProvider: referenceCount.provider,
     references,
     resolvedReferenceCount: Math.max(
       record.resolvedReferenceCount,
@@ -414,16 +431,25 @@ async function runProviderTaskGroups(
     group.push(task);
     groups.set(task.provider, group);
   }
-  const groupResults = await Promise.all(
-    [...groups].map(async ([provider, providerTasks]) =>
-      settleBounded(
+
+  // Provider batches can return large JSON payloads at nearly the same time.
+  // Running every provider group concurrently causes parsing and merge bursts
+  // on Zotero's single UI thread. Preserve each provider's own bounded
+  // parallelism, but process provider groups one after another and leave a
+  // short interaction window between them.
+  const results: Array<PromiseSettledResult<void>> = [];
+  for (const [provider, providerTasks] of groups) {
+    results.push(
+      ...(await settleBounded(
         providerTasks,
         providerExecutionPolicy(provider).requestParallelism,
         execute,
-      ),
-    ),
-  );
-  return groupResults.flat();
+        { yieldAfterEach: true, yieldDelayMs: 12 },
+      )),
+    );
+    await yieldToUI(12);
+  }
+  return results;
 }
 
 /**
@@ -565,9 +591,7 @@ export async function enrichCitationMetricRecords(
         changed.push(record);
       }
     }
-    await Promise.all(
-      changed.map((record) => saveCitationMetricRecord(record)),
-    );
+    await saveCitationMetricRecords(changed);
     enriched += changed.length;
     await checkpoint(true);
   }

@@ -3,6 +3,13 @@ import { createCitationMapIcon } from "./uiIconService";
 
 type Action = () => void | Promise<void>;
 
+export interface PaperOverviewOpenInAction {
+  label: string;
+  title?: string;
+  separatorBefore?: boolean;
+  action: Action;
+}
+
 export interface PaperOverviewActionOptions {
   document: Document;
   actionsClass: string;
@@ -10,7 +17,7 @@ export interface PaperOverviewActionOptions {
   secondaryButtonClass?: string;
   doi: string | null;
   onShowInZotero: Action;
-  onOpenFocusView?: Action;
+  getOpenInActions?: () => readonly PaperOverviewOpenInAction[];
   onSimilar: Action;
   onRefresh: Action;
 }
@@ -19,7 +26,7 @@ export interface PaperOverviewActionBar {
   root: HTMLDivElement;
   showInZoteroButton: HTMLButtonElement;
   openDOIButton: HTMLButtonElement | null;
-  openFocusViewButton: HTMLButtonElement | null;
+  openInButton: HTMLButtonElement | null;
   similarButton: HTMLButtonElement;
   refreshButton: HTMLButtonElement;
 }
@@ -97,18 +104,92 @@ export function createPaperOverviewActionBar(
     left.appendChild(openDOIButton);
   }
 
-  let openFocusViewButton: HTMLButtonElement | null = null;
-  const openFocusView = options.onOpenFocusView;
-  if (openFocusView) {
-    openFocusViewButton = element(document, "button", secondaryButtonClass);
-    openFocusViewButton.type = "button";
-    openFocusViewButton.textContent = "Open Focus View";
-    openFocusViewButton.title =
-      "Show this paper with its direct references and citing papers in Citation Map.";
-    openFocusViewButton.addEventListener("click", () =>
-      invoke(openFocusViewButton!, openFocusView),
-    );
-    left.appendChild(openFocusViewButton);
+  let openInButton: HTMLButtonElement | null = null;
+  const getOpenInActions = options.getOpenInActions;
+  if (getOpenInActions) {
+    const wrapper = element(document, "div");
+    wrapper.style.position = "relative";
+    wrapper.style.display = "inline-flex";
+
+    openInButton = element(document, "button", secondaryButtonClass);
+    openInButton.type = "button";
+    openInButton.textContent = "Open in ›";
+    openInButton.title = "Open this paper in a Citation Map view.";
+    openInButton.setAttribute("aria-haspopup", "menu");
+    openInButton.setAttribute("aria-expanded", "false");
+
+    const menu = element(document, "div");
+    menu.hidden = true;
+    menu.setAttribute("role", "menu");
+    Object.assign(menu.style, {
+      position: "absolute",
+      insetInlineStart: "0",
+      top: "calc(100% + 4px)",
+      zIndex: "1000",
+      display: "none",
+      flexDirection: "column",
+      minWidth: "190px",
+      padding: "4px",
+      border: "1px solid color-mix(in srgb, CanvasText 22%, transparent)",
+      borderRadius: "6px",
+      background: "Canvas",
+      color: "CanvasText",
+      boxShadow: "0 8px 24px color-mix(in srgb, black 24%, transparent)",
+    });
+
+    const closeMenu = (): void => {
+      menu.hidden = true;
+      menu.style.display = "none";
+      openInButton?.setAttribute("aria-expanded", "false");
+    };
+    const rebuildMenu = (): void => {
+      menu.replaceChildren();
+      for (const entry of getOpenInActions()) {
+        if (entry.separatorBefore && menu.childElementCount) {
+          const separator = element(document, "div");
+          separator.setAttribute("role", "separator");
+          separator.style.borderTop =
+            "1px solid color-mix(in srgb, CanvasText 16%, transparent)";
+          separator.style.margin = "3px 2px";
+          menu.appendChild(separator);
+        }
+        const button = element(document, "button", secondaryButtonClass);
+        button.type = "button";
+        button.setAttribute("role", "menuitem");
+        button.textContent = entry.label;
+        button.title = entry.title ?? entry.label;
+        button.style.justifyContent = "flex-start";
+        button.style.width = "100%";
+        button.addEventListener("click", () => {
+          closeMenu();
+          invoke(button, entry.action);
+        });
+        menu.appendChild(button);
+      }
+    };
+
+    openInButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (!menu.hidden) {
+        closeMenu();
+        return;
+      }
+      rebuildMenu();
+      if (!menu.childElementCount) return;
+      menu.hidden = false;
+      menu.style.display = "flex";
+      openInButton?.setAttribute("aria-expanded", "true");
+      const closeOnOutsideClick = (outsideEvent: Event): void => {
+        if (!wrapper.contains(outsideEvent.target as Node)) closeMenu();
+      };
+      document.addEventListener("pointerdown", closeOnOutsideClick, {
+        once: true,
+        capture: true,
+      });
+    });
+
+    wrapper.append(openInButton, menu);
+    left.appendChild(wrapper);
   }
 
   const similarButton = element(document, "button", primaryButtonClass);
@@ -145,7 +226,7 @@ export function createPaperOverviewActionBar(
     root,
     showInZoteroButton,
     openDOIButton,
-    openFocusViewButton,
+    openInButton,
     similarButton,
     refreshButton,
   };

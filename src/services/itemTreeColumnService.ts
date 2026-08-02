@@ -19,6 +19,32 @@ const descriptions = new Map<string, string>();
 const tooltipHandlers = new Map<Window, EventListener>();
 const VALUE_SEPARATOR = "\u001f";
 
+type ColumnMetricNode = ReturnType<typeof createMetricNodeForItem>;
+
+let columnMetricNodeCache = new WeakMap<Zotero.Item, ColumnMetricNode>();
+let columnMetricNodeCacheResetScheduled = false;
+
+function resetColumnMetricNodeCache(): void {
+  columnMetricNodeCache = new WeakMap<Zotero.Item, ColumnMetricNode>();
+  columnMetricNodeCacheResetScheduled = false;
+}
+
+function getColumnMetricNode(item: Zotero.Item): ColumnMetricNode {
+  const cached = columnMetricNodeCache.get(item);
+  if (cached) return cached;
+
+  const node = createMetricNodeForItem(item, { includeReferences: false });
+  columnMetricNodeCache.set(item, node);
+  if (!columnMetricNodeCacheResetScheduled) {
+    columnMetricNodeCacheResetScheduled = true;
+    // Zotero may request cells across several event-loop turns during a
+    // virtualized table refresh. Keep the per-item node briefly so every
+    // visible Citation Map column reuses the same lightweight context.
+    setTimeout(resetColumnMetricNodeCache, 250);
+  }
+  return node;
+}
+
 interface EncodedCell {
   display: string;
   title: string;
@@ -93,7 +119,7 @@ function renderCell(
 
 function metricData(spec: MetricDefinition, item: Zotero.Item): string {
   if (!item?.isRegularItem?.()) return "";
-  const node = createMetricNodeForItem(item);
+  const node = getColumnMetricNode(item);
   const raw = spec.value(node);
   if (typeof raw !== "number" || !Number.isFinite(raw)) return "";
   const display = formatMetricValue(spec.id, raw);
@@ -111,7 +137,7 @@ function supplementaryData(
   item: Zotero.Item,
 ): string {
   if (!item?.isRegularItem?.()) return "";
-  const node = createMetricNodeForItem(item);
+  const node = getColumnMetricNode(item);
   const value = spec.value(node);
   if (value === null || value === undefined || value === "") return "";
   const display = spec.format(value);
@@ -228,14 +254,23 @@ export async function registerCitationColumns(): Promise<void> {
 }
 
 export function refreshCitationColumns(): void {
+  resetColumnMetricNodeCache();
+  const startedAt = Date.now();
   try {
     Zotero.ItemTreeManager.refreshColumns();
+    const durationMs = Date.now() - startedAt;
+    if (durationMs >= 500) {
+      Zotero.debug(
+        `Citation Map: refreshed item-tree columns in ${durationMs} ms`,
+      );
+    }
   } catch (error) {
     Zotero.debug(`Citation Map: could not refresh columns: ${String(error)}`);
   }
 }
 
 export function unregisterCitationColumns(): void {
+  resetColumnMetricNodeCache();
   for (const [win, handler] of tooltipHandlers) {
     win.document.removeEventListener("mouseover", handler, true);
     uninstallDataSourceHoverTooltips(win.document);

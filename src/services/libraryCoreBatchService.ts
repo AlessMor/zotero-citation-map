@@ -257,7 +257,7 @@ async function resolveProviderBatches(
           `batch ${completedBatches}/${batches.length}`,
       });
     },
-    { yieldAfterEach: true },
+    { yieldAfterEach: true, yieldDelayMs: 8 },
   );
 }
 
@@ -381,7 +381,7 @@ export async function resolveLibraryCoreLookups(
         message: `Resolving unmatched papers · ${pending.length - unresolved.size}/${pending.length}`,
       });
     },
-    { yieldAfterEach: true },
+    { yieldAfterEach: true, yieldDelayMs: 8 },
   );
 
   return {

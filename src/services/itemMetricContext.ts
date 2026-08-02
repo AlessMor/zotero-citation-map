@@ -1,10 +1,14 @@
 import type { CitationGraphNode } from "../domain/graphTypes";
-import { getItemCitationAnalytics } from "./citationAnalyticsService";
+import { getCachedItemCitationAnalytics } from "./citationAnalyticsService";
 import {
   getCitationMetricRecord,
   getItemCitationMetrics,
 } from "./citationMetricsStore";
 import { calculateItemMetadataCompleteness } from "./zoteroLibraryService";
+import {
+  getStoredRelationshipSummary,
+  getStoredRelationshipWorks,
+} from "./relationshipStoreService";
 
 function getYear(item: Zotero.Item): number | null {
   const match = String(item.getField?.("date") ?? "").match(
@@ -24,21 +28,45 @@ function getAuthors(item: Zotero.Item): string[] {
     .filter(Boolean);
 }
 
-export function createMetricNodeForItem(item: Zotero.Item): CitationGraphNode {
+export function createMetricNodeForItem(
+  item: Zotero.Item,
+  options: { includeReferences?: boolean } = {},
+): CitationGraphNode {
   const libraryID = Number(item.libraryID);
   const itemKey = String(item.key);
   const metrics = getItemCitationMetrics(libraryID, itemKey);
   const record = getCitationMetricRecord(libraryID, itemKey);
-  const analytics = getItemCitationAnalytics(libraryID, itemKey);
+  const analytics = getCachedItemCitationAnalytics(libraryID, itemKey);
+  const relationshipSubject = {
+    itemID: Number(item.id),
+    itemKey,
+    doi: record?.doi ?? null,
+    provider: record?.provider ?? null,
+    providerWorkID: record?.providerWorkID ?? null,
+    title: record?.title ?? String(item.getField?.("title") ?? ""),
+    year: record?.year ?? getYear(item),
+  };
+  const storedReferenceSummary = getStoredRelationshipSummary(
+    relationshipSubject,
+    "references",
+  );
+  const references =
+    options.includeReferences === false
+      ? []
+      : storedReferenceSummary
+        ? getStoredRelationshipWorks(relationshipSubject, "references")
+        : (record?.references ?? []);
+  const resolvedReferenceCount =
+    storedReferenceSummary?.count ?? metrics.resolvedReferenceCount;
   const referenceCount = metrics.referenceCount;
   const referenceCoverage =
     referenceCount === null
       ? null
       : referenceCount === 0
-        ? metrics.resolvedReferenceCount === 0
+        ? resolvedReferenceCount === 0
           ? 1
           : null
-        : metrics.resolvedReferenceCount / referenceCount;
+        : resolvedReferenceCount / referenceCount;
 
   return {
     key: itemKey,
@@ -68,7 +96,7 @@ export function createMetricNodeForItem(item: Zotero.Item): CitationGraphNode {
       .filter(Number.isFinite),
     citationCount: metrics.citationCount,
     referenceCount,
-    resolvedReferenceCount: metrics.resolvedReferenceCount,
+    resolvedReferenceCount,
     referenceCoverage,
     metricsUpdatedAt: metrics.updatedAt,
     dataAgeDays: metrics.dataAgeDays,
@@ -103,6 +131,6 @@ export function createMetricNodeForItem(item: Zotero.Item): CitationGraphNode {
     referenceAgeSpread: analytics?.referenceAgeSpread ?? null,
     selfCitationEstimate: analytics?.selfCitationEstimate ?? null,
     futureReferenceCount: analytics?.futureReferenceCount ?? null,
-    references: record?.references ?? [],
+    references,
   };
 }

@@ -21,7 +21,17 @@ import type {
   GraphLayoutOptions,
 } from "../domain/graphTypes";
 import type { LibrarySnapshot, ZoteroPaper } from "../domain/types";
-import { buildCitationGraph } from "./citationGraphService";
+import {
+  buildCitationGraph,
+  getCitationGraphSnapshot,
+  warmLocalCitationRelations,
+} from "./citationGraphService";
+import {
+  applyCitationGraphDelta,
+  cloneCitationGraphModel,
+  createCitationGraphIndex,
+  invalidateCitationGraphSnapshot,
+} from "./graphSnapshotStore";
 import {
   CitationGraphRenderer,
   type GraphViewTransform,
@@ -130,6 +140,14 @@ import {
   type GraphFocusState,
 } from "./graphFocusService";
 import {
+  focusProjectionCacheKey,
+  getCachedFocusProjection,
+  getFocusRelationshipFragment,
+  invalidateFocusRelationshipFragment,
+  setCachedFocusProjection,
+  setFocusRelationshipFragment,
+} from "./focusGraphCacheService";
+import {
   getDetailPanelCollapsed,
   getDetailPanelWidth,
   getFocusGraphAppearance,
@@ -163,6 +181,10 @@ export interface CitationMapViewController {
 }
 
 const FOCUS_RELATIONSHIP_CACHE_LIMIT = 200;
+const RELATIONSHIP_CARD_BATCH_SIZE = 36;
+const RELATIONSHIP_FILTER_DEBOUNCE_MS = 120;
+const LIBRARY_SEARCH_DEBOUNCE_MS = 180;
+const LOCAL_CITATION_WARMUP_DELAY_MS = 1200;
 const AUTOMATIC_FOCUS_REFRESH = automaticFocusSeedRefreshPlan();
 const cleanupByMount = new WeakMap<Element, () => void>();
 const controllerByMount = new WeakMap<Element, CitationMapViewController>();
@@ -328,11 +350,21 @@ export function renderCitationMapView(
   destroyCitationMapView(mount);
   ensureStyles(document);
   clear(mount);
-  const model = buildCitationGraph(snapshot);
-  const libraryModel = {
-    nodes: [...model.nodes],
-    edges: [...model.edges],
-    statistics: { ...model.statistics },
+  const sharedGraphSnapshot = getCitationGraphSnapshot(snapshot);
+  const libraryModel = cloneCitationGraphModel(sharedGraphSnapshot.model);
+  const model = {
+    nodes: [...libraryModel.nodes],
+    edges: [...libraryModel.edges],
+    statistics: { ...libraryModel.statistics },
+  };
+  let libraryGraphIndex = sharedGraphSnapshot.index;
+  let libraryGraphRevision = sharedGraphSnapshot.signature;
+  let libraryGraphRevisionCounter = 0;
+  const markLibraryGraphChanged = (invalidateShared = true): void => {
+    libraryGraphIndex = createCitationGraphIndex(libraryModel);
+    libraryGraphRevisionCounter += 1;
+    libraryGraphRevision = `${sharedGraphSnapshot.signature}:local:${libraryGraphRevisionCounter}`;
+    if (invalidateShared) invalidateCitationGraphSnapshot(snapshot.libraryID);
   };
   const paperByKey = localPaperByKey(snapshot);
   const visuals = buildCollectionVisuals(snapshot, model.nodes);
@@ -365,6 +397,12 @@ export function renderCitationMapView(
   let focusRebuildFrame = 0;
   const focusBack: GraphFocusState[] = [];
   const focusForward: GraphFocusState[] = [];
+  const mapSelectionBack: Array<string | null> = [];
+  const mapSelectionForward: Array<string | null> = [];
+  let focusReturnState: GraphFocusState | null = null;
+  let focusReturnForward: GraphFocusState[] = [];
+  let librarySelectedKeyBeforeFocus: string | null = null;
+  let suppressSelectionHistory = false;
   let activeRelationshipView: {
     itemKey: string;
     direction: "references" | "cited-by";
@@ -409,12 +447,28 @@ export function renderCitationMapView(
   const header = element(document, "header", "cm-header");
   const identity = element(document, "div", "cm-header-identity");
   const titleRow = element(document, "div", "cm-title-row");
+  const historyControls = element(document, "div", "cm-history-controls");
+  const historyBackButton = element(document, "button", "cm-secondary-button");
+  historyBackButton.type = "button";
+  historyBackButton.textContent = "←";
+  historyBackButton.title = "Go back";
+  historyBackButton.setAttribute("aria-label", "Go back");
+  const historyForwardButton = element(
+    document,
+    "button",
+    "cm-secondary-button",
+  );
+  historyForwardButton.type = "button";
+  historyForwardButton.textContent = "→";
+  historyForwardButton.title = "Go forward";
+  historyForwardButton.setAttribute("aria-label", "Go forward");
+  historyControls.append(historyBackButton, historyForwardButton);
   const viewTitle = text(
     document,
     "h1",
     currentViewKind === "focus" ? "Focus View" : "Citation Map",
   );
-  titleRow.append(networkLogo(document), viewTitle);
+  titleRow.append(historyControls, networkLogo(document), viewTitle);
   const summary = text(
     document,
     "p",
@@ -574,22 +628,56 @@ export function renderCitationMapView(
     currentViewKind = kind;
     root.dataset.viewKind = kind;
     viewTitle.textContent = kind === "focus" ? "Focus View" : "Citation Map";
+    refreshButton.title =
+      kind === "focus"
+        ? "Refresh references and citing papers for the current Focus seeds."
+        : "Refresh metadata and citation counts for the currently visible papers.";
+    if (kind === "map") {
+      refreshButton.removeAttribute("aria-busy");
+      refreshButton.disabled = false;
+    }
     if (changed && notify) options.onViewKindChange?.(kind);
   };
 
   const focusBar = element(document, "section", "cm-focus-bar");
   focusBar.hidden = true;
-  const focusBackButton = element(document, "button", "cm-secondary-button");
-  focusBackButton.type = "button";
-  focusBackButton.textContent = "←";
-  focusBackButton.title = "Previous focus";
-  const focusForwardButton = element(document, "button", "cm-secondary-button");
-  focusForwardButton.type = "button";
-  focusForwardButton.textContent = "→";
-  focusForwardButton.title = "Next focus";
-  const focusLabel = text(document, "strong", "Focus");
-  focusLabel.className = "cm-focus-label";
-  const focusSeedsHost = element(document, "div", "cm-focus-seeds");
+  const focusSeedMenu = element(
+    document,
+    "div",
+    "cm-focus-seed-menu cm-menu-wrapper",
+  );
+  const focusSeedButton = element(document, "button", "cm-focus-seed-button");
+  focusSeedButton.type = "button";
+  focusSeedButton.setAttribute("aria-haspopup", "dialog");
+  focusSeedButton.setAttribute("aria-expanded", "false");
+  const focusSeedButtonLabel = text(document, "span", "0 seeds");
+  const focusSeedButtonChevron = text(
+    document,
+    "span",
+    "▾",
+    "cm-focus-seed-chevron",
+  );
+  focusSeedButtonChevron.setAttribute("aria-hidden", "true");
+  focusSeedButton.append(focusSeedButtonLabel, focusSeedButtonChevron);
+  const focusSeedPopover = element(document, "div", "cm-focus-seed-popover");
+  focusSeedPopover.hidden = true;
+  focusSeedPopover.setAttribute("role", "dialog");
+  focusSeedPopover.setAttribute("aria-label", "Focus seeds");
+  const focusSeedSearchWrap = element(
+    document,
+    "label",
+    "cm-focus-seed-search-wrap",
+  );
+  focusSeedSearchWrap.appendChild(icon(document, "search"));
+  const focusSeedSearch = element(document, "input", "cm-focus-seed-search");
+  focusSeedSearch.type = "search";
+  focusSeedSearch.placeholder = "Search seeds";
+  focusSeedSearch.setAttribute("aria-label", "Search Focus seeds");
+  focusSeedSearchWrap.appendChild(focusSeedSearch);
+  const focusSeedResults = element(document, "div", "cm-focus-seed-results");
+  focusSeedResults.setAttribute("role", "list");
+  focusSeedPopover.append(focusSeedSearchWrap, focusSeedResults);
+  focusSeedMenu.append(focusSeedButton, focusSeedPopover);
   const focusDirection = element(document, "select", "cm-select");
   for (const [value, label] of [
     ["both", "References + cited by"],
@@ -631,25 +719,12 @@ export function renderCitationMapView(
     if (value === 25) option.selected = true;
     focusLimit.appendChild(option);
   }
-  const focusRefreshButton = element(document, "button", "cm-secondary-button");
-  focusRefreshButton.type = "button";
-  focusRefreshButton.textContent = "Update connections";
-  focusRefreshButton.title =
-    "Fetch fresh references and citing papers again. New Focus seeds are updated automatically in the background.";
-  const focusExitButton = element(document, "button", "cm-secondary-button");
-  focusExitButton.type = "button";
-  focusExitButton.textContent = "Back to library map";
   focusBar.append(
-    focusBackButton,
-    focusForwardButton,
-    focusLabel,
-    focusSeedsHost,
+    focusSeedMenu,
     focusDirection,
     focusLocality,
     focusRanking,
     focusLimit,
-    focusRefreshButton,
-    focusExitButton,
   );
   root.appendChild(focusBar);
 
@@ -827,6 +902,7 @@ export function renderCitationMapView(
     snapshot.papers.map((paper) => [paper.itemID, paper]),
   );
   let librarySearchGeneration = 0;
+  let librarySearchTimer: number | null = null;
 
   const closeAddNodePopup = (): void => {
     addNodePopup.hidden = true;
@@ -1024,7 +1100,38 @@ export function renderCitationMapView(
     document.defaultView?.setTimeout(() => addNodeSearch.focus(), 0);
   });
   addNodeSearch.addEventListener("input", () => {
-    void renderLibrarySearchResults();
+    librarySearchGeneration += 1;
+    if (librarySearchTimer !== null) {
+      if (document.defaultView) {
+        document.defaultView.clearTimeout(librarySearchTimer);
+      } else {
+        clearTimeout(librarySearchTimer);
+      }
+      librarySearchTimer = null;
+    }
+    const query = addNodeSearch.value.trim();
+    clear(addNodeResults);
+    if (!query) {
+      addNodeResults.appendChild(
+        text(
+          document,
+          "p",
+          "Search by title, creator, publication title, year, or citation key.",
+          "cm-placeholder",
+        ),
+      );
+      return;
+    }
+    addNodeResults.appendChild(
+      text(document, "p", "Searching library…", "cm-placeholder"),
+    );
+    const run = (): void => {
+      librarySearchTimer = null;
+      void renderLibrarySearchResults();
+    };
+    librarySearchTimer = document.defaultView
+      ? document.defaultView.setTimeout(run, LIBRARY_SEARCH_DEBOUNCE_MS)
+      : (setTimeout(run, LIBRARY_SEARCH_DEBOUNCE_MS) as unknown as number);
   });
   addSelectedButton.addEventListener("click", () => {
     const itemIDs = [...selectedLibraryItemIDs];
@@ -1109,11 +1216,23 @@ export function renderCitationMapView(
     };
   };
 
+  const cacheFocusRelationships = (
+    seedKey: string,
+    relationships: { references: ExternalWork[]; citedBy: ExternalWork[] },
+  ): void => {
+    setFocusRelationshipFragment(snapshot.libraryID, seedKey, relationships);
+  };
+
   const ensureFocusRelationships = (
     seed: CitationGraphNode,
   ): { references: ExternalWork[]; citedBy: ExternalWork[] } => {
     const existing = focusRelationships.get(seed.key);
     if (existing) return existing;
+    const shared = getFocusRelationshipFragment(snapshot.libraryID, seed.key);
+    if (shared) {
+      focusRelationships.set(seed.key, shared);
+      return shared;
+    }
     const graph = seedRelationshipGraph(seed);
     const cachedReferences = getRelationshipViewSnapshot(
       graph,
@@ -1145,6 +1264,7 @@ export function renderCitationMapView(
       ).works,
     };
     focusRelationships.set(seed.key, relationships);
+    cacheFocusRelationships(seed.key, relationships);
     return relationships;
   };
 
@@ -1210,6 +1330,7 @@ export function renderCitationMapView(
           relationships.references,
           embedded,
         ) as ExternalWork[];
+        cacheFocusRelationships(seed.key, relationships);
       }
       scheduleFocusRebuild();
     }
@@ -1218,42 +1339,141 @@ export function renderCitationMapView(
 
   let removeFocusSeed = (_key: string): void => undefined;
 
-  const updateFocusBar = (): void => {
-    focusBar.hidden = !focusProjection;
-    clear(focusSeedsHost);
+  const updateNavigationButtons = (): void => {
+    historyBackButton.disabled = focusProjection
+      ? false
+      : mapSelectionBack.length === 0;
+    historyForwardButton.disabled = focusProjection
+      ? focusForward.length === 0
+      : mapSelectionForward.length === 0 && focusReturnState === null;
+  };
+
+  const closeFocusSeedPopover = (restoreFocus = false): void => {
+    focusSeedPopover.hidden = true;
+    focusSeedButton.setAttribute("aria-expanded", "false");
+    focusSeedSearch.value = "";
+    clear(focusSeedResults);
+    if (restoreFocus) focusSeedButton.focus();
+  };
+
+  const renderFocusSeedResults = (): void => {
+    clear(focusSeedResults);
     if (!focusProjection) return;
-    const primarySeed = focusProjection.seeds[0];
-    focusLabel.textContent =
-      focusProjection.seeds.length === 1
-        ? `Focus: ${primarySeed.title}`
-        : `Focus: ${focusProjection.seeds.length} seeds`;
-    for (const seed of focusProjection.seeds) {
-      const chip = element(document, "span", "cm-focus-seed-chip");
-      chip.title = seed.title;
-      chip.appendChild(
-        text(
-          document,
-          "span",
-          seed.title.length > 42 ? `${seed.title.slice(0, 39)}…` : seed.title,
-        ),
+    const query = normalizeSearch(focusSeedSearch.value.trim());
+    const matches = focusProjection.seeds.filter((seed) => {
+      if (!query) return true;
+      return normalizeSearch(
+        [
+          seed.title,
+          seed.authors.join(" "),
+          seed.year ?? "",
+          seed.sourceTitle ?? "",
+          seed.doi ?? "",
+        ].join(" "),
+      ).includes(query);
+    });
+    if (!matches.length) {
+      focusSeedResults.appendChild(
+        text(document, "p", "No matching seeds.", "cm-placeholder"),
       );
+      return;
+    }
+    for (const seed of matches) {
+      const row = element(document, "div", "cm-focus-seed-result");
+      row.setAttribute("role", "listitem");
+      const select = element(document, "button", "cm-focus-seed-result-main");
+      select.type = "button";
+      select.title = `Select ${seed.title} in the graph`;
+      const title = text(
+        document,
+        "span",
+        seed.title || "Untitled paper",
+        "cm-focus-seed-result-title",
+      );
+      const metadata = [
+        seed.authors.slice(0, 2).join(", "),
+        seed.year === null ? "" : String(seed.year),
+        seed.sourceTitle ?? "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      select.append(title);
+      if (metadata) {
+        select.append(
+          text(document, "span", metadata, "cm-focus-seed-result-meta"),
+        );
+      }
+      select.addEventListener("click", () => {
+        renderer?.selectNode(seed.key, false);
+        closeFocusSeedPopover();
+      });
+      row.appendChild(select);
       if (focusProjection.seeds.length > 1) {
-        const remove = element(document, "button");
+        const remove = element(
+          document,
+          "button",
+          "cm-focus-seed-result-remove",
+        );
         remove.type = "button";
         remove.textContent = "×";
         remove.title = `Remove ${seed.title} from Focus View`;
-        remove.addEventListener("click", () => removeFocusSeed(seed.key));
-        chip.appendChild(remove);
+        remove.setAttribute("aria-label", remove.title);
+        remove.addEventListener("click", (event) => {
+          event.stopPropagation();
+          removeFocusSeed(seed.key);
+        });
+        row.appendChild(remove);
       }
-      focusSeedsHost.appendChild(chip);
+      focusSeedResults.appendChild(row);
     }
+  };
+
+  const updateFocusBar = (): void => {
+    focusBar.hidden = !focusProjection;
+    if (!focusProjection) {
+      closeFocusSeedPopover();
+      updateNavigationButtons();
+      return;
+    }
+    focusSeedButtonLabel.textContent = `${focusProjection.seeds.length} seed${
+      focusProjection.seeds.length === 1 ? "" : "s"
+    }`;
+    focusSeedButton.title = `Show ${focusProjection.seeds.length} Focus seed${
+      focusProjection.seeds.length === 1 ? "" : "s"
+    }`;
+    if (!focusSeedPopover.hidden) renderFocusSeedResults();
     focusDirection.value = focusProjection.state.direction;
     focusLocality.value = focusProjection.state.locality;
     focusRanking.value = focusProjection.state.ranking;
     focusLimit.value = String(focusProjection.state.maxPerDirection);
-    focusBackButton.disabled = focusBack.length === 0;
-    focusForwardButton.disabled = focusForward.length === 0;
+    updateNavigationButtons();
   };
+
+  focusSeedButton.addEventListener("click", () => {
+    const opening = focusSeedPopover.hidden;
+    focusSeedPopover.hidden = !opening;
+    focusSeedButton.setAttribute("aria-expanded", String(opening));
+    if (!opening) return;
+    renderFocusSeedResults();
+    document.defaultView?.setTimeout(() => focusSeedSearch.focus(), 0);
+  });
+  focusSeedSearch.addEventListener("input", renderFocusSeedResults);
+  const closeFocusSeedPopoverOnOutsidePointer = (event: Event): void => {
+    if (focusSeedPopover.hidden) return;
+    const target = event.target as Node | null;
+    if (target && focusSeedMenu.contains(target)) return;
+    closeFocusSeedPopover();
+  };
+  const closeFocusSeedPopoverOnEscape = (event: KeyboardEvent): void => {
+    if (event.key !== "Escape" || focusSeedPopover.hidden) return;
+    closeFocusSeedPopover(true);
+  };
+  document.addEventListener(
+    "pointerdown",
+    closeFocusSeedPopoverOnOutsidePointer,
+    true,
+  );
+  document.addEventListener("keydown", closeFocusSeedPopoverOnEscape, true);
 
   const applyFocusProjection = (
     projection: GraphFocusProjection,
@@ -1300,12 +1520,26 @@ export function renderCitationMapView(
   ): GraphFocusProjection | null => {
     const seeds = seedsForState(state);
     for (const seed of seeds) ensureFocusRelationships(seed);
-    return buildGraphFocusProjection({
+    const normalizedState = {
+      ...state,
+      seedKeys: seeds.map((seed) => seed.key),
+    };
+    const cacheKey = focusProjectionCacheKey(
+      snapshot.libraryID,
+      libraryGraphRevision,
+      normalizedState,
+    );
+    const cached = getCachedFocusProjection(cacheKey);
+    if (cached) return cached;
+    const projection = buildGraphFocusProjection({
       graph: libraryModel,
-      state: { ...state, seedKeys: seeds.map((seed) => seed.key) },
+      index: libraryGraphIndex,
+      state: normalizedState,
       seeds,
       relationships: focusRelationships,
     });
+    if (projection) setCachedFocusProjection(cacheKey, projection);
+    return projection;
   };
 
   const rebuildCurrentFocus = (options: { fit?: boolean } = {}): boolean => {
@@ -1358,10 +1592,12 @@ export function renderCitationMapView(
 
   const updateFocusRefreshState = (): void => {
     focusLoadActive = focusRefreshCount > 0;
-    focusRefreshButton.disabled = focusLoadActive;
-    focusRefreshButton.textContent = focusLoadActive
-      ? `Updating ${focusRefreshCount} seed${focusRefreshCount === 1 ? "" : "s"}…`
-      : "Update connections";
+    if (!focusProjection) return;
+    refreshButton.disabled = focusLoadActive;
+    refreshButton.title = focusLoadActive
+      ? `Updating connections for ${focusRefreshCount} seed${focusRefreshCount === 1 ? "" : "s"}…`
+      : "Refresh references and citing papers for the current Focus seeds.";
+    refreshButton.setAttribute("aria-busy", String(focusLoadActive));
   };
 
   const scheduleFocusTask = (callback: () => void, delay = 0): number =>
@@ -1416,10 +1652,6 @@ export function renderCitationMapView(
         for (const direction of directions) {
           if (cleaned || epoch !== focusRefreshEpoch) return;
           try {
-            const metadataLimit = Math.max(
-              1,
-              focusProjection?.state.maxPerDirection ?? 25,
-            );
             await refreshExternalRelationships(
               seed,
               libraryModel.nodes,
@@ -1448,14 +1680,11 @@ export function renderCitationMapView(
                           : {},
                     }
                   : {}),
-                // Automatic seed refresh publishes membership immediately and
-                // defers all optional summary hydration. Manual refreshes may
-                // still hydrate the currently visible papers before completing.
-                metadataHydrationLimit:
-                  mode === "automatic"
-                    ? AUTOMATIC_FOCUS_REFRESH.foregroundMetadataLimit
-                    : metadataLimit,
-                ...(mode === "automatic" ? { summaryLookupLimit: 0 } : {}),
+                // Focus refreshes need membership and counts first. Optional
+                // summaries are hydrated cooperatively after the graph is
+                // usable, avoiding a long foreground pause.
+                metadataHydrationLimit: 0,
+                summaryLookupLimit: 0,
                 onMembershipResolved: (resolution) => {
                   if (cleaned || epoch !== focusRefreshEpoch) return;
                   if (resolution.reportedCount !== null) {
@@ -1479,6 +1708,7 @@ export function renderCitationMapView(
                   } else {
                     relationships.citedBy = published;
                   }
+                  cacheFocusRelationships(seed.key, relationships);
                   scheduleFocusRebuild();
                 },
                 onMetadataHydrated: () => {
@@ -1508,6 +1738,7 @@ export function renderCitationMapView(
             } else {
               relationships.citedBy = refreshed;
             }
+            cacheFocusRelationships(seed.key, relationships);
           } catch (error) {
             Zotero.logError(
               error instanceof Error ? error : new Error(String(error)),
@@ -1559,7 +1790,7 @@ export function renderCitationMapView(
 
   const queueAutomaticFocusConnectionUpdate = (
     seed: CitationGraphNode,
-    forceRefresh = AUTOMATIC_FOCUS_REFRESH.forceRefresh,
+    forceRefresh: boolean = AUTOMATIC_FOCUS_REFRESH.forceRefresh,
     fitAfterRefresh = false,
   ): void => {
     if (fitAfterRefresh) focusPostRefreshFitSeeds.add(seed.key);
@@ -1614,6 +1845,12 @@ export function renderCitationMapView(
     const enteringFromLibrary = !focusProjection;
     if (!enteringFromLibrary) resetFocusRefreshTracking();
     if (enteringFromLibrary) {
+      librarySelectedKeyBeforeFocus = selectedNode?.key ?? null;
+      if (options.pushHistory !== false) {
+        focusReturnState = null;
+        focusReturnForward = [];
+        mapSelectionForward.splice(0);
+      }
       libraryLayoutBeforeFocus = { ...currentLayout };
       libraryViewBeforeFocus = renderer?.getViewTransform() ?? null;
       libraryCollectionFilterBeforeFocus = graphFilter.state().collectionID;
@@ -1627,6 +1864,7 @@ export function renderCitationMapView(
     if (focusProjection && options.pushHistory !== false) {
       focusBack.push(cloneFocusState(focusProjection.state));
       focusForward.splice(0);
+      updateNavigationButtons();
     }
     const state = options.state ?? {
       seedKeys: seeds.map((seed) => seed.key),
@@ -1665,7 +1903,7 @@ export function renderCitationMapView(
     }
     scheduleFocusFit();
     for (const seed of seeds) {
-      queueAutomaticFocusConnectionUpdate(seed, true, true);
+      queueAutomaticFocusConnectionUpdate(seed, false, true);
     }
     return true;
   };
@@ -1697,6 +1935,7 @@ export function renderCitationMapView(
 
     focusBack.push(cloneFocusState(focusProjection.state));
     focusForward.splice(0);
+    updateNavigationButtons();
     for (const seed of missingSeeds) ensureFocusRelationships(seed);
     const state = focusStateFromControls(
       appendUniqueCitationMapKeys(
@@ -1713,7 +1952,7 @@ export function renderCitationMapView(
       return false;
     }
     for (const seed of missingSeeds) {
-      queueAutomaticFocusConnectionUpdate(seed, true, true);
+      queueAutomaticFocusConnectionUpdate(seed, false, true);
     }
     return true;
   };
@@ -1732,6 +1971,7 @@ export function renderCitationMapView(
     }
     focusBack.push(cloneFocusState(focusProjection.state));
     focusForward.splice(0);
+    updateNavigationButtons();
     activateFocusState(focusStateFromControls(remaining), { fit: true });
   };
 
@@ -1752,6 +1992,7 @@ export function renderCitationMapView(
     libraryModel.nodes.splice(0, libraryModel.nodes.length, ...next.nodes);
     libraryModel.edges.splice(0, libraryModel.edges.length, ...next.edges);
     Object.assign(libraryModel.statistics, next.statistics);
+    markLibraryGraphChanged(false);
     if (focusProjection) {
       rebuildCurrentFocus();
       return;
@@ -1764,10 +2005,12 @@ export function renderCitationMapView(
     applyFilters();
   };
 
-  const exitFocus = (): void => {
+  const exitFocus = (options: { preserveFocusReturn?: boolean } = {}): void => {
     resetFocusRefreshTracking();
     focusProjection = null;
     setViewKind("map");
+    if (!options.preserveFocusReturn) focusReturnState = null;
+    if (!options.preserveFocusReturn) focusReturnForward = [];
     focusRelationships.clear();
     focusSeedRegistry.clear();
     focusBack.splice(0);
@@ -1782,25 +2025,42 @@ export function renderCitationMapView(
     const restoreLayout = libraryLayoutBeforeFocus;
     const restoreView = libraryViewBeforeFocus;
     const restoreCollectionFilter = libraryCollectionFilterBeforeFocus;
+    const restoreSelectedKey = librarySelectedKeyBeforeFocus;
     libraryLayoutBeforeFocus = null;
     libraryViewBeforeFocus = null;
     libraryCollectionFilterBeforeFocus = undefined;
+    librarySelectedKeyBeforeFocus = null;
     if (restoreLayout) appearance.setLayout(restoreLayout, false);
     if (restoreCollectionFilter !== undefined) {
       graphFilter.setCollectionID(restoreCollectionFilter);
     }
     updateFocusBar();
     applyFilters();
+    const restoreSelection = (): void => {
+      const node = restoreSelectedKey
+        ? model.nodes.find((candidate) => candidate.key === restoreSelectedKey)
+        : null;
+      suppressSelectionHistory = true;
+      if (node) renderer?.selectNode(node.key, false);
+      else renderer?.clearSelection();
+      suppressSelectionHistory = false;
+      updateNavigationButtons();
+    };
     if (restoreView) {
       scheduleCameraAction(() => {
-        if (!focusProjection) renderer?.setViewTransform(restoreView);
+        if (!focusProjection) {
+          renderer?.setViewTransform(restoreView);
+          restoreSelection();
+        }
       });
-    } else if (!restoreLayout) {
-      scheduleCameraAction(() => {
-        if (!focusProjection) renderer?.fitView();
-      });
+    } else {
+      restoreSelection();
+      if (!restoreLayout) {
+        scheduleCameraAction(() => {
+          if (!focusProjection) renderer?.fitView();
+        });
+      }
     }
-    renderOverview(null);
   };
 
   const relationshipPublicationStateForNode = (
@@ -1935,6 +2195,7 @@ export function renderCitationMapView(
         ) {
           list.push(event.work);
         }
+        cacheFocusRelationships(seed.key, relationships);
         shouldRebuildFocus = true;
       }
     }
@@ -1968,7 +2229,25 @@ export function renderCitationMapView(
       }
     };
     mutate(model.edges);
-    if (localRelatedKey) mutate(libraryModel.edges);
+    if (localRelatedKey) {
+      mutate(libraryModel.edges);
+      const relation = {
+        key: `${source}>${target}`,
+        source,
+        target,
+        provenance: event.work.provider,
+        manual: false,
+      };
+      applyCitationGraphDelta(
+        snapshot.libraryID,
+        event.ignored
+          ? { removedEdges: [{ source, target }] }
+          : { addedEdges: [relation] },
+      );
+      markLibraryGraphChanged(false);
+    } else {
+      invalidateCitationGraphSnapshot(snapshot.libraryID);
+    }
     renderer?.setRelationshipHidden(source, target, event.ignored);
     model.statistics.edges = model.edges.length;
     libraryModel.statistics.edges = libraryModel.edges.length;
@@ -2066,6 +2345,14 @@ export function renderCitationMapView(
   const applyRelationshipPublication = (
     event: RelationshipPublicationEvent,
   ): void => {
+    if (event.phase === "membership-published") {
+      invalidateCitationGraphSnapshot(event.libraryID);
+    } else if (event.phase === "metadata-published") {
+      invalidateFocusRelationshipFragment(
+        event.libraryID,
+        event.subjectItemKey,
+      );
+    }
     const affected = nodesForRelationshipPublication(event);
     if (!affected.length) return;
     for (const node of affected) {
@@ -2091,6 +2378,7 @@ export function renderCitationMapView(
         } else {
           relationships.citedBy = published;
         }
+        cacheFocusRelationships(subject.key, relationships);
         scheduleFocusRebuild();
       } else {
         scheduleRelationshipGraphRefresh();
@@ -2205,54 +2493,61 @@ export function renderCitationMapView(
         const add = element(document, "button", "cm-primary-button");
         add.type = "button";
         add.textContent = "Add to Zotero";
-        const importArea = element(document, "div", "cm-import-area");
-        importArea.hidden = true;
-        const chooser = createCollectionChooser(document, snapshot);
-        const confirm = element(document, "button", "cm-primary-button");
-        confirm.type = "button";
-        confirm.textContent = "Add paper";
-        const cancel = element(document, "button", "cm-secondary-button");
-        cancel.type = "button";
-        cancel.textContent = "Cancel";
-        confirm.addEventListener("click", async () => {
-          confirm.disabled = true;
-          confirm.textContent = "Adding…";
-          try {
-            const items = await importExternalWork(work, snapshot.libraryID, [
-              ...chooser.selected,
-            ]);
-            const imported = items[0];
-            if (!imported) throw new Error("No item was imported.");
-            work.inLibraryItemKey = String(imported.key);
-            importArea.replaceChildren(
-              text(document, "p", "Added to Zotero.", "cm-success"),
-            );
-            add.remove();
-          } catch (error) {
-            Zotero.logError(
-              error instanceof Error ? error : new Error(String(error)),
-            );
-            confirm.disabled = false;
-            confirm.textContent = "Import failed — try again";
-          }
-        });
-        cancel.addEventListener("click", () => {
-          importArea.hidden = true;
-          add.hidden = false;
-        });
-        const buttons = element(document, "div", "cm-detail-actions");
-        buttons.append(cancel, confirm);
-        importArea.append(
-          text(document, "h4", "Choose collections"),
-          chooser.root,
-          buttons,
-        );
+        let importArea: HTMLDivElement | null = null;
+        const ensureImportArea = (): HTMLDivElement => {
+          if (importArea) return importArea;
+          const area = element(document, "div", "cm-import-area");
+          const chooser = createCollectionChooser(document, snapshot);
+          const confirm = element(document, "button", "cm-primary-button");
+          confirm.type = "button";
+          confirm.textContent = "Add paper";
+          const cancel = element(document, "button", "cm-secondary-button");
+          cancel.type = "button";
+          cancel.textContent = "Cancel";
+          confirm.addEventListener("click", async () => {
+            confirm.disabled = true;
+            confirm.textContent = "Adding…";
+            try {
+              const items = await importExternalWork(work, snapshot.libraryID, [
+                ...chooser.selected,
+              ]);
+              const imported = items[0];
+              if (!imported) throw new Error("No item was imported.");
+              work.inLibraryItemKey = String(imported.key);
+              area.replaceChildren(
+                text(document, "p", "Added to Zotero.", "cm-success"),
+              );
+              add.remove();
+            } catch (error) {
+              Zotero.logError(
+                error instanceof Error ? error : new Error(String(error)),
+              );
+              confirm.disabled = false;
+              confirm.textContent = "Import failed — try again";
+            }
+          });
+          cancel.addEventListener("click", () => {
+            area.hidden = true;
+            add.hidden = false;
+          });
+          const buttons = element(document, "div", "cm-detail-actions");
+          buttons.append(cancel, confirm);
+          area.append(
+            text(document, "h4", "Choose collections"),
+            chooser.root,
+            buttons,
+          );
+          area.hidden = true;
+          importArea = area;
+          card.insertBefore(area, identityRow);
+          return area;
+        };
         add.addEventListener("click", () => {
+          const area = ensureImportArea();
           add.hidden = true;
-          importArea.hidden = false;
+          area.hidden = false;
         });
         actionButtons.appendChild(add);
-        card.appendChild(importArea);
       }
 
       const focusNode = focusNodeForWork(work);
@@ -2634,7 +2929,36 @@ export function renderCitationMapView(
               ?.references ?? [],
           )
         : undefined;
+    const listHost = element(document, "div");
     let renderList = (): void => undefined;
+    let relationshipRenderTimer = 0;
+    const scheduleRelationshipListRender = (): void => {
+      if (relationshipRenderTimer) {
+        if (document.defaultView) {
+          document.defaultView.clearTimeout(relationshipRenderTimer);
+        } else {
+          clearTimeout(relationshipRenderTimer);
+        }
+      }
+      const run = (): void => {
+        relationshipRenderTimer = 0;
+        if (
+          cleaned ||
+          !listHost.isConnected ||
+          activeRelationshipView?.itemKey !== node.itemKey ||
+          activeRelationshipView.direction !== direction
+        ) {
+          return;
+        }
+        renderList();
+      };
+      relationshipRenderTimer = document.defaultView
+        ? document.defaultView.setTimeout(run, RELATIONSHIP_FILTER_DEBOUNCE_MS)
+        : (setTimeout(
+            run,
+            RELATIONSHIP_FILTER_DEBOUNCE_MS,
+          ) as unknown as number);
+    };
 
     const controls = element(document, "div", "cm-relationship-controls");
     Object.assign(controls.style, {
@@ -2653,7 +2977,7 @@ export function renderCitationMapView(
       collections: snapshot.collections,
       buttonClassName: "cm-secondary-button",
       inputClassName: "cm-search",
-      onChange: () => renderList(),
+      onChange: scheduleRelationshipListRender,
     });
     toolbar.searchInput.style.maxWidth = "none";
 
@@ -2682,9 +3006,10 @@ export function renderCitationMapView(
 
     const synchronizeGraph = (changes: ManualRelationshipChange[]): void => {
       if (!changes.length) return;
+      invalidateCitationGraphSnapshot(snapshot.libraryID);
+      invalidateFocusRelationshipFragment(snapshot.libraryID, node.key);
       const refreshed = buildCitationGraph(snapshot);
-      model.edges.splice(0, model.edges.length, ...refreshed.edges);
-      Object.assign(model.statistics, refreshed.statistics);
+      replaceLibraryGraph(refreshed);
       renderer?.setLayout(renderer.getLayout());
       updateSummary();
     };
@@ -2731,7 +3056,6 @@ export function renderCitationMapView(
       );
       status.textContent = updateOutcome ? `${base} · ${updateOutcome}` : base;
     };
-    const listHost = element(document, "div");
     detail.append(status, listHost);
 
     renderList = (): void => {
@@ -2754,20 +3078,26 @@ export function renderCitationMapView(
         descriptorCache.set(work, descriptor);
         return descriptor;
       });
-      shownCount = ordered.length;
       filtered = toolbar.hasActiveQueryOrFilters();
-      updateStatus();
       if (!ordered.length) {
+        shownCount = 0;
+        updateStatus();
         appendExternalWorkCards([], undefined, listHost);
         return;
       }
 
       const list = element(document, "div", "cm-external-list");
-      listHost.appendChild(list);
+      const loadMore = element(document, "button", "cm-secondary-button");
+      loadMore.type = "button";
+      loadMore.style.margin = "10px auto";
+      loadMore.style.display = "block";
       let index = 0;
       const appendNextBatch = (): void => {
         if (generation !== renderGeneration || !list.isConnected) return;
-        const batch = ordered.slice(index, index + 24);
+        const batch = ordered.slice(
+          index,
+          index + RELATIONSHIP_CARD_BATCH_SIZE,
+        );
         appendExternalWorkCards(
           batch.map((entry) => entry.work),
           {
@@ -2795,12 +3125,20 @@ export function renderCitationMapView(
           list,
         );
         index += batch.length;
-        if (index < ordered.length) {
-          const view = document.defaultView;
-          if (view) view.requestAnimationFrame(appendNextBatch);
-          else setTimeout(appendNextBatch, 0);
+        shownCount = index;
+        updateStatus();
+        const remaining = ordered.length - index;
+        if (remaining <= 0) {
+          loadMore.remove();
+          return;
         }
+        loadMore.textContent = `Show ${Math.min(
+          RELATIONSHIP_CARD_BATCH_SIZE,
+          remaining,
+        )} more`;
       };
+      loadMore.addEventListener("click", appendNextBatch);
+      listHost.append(list, loadMore);
       appendNextBatch();
     };
 
@@ -2890,6 +3228,7 @@ export function renderCitationMapView(
             } else {
               relationships.citedBy = works;
             }
+            cacheFocusRelationships(node.key, relationships);
             rebuildCurrentFocus();
           }
           const added = newlyRetrievedRelationshipWorkCount(
@@ -3163,6 +3502,7 @@ export function renderCitationMapView(
               snapshot.libraryID,
               RELATIONSHIP_VIEW_LIMIT,
             ).works;
+            cacheFocusRelationships(node.key, relationships);
             if (focusProjection?.seedKeys.has(node.key)) rebuildCurrentFocus();
             if (!cleaned) renderOverview(node);
           })
@@ -3185,13 +3525,19 @@ export function renderCitationMapView(
         secondaryButtonClass: "cm-secondary-button",
         doi: node.doi,
         onShowInZotero: () => selectPaper(node.itemID),
-        onOpenFocusView:
+        getOpenInActions:
           focusProjection?.seedKeys.size === 1 &&
           focusProjection.seedKeys.has(node.key)
             ? undefined
-            : () => {
-                focusOnPaper(node);
-              },
+            : () => [
+                {
+                  label: "Current Focus View",
+                  title: "Use this paper as the seed of this Focus View.",
+                  action: () => {
+                    focusOnPaper(node);
+                  },
+                },
+              ],
         onSimilar: () => loadInlineSimilarResults([node]),
         onRefresh: async () => {
           const item = Zotero.Items.get(node.itemID) as Zotero.Item | null;
@@ -3239,13 +3585,29 @@ export function renderCitationMapView(
     detail.appendChild(inlineSimilarResults);
   }
 
+  const handleGraphSelection = (node: CitationGraphNode | null): void => {
+    if (!suppressSelectionHistory && !focusProjection) {
+      const previousKey = selectedNode?.key ?? null;
+      const nextKey = node?.key ?? null;
+      if (previousKey !== nextKey) {
+        mapSelectionBack.push(previousKey);
+        if (mapSelectionBack.length > 100) mapSelectionBack.shift();
+        mapSelectionForward.splice(0);
+        focusReturnState = null;
+        focusReturnForward = [];
+      }
+    }
+    renderOverview(node);
+    updateNavigationButtons();
+  };
+
   renderer = new CitationGraphRenderer({
     canvas,
     model,
     layout: currentLayout,
     collectionColorsByNodeKey: visuals.colorsByNodeKey,
     collectionLabelsByNodeKey: visuals.labelsByNodeKey,
-    onSelectionChange: renderOverview,
+    onSelectionChange: handleGraphSelection,
     onOpenNode: (node) => {
       if (node.kind === "external" && node.externalWork) {
         const url = externalWorkURL(node.externalWork as ExternalWork);
@@ -3258,6 +3620,7 @@ export function renderCitationMapView(
   });
   renderer.setLegendVisible(appearance.getLegendVisible());
   renderOverview(null);
+  updateNavigationButtons();
   refreshSourceMetricsForLayout(currentLayout);
 
   const onGraphAreaPointerDown = (event: PointerEvent): void => {
@@ -3328,28 +3691,61 @@ export function renderCitationMapView(
       scheduleFocusRebuild();
     });
   }
-  focusExitButton.addEventListener("click", exitFocus);
-  focusRefreshButton.addEventListener("click", () => {
-    if (!focusProjection) return;
-    loadFocusConnections(focusProjection.seeds, {
-      forceRefresh: true,
-      mode: "manual",
+  const restoreMapSelection = (key: string | null): void => {
+    const node = key
+      ? (model.nodes.find((candidate) => candidate.key === key) ?? null)
+      : null;
+    suppressSelectionHistory = true;
+    if (node) renderer?.selectNode(node.key, false);
+    else renderer?.clearSelection();
+    suppressSelectionHistory = false;
+    updateNavigationButtons();
+  };
+  historyBackButton.addEventListener("click", () => {
+    if (focusProjection) {
+      const previous = focusBack.pop();
+      if (previous) {
+        focusForward.push(cloneFocusState(focusProjection.state));
+        restoreFocusState(previous);
+        updateFocusBar();
+        return;
+      }
+      focusReturnState = cloneFocusState(focusProjection.state);
+      focusReturnForward = focusForward.map(cloneFocusState);
+      exitFocus({ preserveFocusReturn: true });
+      return;
+    }
+    const previous = mapSelectionBack.pop();
+    if (previous === undefined) return;
+    mapSelectionForward.push(selectedNode?.key ?? null);
+    restoreMapSelection(previous);
+  });
+  historyForwardButton.addEventListener("click", () => {
+    if (focusProjection) {
+      const next = focusForward.pop();
+      if (!next) return;
+      focusBack.push(cloneFocusState(focusProjection.state));
+      restoreFocusState(next);
+      updateFocusBar();
+      return;
+    }
+    const nextSelection = mapSelectionForward.pop();
+    if (nextSelection !== undefined) {
+      mapSelectionBack.push(selectedNode?.key ?? null);
+      restoreMapSelection(nextSelection);
+      return;
+    }
+    const returnState = focusReturnState;
+    if (!returnState) return;
+    const returnForward = focusReturnForward.map(cloneFocusState);
+    focusReturnState = null;
+    focusReturnForward = [];
+    const seeds = seedsForState(returnState);
+    enterFocusSeeds(seeds, {
+      pushHistory: false,
+      state: returnState,
     });
-  });
-  focusBackButton.addEventListener("click", () => {
-    if (!focusProjection) return;
-    const previous = focusBack.pop();
-    if (!previous) return;
-    focusForward.push(cloneFocusState(focusProjection.state));
-    restoreFocusState(previous);
-    updateFocusBar();
-  });
-  focusForwardButton.addEventListener("click", () => {
-    if (!focusProjection) return;
-    const next = focusForward.pop();
-    if (!next) return;
-    focusBack.push(cloneFocusState(focusProjection.state));
-    restoreFocusState(next);
+    focusForward.splice(0, focusForward.length, ...returnForward);
     updateFocusBar();
   });
   similarButton.addEventListener("click", () => {
@@ -3396,6 +3792,17 @@ export function renderCitationMapView(
   });
   refreshButton.addEventListener("click", () => {
     if (refreshButton.disabled) return;
+    if (focusProjection) {
+      void loadFocusConnections(focusProjection.seeds, {
+        forceRefresh: true,
+        mode: "manual",
+      }).catch((error: unknown) => {
+        Zotero.logError(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      });
+      return;
+    }
     const visibleNodes = model.nodes.filter((node) =>
       visibleKeys.has(node.key),
     );
@@ -3562,6 +3969,7 @@ export function renderCitationMapView(
     }
     node = createMetricNodeForItem(item);
     libraryModel.nodes.push(node);
+    markLibraryGraphChanged();
     return node;
   };
 
@@ -3667,6 +4075,7 @@ export function renderCitationMapView(
           FOCUS_RELATIONSHIP_CACHE_LIMIT,
           { queueBackgroundHydration: false },
         ).works;
+        cacheFocusRelationships(seed.key, relationships);
       }
       rebuildCurrentFocus();
     } else {
@@ -3755,8 +4164,61 @@ export function renderCitationMapView(
     controller.replaceMapItems([options.initialItemID]);
   }
   updateSummary();
+  const localCitationWarmupItemIDs = [
+    ...(options.initialItemIDs ?? []),
+    ...(options.initialFocusItemIDs ?? []),
+    ...(options.initialItemID ? [options.initialItemID] : []),
+    ...(options.initialFocusItemID ? [options.initialFocusItemID] : []),
+  ].filter((itemID, index, values) => values.indexOf(itemID) === index);
+  const runLocalCitationWarmup = (): void => {
+    if (!localCitationWarmupItemIDs.length) return;
+    void warmLocalCitationRelations(snapshot, localCitationWarmupItemIDs)
+      .then((changed) => {
+        if (!changed || cleaned) return;
+        invalidateCitationGraphSnapshot(snapshot.libraryID);
+        if (!viewActive) {
+          inactiveRelationshipDirty = true;
+          return;
+        }
+        replaceLibraryGraph(buildCitationGraph(snapshot));
+        renderer?.setLayout(currentLayout);
+        updateSummary();
+      })
+      .catch((error: unknown) => {
+        Zotero.debug(
+          `Citation Map: background local-relation extraction failed: ${String(error)}`,
+        );
+      });
+  };
+  let localCitationWarmupTimer = localCitationWarmupItemIDs.length
+    ? document.defaultView
+      ? document.defaultView.setTimeout(
+          runLocalCitationWarmup,
+          LOCAL_CITATION_WARMUP_DELAY_MS,
+        )
+      : (setTimeout(
+          runLocalCitationWarmup,
+          LOCAL_CITATION_WARMUP_DELAY_MS,
+        ) as unknown as number)
+    : 0;
   const cleanup = (): void => {
     cleaned = true;
+    if (localCitationWarmupTimer) {
+      if (document.defaultView) {
+        document.defaultView.clearTimeout(localCitationWarmupTimer);
+      } else {
+        clearTimeout(localCitationWarmupTimer);
+      }
+      localCitationWarmupTimer = 0;
+    }
+    if (librarySearchTimer !== null) {
+      if (document.defaultView) {
+        document.defaultView.clearTimeout(librarySearchTimer);
+      } else {
+        clearTimeout(librarySearchTimer);
+      }
+      librarySearchTimer = null;
+    }
     resetFocusRefreshTracking(true);
     cancelCameraFrame();
     if (focusRebuildFrame) {
@@ -3784,6 +4246,16 @@ export function renderCitationMapView(
       true,
     );
     document.removeEventListener("keydown", closeAddNodePopupOnEscape, true);
+    document.removeEventListener(
+      "pointerdown",
+      closeFocusSeedPopoverOnOutsidePointer,
+      true,
+    );
+    document.removeEventListener(
+      "keydown",
+      closeFocusSeedPopoverOnEscape,
+      true,
+    );
     graphArea.removeEventListener("pointerdown", onGraphAreaPointerDown, true);
     renderer?.destroy();
     renderer = null;

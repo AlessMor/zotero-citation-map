@@ -168,6 +168,21 @@ export function getLibraryCitationAnalytics(
   return values;
 }
 
+/**
+ * Return already-computed analytics without rebuilding the complete library.
+ * Item-pane and item-tree rendering are synchronous Zotero callbacks; forcing
+ * a whole-library edge analysis from those callbacks can block navigation
+ * after a large relationship update. Stale cached values are preferable to a
+ * UI freeze and are replaced the next time an explicit graph/analytics build
+ * runs.
+ */
+export function getCachedItemCitationAnalytics(
+  libraryID: number,
+  itemKey: string,
+): CitationDerivedAnalytics | null {
+  return cache.get(libraryID)?.values.get(itemKey) ?? null;
+}
+
 export function getItemCitationAnalytics(
   libraryID: number,
   itemKey: string,

@@ -86,10 +86,15 @@ import { createCitationMapIcon } from "./uiIconService";
 import {
   buildCitationGraph,
   getCachedCitationGraph,
+  getCachedCitationGraphForSnapshot,
 } from "./citationGraphService";
 import { ensureSourceMetricsForNodes } from "./sourceMetricsService";
 import {
-  openCitationMapFocusItem,
+  getOpenCitationMapViews,
+  openCitationMapAndSelectItemsInNewTab,
+  openCitationMapAndSelectItemsInView,
+  openCitationMapFocusItemsInNewTab,
+  openCitationMapFocusItemsInView,
   refreshOpenCitationMapViews,
 } from "./windowService";
 import { loadWholeLibrary } from "./zoteroLibraryService";
@@ -252,7 +257,8 @@ async function graphNodeForItem(item: Zotero.Item): Promise<{
   snapshot: LibrarySnapshot;
 }> {
   const snapshot = await loadWholeLibrary(Number(item.libraryID));
-  const graph = buildCitationGraph(snapshot);
+  const graph =
+    getCachedCitationGraphForSnapshot(snapshot) ?? buildCitationGraph(snapshot);
   const node =
     graph.nodes.find((candidate) => candidate.itemKey === String(item.key)) ??
     createMetricNodeForItem(item);
@@ -691,7 +697,44 @@ function renderOverview(
     doi: node.doi,
     onShowInZotero: () =>
       Zotero.getActiveZoteroPane?.()?.selectItem?.(Number(item.id)),
-    onOpenFocusView: () => openCitationMapFocusItem(Number(item.id)),
+    getOpenInActions: () => {
+      const itemID = Number(item.id);
+      const hostWindow = document.defaultView as _ZoteroTypes.MainWindow;
+      const openViews = getOpenCitationMapViews(hostWindow);
+      return [
+        {
+          label: "New Citation Map",
+          title: "Open this paper in a new Citation Map tab.",
+          action: () =>
+            openCitationMapAndSelectItemsInNewTab([itemID], hostWindow),
+        },
+        {
+          label: "New Focus View",
+          title: "Open this paper as the seed of a new Focus View.",
+          action: () => openCitationMapFocusItemsInNewTab([itemID], hostWindow),
+        },
+        ...openViews.map((view, index) => ({
+          label: `${view.active ? "✓ " : ""}${view.title}`,
+          title:
+            view.kind === "focus"
+              ? "Add this paper as a seed in the selected Focus View."
+              : "Add this paper to the selected Citation Map.",
+          separatorBefore: index === 0,
+          action: () =>
+            view.kind === "focus"
+              ? openCitationMapFocusItemsInView(
+                  view.instanceID,
+                  [itemID],
+                  hostWindow,
+                )
+              : openCitationMapAndSelectItemsInView(
+                  view.instanceID,
+                  [itemID],
+                  hostWindow,
+                ),
+        })),
+      ];
+    },
     onSimilar: async () => {
       clear(similarResults);
       similarResults.appendChild(

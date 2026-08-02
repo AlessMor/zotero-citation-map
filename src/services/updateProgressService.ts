@@ -1,12 +1,13 @@
 import { config } from "../../package.json";
 
 const HTML_NS = "http://www.w3.org/1999/xhtml";
+const SVG_NS = "http://www.w3.org/2000/svg";
 const ICON = `chrome://${config.addonRef}/content/icons/network.svg`;
 const SPINNER_STYLE_ID = `${config.addonRef}-update-spinner-style`;
 const DEFAULT_FINISH_CLOSE_MS = 3500;
 const DEFAULT_FAILURE_CLOSE_MS = 7000;
 const EMPTY_ACTIVITY_GRACE_MS = 1500;
-const PROGRESS_RENDER_DELAY_MS = 16;
+const PROGRESS_RENDER_DELAY_MS = 60;
 
 export interface UpdateProgressOptions {
   document?: Document | null;
@@ -79,8 +80,65 @@ function ensureSpinnerStyle(document: Document): void {
   style.id = SPINNER_STYLE_ID;
   style.textContent = `
     @keyframes citation-map-update-spin {
-      from { transform: rotate(0deg); }
       to { transform: rotate(360deg); }
+    }
+
+    .citation-map-progress-spinner {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      box-sizing: border-box;
+      border: 2px solid color-mix(in srgb, currentColor 24%, transparent);
+      border-top-color: currentColor;
+      border-radius: 50%;
+      transform-origin: 50% 50%;
+      animation: citation-map-update-spin .78s linear infinite;
+      flex: 0 0 16px;
+    }
+
+    .citation-map-progress-action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      min-width: 28px;
+      height: 28px;
+      padding: 0;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      transition: background-color 120ms ease, color 120ms ease,
+        transform 120ms ease;
+    }
+
+    .citation-map-progress-action:hover {
+      background: color-mix(in srgb, CanvasText 10%, transparent);
+    }
+
+    .citation-map-progress-action:active {
+      transform: scale(.94);
+    }
+
+    .citation-map-progress-action:focus-visible {
+      outline: 2px solid Highlight;
+      outline-offset: 1px;
+    }
+
+    .citation-map-progress-action-danger {
+      color: #d70022;
+    }
+
+    .citation-map-progress-action-danger:hover {
+      background: color-mix(in srgb, #d70022 14%, transparent);
+      color: #e5484d;
+    }
+
+    .citation-map-progress-action svg {
+      width: 17px;
+      height: 17px;
+      flex: 0 0 17px;
     }
   `;
   (document.head ?? document.documentElement).appendChild(style);
@@ -129,20 +187,31 @@ function setMinimized(minimized: boolean): void {
   minimizedPreference = minimized;
   if (!progressWindow) return;
   progressWindow.minimized = minimized;
+  progressWindow.root.dataset.minimized = String(minimized);
   progressWindow.details.style.display = minimized ? "none" : "block";
   progressWindow.heading.style.display = minimized ? "none" : "block";
-  progressWindow.spinner.style.display = minimized ? "inline-flex" : "none";
+  progressWindow.spinner.style.display =
+    minimized &&
+    [...activities.values()].some((activity) => activity.status === "active")
+      ? "inline-block"
+      : "none";
   progressWindow.root.style.width = minimized
     ? "auto"
     : "min(380px, calc(100vw - 36px))";
   progressWindow.root.style.gridTemplateColumns = minimized
     ? "auto auto"
     : "minmax(0, 1fr) auto";
-  progressWindow.root.style.padding = minimized ? "7px 8px" : "10px 11px";
-  progressWindow.minimizeButton.textContent = minimized ? "▲" : "▼";
+  progressWindow.root.style.gap = minimized ? "5px" : "8px";
+  progressWindow.root.style.padding = minimized ? "6px 7px" : "10px 11px";
+  progressWindow.minimizeButton.replaceChildren(
+    createProgressIcon(
+      progressWindow.document,
+      minimized ? "chevron-up" : "chevron-down",
+    ),
+  );
   progressWindow.minimizeButton.title = minimized
-    ? "Expand the Citation Map update window."
-    : "Collapse the Citation Map update window. Updates will continue.";
+    ? "Expand update details"
+    : "Collapse update details";
   progressWindow.minimizeButton.setAttribute(
     "aria-label",
     progressWindow.minimizeButton.title,
@@ -171,24 +240,55 @@ function cancelAllUpdates(): void {
   cleanupWindow(true);
 }
 
-function makeButton(document: Document, text: string): HTMLButtonElement {
+type ProgressIconName = "chevron-up" | "chevron-down" | "trash";
+
+function createProgressIcon(
+  document: Document,
+  name: ProgressIconName,
+): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", name === "trash" ? "1.9" : "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+
+  const paths: Record<ProgressIconName, string[]> = {
+    "chevron-up": ["M7 14l5-5 5 5"],
+    "chevron-down": ["M7 10l5 5 5-5"],
+    trash: [
+      "M4 7h16",
+      "M9 7V4h6v3",
+      "M6 7l1 14h10l1-14",
+      "M10 11v6",
+      "M14 11v6",
+    ],
+  };
+
+  for (const d of paths[name]) {
+    const path = document.createElementNS(SVG_NS, "path");
+    path.setAttribute("d", d);
+    svg.appendChild(path);
+  }
+  return svg;
+}
+
+function makeButton(
+  document: Document,
+  icon: ProgressIconName,
+  label: string,
+  danger = false,
+): HTMLButtonElement {
   const button = element(document, "button");
   button.type = "button";
-  button.textContent = text;
-  Object.assign(button.style, {
-    alignSelf: "start",
-    width: "24px",
-    minWidth: "24px",
-    height: "24px",
-    padding: "0",
-    border: "0",
-    borderRadius: "5px",
-    background: "transparent",
-    color: "inherit",
-    fontSize: "18px",
-    lineHeight: "20px",
-    cursor: "pointer",
-  });
+  button.className = `citation-map-progress-action${
+    danger ? " citation-map-progress-action-danger" : ""
+  }`;
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.appendChild(createProgressIcon(document, icon));
   return button;
 }
 
@@ -246,20 +346,10 @@ function ensureWindow(preferred?: Document | null): ProgressWindow | null {
   heading.textContent = "Updating Entries";
   heading.style.display = "block";
   const spinner = element(document, "span");
-  spinner.textContent = "↻";
+  spinner.className = "citation-map-progress-spinner";
   spinner.title = "Update in progress";
+  spinner.setAttribute("role", "img");
   spinner.setAttribute("aria-label", spinner.title);
-  Object.assign(spinner.style, {
-    display: "none",
-    alignItems: "center",
-    justifyContent: "center",
-    width: "18px",
-    height: "18px",
-    fontSize: "17px",
-    lineHeight: "18px",
-    transformOrigin: "50% 50%",
-    animation: "citation-map-update-spin 1s linear infinite",
-  });
   header.append(icon, heading, spinner);
 
   const details = element(document, "div");
@@ -304,21 +394,25 @@ function ensureWindow(preferred?: Document | null): ProgressWindow | null {
   const controls = element(document, "div");
   Object.assign(controls.style, {
     display: "flex",
-    alignItems: "flex-start",
-    gap: "2px",
+    alignItems: "center",
+    gap: "3px",
   });
-  const minimize = makeButton(document, "▼");
-  minimize.title =
-    "Collapse the Citation Map update window. Updates will continue.";
-  minimize.setAttribute("aria-label", minimize.title);
-  const close = makeButton(document, "×");
-  close.title = "Cancel all active and queued Citation Map updates.";
-  close.setAttribute("aria-label", close.title);
+  const minimize = makeButton(
+    document,
+    "chevron-down",
+    "Collapse update details",
+  );
+  const cancel = makeButton(
+    document,
+    "trash",
+    "Cancel all Citation Map updates and close",
+    true,
+  );
   minimize.addEventListener("click", () =>
     setMinimized(!progressWindow?.minimized),
   );
-  close.addEventListener("click", cancelAllUpdates);
-  controls.append(minimize, close);
+  cancel.addEventListener("click", cancelAllUpdates);
+  controls.append(minimize, cancel);
   root.append(content, controls);
   (document.body ?? document.documentElement).appendChild(root);
 
@@ -379,6 +473,8 @@ function renderNow(preferred?: Document | null): void {
 
   const active = activeActivities();
   const completed = completedActivities();
+  window.spinner.style.display =
+    window.minimized && active.length > 0 ? "inline-block" : "none";
   const failed = completed.filter((activity) => activity.status === "failed");
 
   if (active.length > 0) {

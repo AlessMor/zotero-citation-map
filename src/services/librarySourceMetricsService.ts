@@ -19,7 +19,7 @@ import {
   providerExecutionPolicy,
   SOURCE_RECORD_WRITE_CHUNK_SIZE,
 } from "./providerExecutionPolicy";
-import { saveCitationMetricRecord } from "./citationMetricsStore";
+import { saveCitationMetricRecords } from "./citationMetricsStore";
 
 interface OpenAlexSource {
   id?: string;
@@ -79,7 +79,10 @@ async function runSourceMetricTasks(
   concurrency: number,
 ): Promise<number> {
   let failed = 0;
-  const results = await settleBounded(tasks, concurrency, (task) => task());
+  const results = await settleBounded(tasks, concurrency, (task) => task(), {
+    yieldAfterEach: true,
+    yieldDelayMs: 8,
+  });
   for (const result of results) {
     if (result.status !== "rejected") continue;
     failed += 1;
@@ -381,9 +384,7 @@ export async function enrichLibrarySourceMetrics(
         records[target.recordIndex] = updatedRecord;
         return updatedRecord;
       });
-      await Promise.all(
-        changed.map((record) => saveCitationMetricRecord(record)),
-      );
+      await saveCitationMetricRecords(changed);
     }
     return {
       records,
@@ -551,9 +552,7 @@ export async function enrichLibrarySourceMetrics(
         message: `Retrieving journal metrics · ${completed}/${total}`,
       });
     }
-    await Promise.all(
-      changed.map((record) => saveCitationMetricRecord(record)),
-    );
+    await saveCitationMetricRecords(changed);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
 

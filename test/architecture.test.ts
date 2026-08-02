@@ -105,6 +105,16 @@ import {
   cancellationRequested,
   createCancellationScope,
 } from "../src/services/cancellationScope";
+import {
+  cloneCitationGraphModel,
+  createCitationGraphIndex,
+} from "../src/services/graphSnapshotStore";
+import {
+  clearFocusGraphCaches,
+  focusProjectionCacheKey,
+  getFocusRelationshipFragment,
+  setFocusRelationshipFragment,
+} from "../src/services/focusGraphCacheService";
 
 function work(
   overrides: Partial<RelatedWorkMetadata> = {},
@@ -121,6 +131,79 @@ function work(
 }
 
 describe("Architecture foundations", function () {
+  it("builds reusable graph indexes and clones mutable view models", function () {
+    const source = externalWorkToFocusNode(
+      work({ providerWorkID: "source", doi: "10.1000/source" }),
+      "seed",
+    );
+    const target = externalWorkToFocusNode(
+      work({ providerWorkID: "target", doi: "10.1000/target" }),
+      "reference",
+    );
+    const model = {
+      nodes: [source, target],
+      edges: [
+        {
+          key: `${source.key}>${target.key}`,
+          source: source.key,
+          target: target.key,
+          provenance: "crossref",
+          manual: false,
+        },
+      ],
+      statistics: {
+        nodes: 2,
+        resolvedNodes: 2,
+        edges: 1,
+        isolatedNodes: 0,
+      },
+    };
+
+    const index = createCitationGraphIndex(model);
+    expect(index.nodeByKey.get(target.key)?.key).to.equal(target.key);
+    expect(index.outgoingEdgesByKey.get(source.key)?.[0]?.target).to.equal(
+      target.key,
+    );
+    expect(index.incomingEdgesByKey.get(target.key)?.[0]?.source).to.equal(
+      source.key,
+    );
+
+    const cloned = cloneCitationGraphModel(model);
+    cloned.nodes[0].title = "Changed";
+    cloned.nodes[0].authors.push("Another author");
+    cloned.edges[0].provenance = "manual";
+    expect(model.nodes[0].title).to.equal("Example paper");
+    expect(model.nodes[0].authors).to.deep.equal(["Alice Smith"]);
+    expect(model.edges[0].provenance).to.equal("crossref");
+  });
+
+  it("reuses bounded Focus fragments and invalidates projection keys on change", function () {
+    clearFocusGraphCaches();
+    const state = {
+      seedKeys: ["seed"],
+      direction: "both" as const,
+      locality: "all" as const,
+      ranking: "relevance" as const,
+      maxPerDirection: 25,
+    };
+    const first = work({ doi: "10.1000/one", citationCount: 2 });
+    setFocusRelationshipFragment(1, "seed", {
+      references: [first],
+      citedBy: [],
+    });
+    const firstKey = focusProjectionCacheKey(1, "graph-a", state);
+    const cached = getFocusRelationshipFragment(1, "seed");
+    expect(cached?.references[0].doi).to.equal("10.1000/one");
+
+    setFocusRelationshipFragment(1, "seed", {
+      references: [work({ doi: "10.1000/one", citationCount: 3 })],
+      citedBy: [],
+    });
+    const secondKey = focusProjectionCacheKey(1, "graph-a", state);
+    expect(secondKey).not.to.equal(firstKey);
+    clearFocusGraphCaches();
+  });
+
   it("invalidates only relationship lists that depend on changed summaries", function () {
     const index = new RelationshipMetadataDependencyIndex();
     index.register("paper-a:references", ["doi:one", "doi:two"]);
@@ -578,13 +661,18 @@ describe("Architecture foundations", function () {
   it("bounds concurrent mapping and preserves result order", async function () {
     let active = 0;
     let maximumActive = 0;
-    const result = await mapBounded([1, 2, 3, 4], 2, async (value) => {
-      active += 1;
-      maximumActive = Math.max(maximumActive, active);
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      active -= 1;
-      return value * 10;
-    });
+    const result = await mapBounded(
+      [1, 2, 3, 4],
+      2,
+      async (value) => {
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        active -= 1;
+        return value * 10;
+      },
+      { yieldAfterEach: true, yieldDelayMs: 1 },
+    );
     expect(maximumActive).to.equal(2);
     expect(result).to.deep.equal([10, 20, 30, 40]);
   });
@@ -601,9 +689,9 @@ describe("Architecture foundations", function () {
     ]);
   });
 
-  it("forces new Focus seeds to refresh without foreground metadata hydration", function () {
+  it("reuses fresh Focus membership without foreground metadata hydration", function () {
     const plan = automaticFocusSeedRefreshPlan();
-    expect(plan.forceRefresh).to.equal(true);
+    expect(plan.forceRefresh).to.equal(false);
     expect(plan.membershipLimit).to.equal(50);
     expect(plan.foregroundMetadataLimit).to.equal(0);
     expect(plan.showBackgroundProgress).to.equal(true);
@@ -1246,6 +1334,39 @@ describe("Architecture foundations", function () {
         2025,
       ),
     ).to.equal("Campbell (2025)");
+  });
+
+  it("canonicalizes a complete single-provider relationship snapshot once", function () {
+    let mergeCalls = 0;
+    const snapshots = prepareRelationshipSnapshots(
+      [
+        {
+          provider: "openalex",
+          works: [
+            work({
+              provider: "openalex",
+              providerWorkID: "W1",
+              doi: "10.1000/one",
+            }),
+            work({
+              provider: "openalex",
+              providerWorkID: "W2",
+              doi: "10.1000/two",
+            }),
+          ],
+          reportedCount: 2,
+          complete: true,
+          succeeded: true,
+        },
+      ],
+      (...groups) => {
+        mergeCalls += 1;
+        return mergeRelatedWorkLists(...groups);
+      },
+    );
+
+    expect(snapshots[0].identifiedWorks).to.have.length(2);
+    expect(mergeCalls).to.equal(1);
   });
 
   it("publishes relationship membership counts before metadata completion", function () {

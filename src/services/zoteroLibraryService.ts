@@ -6,6 +6,75 @@ import type {
 } from "../domain/types";
 import { normalizeDOI } from "../domain/workIdentity";
 import { getItemCitationMetrics } from "./citationMetricsStore";
+import { createCooperativeCheckpoint } from "./backgroundTaskService";
+
+const pendingLibraryLoads = new Map<number, Promise<LibrarySnapshot>>();
+const cachedLibrarySnapshots = new Map<number, LibrarySnapshot>();
+const cachedLibraryAccessOrder: number[] = [];
+const dirtyLibraryMetrics = new Set<number>();
+const librarySnapshotGeneration = new Map<number, number>();
+const MAX_CACHED_LIBRARY_SNAPSHOTS = 2;
+const LIBRARY_LOAD_FORCE_YIELD_INTERVAL = 20;
+const LIBRARY_METRIC_FORCE_YIELD_INTERVAL = 100;
+
+function touchCachedLibrary(libraryID: number): void {
+  const existing = cachedLibraryAccessOrder.indexOf(libraryID);
+  if (existing >= 0) cachedLibraryAccessOrder.splice(existing, 1);
+  cachedLibraryAccessOrder.push(libraryID);
+  while (cachedLibraryAccessOrder.length > MAX_CACHED_LIBRARY_SNAPSHOTS) {
+    const evicted = cachedLibraryAccessOrder.shift();
+    if (evicted === undefined) continue;
+    cachedLibrarySnapshots.delete(evicted);
+    dirtyLibraryMetrics.delete(evicted);
+  }
+}
+
+export function invalidateWholeLibrarySnapshot(libraryID?: number): void {
+  if (typeof libraryID === "number" && Number.isFinite(libraryID)) {
+    librarySnapshotGeneration.set(
+      libraryID,
+      (librarySnapshotGeneration.get(libraryID) ?? 0) + 1,
+    );
+    cachedLibrarySnapshots.delete(libraryID);
+    pendingLibraryLoads.delete(libraryID);
+    dirtyLibraryMetrics.delete(libraryID);
+    const index = cachedLibraryAccessOrder.indexOf(libraryID);
+    if (index >= 0) cachedLibraryAccessOrder.splice(index, 1);
+    return;
+  }
+  for (const cachedLibraryID of new Set([
+    ...cachedLibrarySnapshots.keys(),
+    ...pendingLibraryLoads.keys(),
+  ])) {
+    librarySnapshotGeneration.set(
+      cachedLibraryID,
+      (librarySnapshotGeneration.get(cachedLibraryID) ?? 0) + 1,
+    );
+  }
+  cachedLibrarySnapshots.clear();
+  pendingLibraryLoads.clear();
+  cachedLibraryAccessOrder.splice(0);
+  dirtyLibraryMetrics.clear();
+}
+
+export function markWholeLibraryMetricsDirty(libraryID?: number): void {
+  if (typeof libraryID === "number" && Number.isFinite(libraryID)) {
+    if (cachedLibrarySnapshots.has(libraryID))
+      dirtyLibraryMetrics.add(libraryID);
+    return;
+  }
+  for (const cachedLibraryID of cachedLibrarySnapshots.keys()) {
+    dirtyLibraryMetrics.add(cachedLibraryID);
+  }
+}
+
+export function clearWholeLibrarySnapshotCache(): void {
+  invalidateWholeLibrarySnapshot();
+}
+
+function yieldToZoteroUI(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 function extractYear(value: unknown): number | null {
   const match = String(value ?? "").match(/\b(1[5-9]\d{2}|20\d{2}|21\d{2})\b/);
@@ -235,24 +304,100 @@ function collectionFilters(
     });
 }
 
-export async function loadWholeLibrary(
+async function buildWholeLibrarySnapshot(
   libraryID: number = Zotero.Libraries.userLibraryID,
 ): Promise<LibrarySnapshot> {
+  const startedAt = globalThis.performance?.now?.() ?? Date.now();
   const items = await Zotero.Items.getAll(libraryID);
-  const papers = (items as Zotero.Item[])
-    .filter((item: any) => item?.isRegularItem?.() && !item.deleted)
-    .map(toPaper)
-    .sort((a, b) => a.title.localeCompare(b.title));
-  return {
+  const papers: ZoteroPaper[] = [];
+  const libraryItems = items as Zotero.Item[];
+  const checkpoint = createCooperativeCheckpoint(7);
+  for (let index = 0; index < libraryItems.length; index += 1) {
+    const item = libraryItems[index] as any;
+    if (item?.isRegularItem?.() && !item.deleted) papers.push(toPaper(item));
+    await checkpoint((index + 1) % LIBRARY_LOAD_FORCE_YIELD_INTERVAL === 0);
+  }
+  const titleCollator = new Intl.Collator(undefined, {
+    sensitivity: "base",
+    numeric: true,
+  });
+  papers.sort((a, b) => titleCollator.compare(a.title, b.title));
+  await yieldToZoteroUI();
+  const collections = collectionFilters(libraryID, papers);
+  await yieldToZoteroUI();
+  const libraryTags = [...new Set(papers.flatMap((paper) => paper.tags))].sort(
+    (a, b) => titleCollator.compare(a, b),
+  );
+  const snapshot: LibrarySnapshot = {
     libraryID,
     libraryName:
       Zotero.Libraries.getName?.(libraryID) || `Library ${libraryID}`,
     generatedAt: new Date().toISOString(),
     papers,
-    collections: collectionFilters(libraryID, papers),
-    tags: [...new Set(papers.flatMap((paper) => paper.tags))].sort((a, b) =>
-      a.localeCompare(b),
-    ),
+    collections,
+    tags: libraryTags,
     statistics: statistics(papers),
   };
+  const elapsed = (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
+  if (elapsed >= 500) {
+    Zotero.debug(
+      `Citation Map: prepared ${papers.length} library papers in ${Math.round(elapsed)} ms`,
+    );
+  }
+  return snapshot;
+}
+
+async function refreshCachedSnapshotMetrics(
+  snapshot: LibrarySnapshot,
+): Promise<LibrarySnapshot> {
+  const startedAt = globalThis.performance?.now?.() ?? Date.now();
+  const checkpoint = createCooperativeCheckpoint(7);
+  for (let index = 0; index < snapshot.papers.length; index += 1) {
+    const paper = snapshot.papers[index];
+    paper.metrics = getItemCitationMetrics(snapshot.libraryID, paper.itemKey);
+    await checkpoint((index + 1) % LIBRARY_METRIC_FORCE_YIELD_INTERVAL === 0);
+  }
+  snapshot.generatedAt = new Date().toISOString();
+  snapshot.statistics = statistics(snapshot.papers);
+  dirtyLibraryMetrics.delete(snapshot.libraryID);
+  touchCachedLibrary(snapshot.libraryID);
+  const elapsed = (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
+  if (elapsed >= 500) {
+    Zotero.debug(
+      `Citation Map: refreshed ${snapshot.papers.length} cached paper metrics in ${Math.round(elapsed)} ms`,
+    );
+  }
+  return snapshot;
+}
+
+export function loadWholeLibrary(
+  libraryID: number = Zotero.Libraries.userLibraryID,
+): Promise<LibrarySnapshot> {
+  const existing = pendingLibraryLoads.get(libraryID);
+  if (existing) return existing;
+
+  const cached = cachedLibrarySnapshots.get(libraryID);
+  if (cached && !dirtyLibraryMetrics.has(libraryID)) {
+    touchCachedLibrary(libraryID);
+    return Promise.resolve(cached);
+  }
+
+  const generation = librarySnapshotGeneration.get(libraryID) ?? 0;
+  const operation = cached
+    ? refreshCachedSnapshotMetrics(cached)
+    : buildWholeLibrarySnapshot(libraryID).then((snapshot) => {
+        if ((librarySnapshotGeneration.get(libraryID) ?? 0) === generation) {
+          cachedLibrarySnapshots.set(libraryID, snapshot);
+          dirtyLibraryMetrics.delete(libraryID);
+          touchCachedLibrary(libraryID);
+        }
+        return snapshot;
+      });
+  const pending = operation.finally(() => {
+    if (pendingLibraryLoads.get(libraryID) === pending) {
+      pendingLibraryLoads.delete(libraryID);
+    }
+  });
+  pendingLibraryLoads.set(libraryID, pending);
+  return pending;
 }

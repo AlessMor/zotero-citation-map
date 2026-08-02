@@ -17,6 +17,7 @@ import {
   publicationYearOrNull,
 } from "../domain/valueNormalization";
 import { normalizeExactTitle } from "../domain/workIdentity";
+import { createCooperativeCheckpoint } from "./backgroundTaskService";
 import {
   CacheDecodeError,
   decodeCitationYearCountsJSON,
@@ -642,6 +643,58 @@ export async function saveCitationMetricRecord(
   await queueWrite(key, async () => {
     await requireDB().queryAsync(UPSERT_SQL, recordToParams(record));
   });
+}
+
+/**
+ * Persist several records through one SQLite transaction while reserving every
+ * affected item key. This avoids hundreds of independent write turns during a
+ * library update and yields while preparing serialized parameters.
+ */
+export async function saveCitationMetricRecords(
+  records: readonly CitationMetricRecord[],
+): Promise<void> {
+  const startedAt = Date.now();
+  const unique = new Map<string, CitationMetricRecord>();
+  for (const record of records) {
+    unique.set(mirrorKey(record.libraryID, record.itemKey), record);
+  }
+  if (unique.size === 0) return;
+
+  const entries = [...unique.entries()];
+  const keys = entries.map(([key]) => key);
+  for (const [key, record] of entries) mirror.set(key, record);
+  mirrorRevision += entries.length;
+
+  const previous = Promise.all(
+    keys.map((key) => writeTails.get(key)?.catch(() => undefined)),
+  );
+  const next = previous
+    .then(async () => {
+      const checkpoint = createCooperativeCheckpoint();
+      const rows: unknown[][] = [];
+      for (const [index, [, record]] of entries.entries()) {
+        rows.push(recordToParams(record));
+        await checkpoint((index + 1) % 10 === 0);
+      }
+      await requireDB().executeTransaction(async () => {
+        for (const row of rows) {
+          await requireDB().queryAsync(UPSERT_SQL, row);
+        }
+      });
+    })
+    .finally(() => {
+      for (const key of keys) {
+        if (writeTails.get(key) === next) writeTails.delete(key);
+      }
+    });
+  for (const key of keys) writeTails.set(key, next);
+  await next;
+  const durationMs = Date.now() - startedAt;
+  if (durationMs >= 500) {
+    Zotero.debug(
+      `Citation Map: saved ${entries.length} citation metric records in ${durationMs} ms`,
+    );
+  }
 }
 
 export async function saveCitationMetricFailure(

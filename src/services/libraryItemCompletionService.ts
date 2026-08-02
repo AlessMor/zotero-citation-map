@@ -7,7 +7,7 @@ import type { CitationGraphNode } from "../domain/graphTypes";
 import { isCitationRequestCancellationRequested } from "../providers/http";
 import {
   getCitationMetricRecord,
-  saveCitationMetricRecord,
+  saveCitationMetricRecords,
 } from "./citationMetricsStore";
 import {
   refreshExternalRelationships,
@@ -21,7 +21,7 @@ import {
   RELATIONSHIP_BULK_EAGER_LIMIT,
   RELATIONSHIP_ITEM_PARALLELISM,
 } from "./providerExecutionPolicy";
-import { getStoredRelationshipEntry } from "./relationshipStoreService";
+import { getStoredRelationshipSummary } from "./relationshipStoreService";
 import {
   enrichLibrarySourceMetrics,
   type LibrarySourceMetricResult,
@@ -158,11 +158,11 @@ function relationshipNeedsRefresh(
     return false;
   }
 
-  const entry = getStoredRelationshipEntry(node, direction);
-  if (!entry) return true;
+  const summary = getStoredRelationshipSummary(node, direction);
+  if (!summary) return true;
 
   const timestamp = Date.parse(
-    state?.[relationshipStateKey(direction)] ?? entry.fetchedAt,
+    state?.[relationshipStateKey(direction)] ?? summary.fetchedAt,
   );
   const stale =
     !Number.isFinite(timestamp) ||
@@ -179,7 +179,7 @@ function relationshipNeedsRefresh(
   if (status === "first-hop-ready") return false;
 
   const loaded =
-    state?.[relationshipLoadedCountKey(direction)] ?? entry.works.length;
+    state?.[relationshipLoadedCountKey(direction)] ?? summary.count;
   return loaded <= 0 && maximum > 0;
 }
 
@@ -229,7 +229,7 @@ function rememberRelationshipFailure(
   direction: RelationshipDirection,
 ): void {
   const now = Date.now();
-  const existing = getStoredRelationshipEntry(node, direction);
+  const existing = getStoredRelationshipSummary(node, direction);
   const reportedCount =
     direction === "references" ? node.referenceCount : node.citationCount;
   const byDirection = resolutions.get(node.itemKey) ?? new Map();
@@ -237,7 +237,7 @@ function rememberRelationshipFailure(
     complete: false,
     provider: null,
     reportedCount,
-    identifiedCount: existing?.works.length ?? 0,
+    identifiedCount: existing?.count ?? 0,
     updatedAt: new Date(now).toISOString(),
     status: "unavailable",
     nextRetryAt: new Date(now + RELATIONSHIP_ERROR_RETRY_MS).toISOString(),
@@ -303,7 +303,7 @@ export async function completeLibraryItemUpdates(
   }
 
   const nodes: CitationGraphNode[] = relevantItems.map((item) =>
-    createMetricNodeForItem(item),
+    createMetricNodeForItem(item, { includeReferences: false }),
   );
   const latestByItemKey = new Map(
     latestRecords(sourceResult.records).map((record) => [
@@ -377,7 +377,11 @@ export async function completeLibraryItemUpdates(
           // optional metadata so the update remains cooperative.
           mode: relationshipMode === "first-page" ? "automatic" : "manual",
           summaryLookupLimit: 0,
-          queueBackgroundHydration: true,
+          // Bulk paper updates persist compact membership only. Optional
+          // summaries are queued when a relationship list or Focus View is
+          // actually opened, avoiding background work that competes with the
+          // user immediately after an update.
+          queueBackgroundHydration: false,
           providerWorkIDs,
           signal: options.signal,
           onMembershipResolved: (value) => {
@@ -430,6 +434,7 @@ export async function completeLibraryItemUpdates(
       // serialization after each network response. Yield between roots so
       // Zotero can repaint.
       yieldAfterEach: true,
+      yieldDelayMs: 12,
     },
   );
 
@@ -505,10 +510,8 @@ export async function completeLibraryItemUpdates(
     start < finalRecords.length;
     start += CITATION_RECORD_WRITE_CHUNK_SIZE
   ) {
-    await Promise.all(
-      finalRecords
-        .slice(start, start + CITATION_RECORD_WRITE_CHUNK_SIZE)
-        .map((record) => saveCitationMetricRecord(record)),
+    await saveCitationMetricRecords(
+      finalRecords.slice(start, start + CITATION_RECORD_WRITE_CHUNK_SIZE),
     );
     await yieldToUI();
   }

@@ -12,7 +12,7 @@ import {
 } from "./citationMetricsStore";
 import { getCacheDays, isProviderEnabled } from "./citationPreferences";
 import {
-  getStoredRelationshipEntry,
+  getStoredRelationshipSummary,
   type RelationshipStoreSubject,
   type StoredRelationshipDirection,
 } from "./relationshipStoreService";
@@ -93,15 +93,15 @@ function relationshipFirstHopIsCurrent(
     return retryIsDeferred(values.nextRetryAt);
   }
 
-  const entry = getStoredRelationshipEntry(subject, direction);
-  const timestamp = Date.parse(values.updatedAt ?? entry?.fetchedAt ?? "");
+  const summary = getStoredRelationshipSummary(subject, direction);
+  const timestamp = Date.parse(values.updatedAt ?? summary?.fetchedAt ?? "");
   if (!Number.isFinite(timestamp) || Date.now() - timestamp >= maxAgeMs) {
     return false;
   }
 
   if (values.status === "empty") return true;
-  if (values.status === "complete" || values.complete) return Boolean(entry);
-  if (values.status === "first-hop-ready") return Boolean(entry);
+  if (values.status === "complete" || values.complete) return Boolean(summary);
+  if (values.status === "first-hop-ready") return Boolean(summary);
 
   // Lazily migrate the first one-hop format. A confirmed empty result remains
   // current, but non-empty legacy state is current only when the selected
@@ -109,7 +109,7 @@ function relationshipFirstHopIsCurrent(
   // the explicit status fields and removes this compatibility path naturally.
   if (values.reportedCount === 0 && (values.loadedCount ?? 0) === 0)
     return true;
-  return Boolean(entry);
+  return Boolean(summary);
 }
 
 function hasCurrentLibraryUpdate(

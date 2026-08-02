@@ -40,6 +40,18 @@ import {
   registerCitationMapPreferencePane,
   unregisterCitationMapPreferenceObservers,
 } from "./services/preferencePaneService";
+import { clearCitationGraphSnapshots } from "./services/graphSnapshotStore";
+import { clearFocusGraphCaches } from "./services/focusGraphCacheService";
+import {
+  clearWholeLibrarySnapshotCache,
+  invalidateWholeLibrarySnapshot,
+  markWholeLibraryMetricsDirty,
+} from "./services/zoteroLibraryService";
+import {
+  clearLocalCitationExtractionCache,
+  invalidateLocalCitationExtractionCache,
+} from "./services/citationGraphService";
+import { yieldToUI } from "./services/backgroundTaskService";
 import {
   cancelPendingCitationMapRefreshes,
   closeCitationMapForWindow,
@@ -53,6 +65,7 @@ const TAB_ICON_STYLESHEET_ID = `${config.addonRef}-tab-icon-stylesheet`;
 const TEARDOWN_MARKER = `__${config.addonRef}RuntimeTeardownListener`;
 let teardownStarted = false;
 let unsubscribeUpdateListener: (() => void) | null = null;
+let librarySnapshotNotifierID: string | null = null;
 const VIEW_REFRESH_DEADLINE_MS = 5000;
 
 function installStyles(win: _ZoteroTypes.MainWindow): void {
@@ -114,13 +127,73 @@ function withDeadline<T>(
   });
 }
 
+function registerLibrarySnapshotInvalidation(): void {
+  if (librarySnapshotNotifierID) return;
+  const observer = {
+    notify(
+      _event: string,
+      type: string,
+      ids: Array<number | string>,
+      extraData?: Record<string, { libraryID?: number }>,
+    ): void {
+      if (type !== "item") return;
+      const libraryIDs = new Set<number>();
+      for (const id of ids) {
+        const itemID = Number(id);
+        const detail = extraData?.[String(id)] ?? extraData?.[itemID];
+        const libraryID = Number(
+          detail?.libraryID ??
+            (Number.isFinite(itemID)
+              ? (Zotero.Items.get(itemID) as Zotero.Item | null)?.libraryID
+              : 0),
+        );
+        if (Number.isFinite(libraryID) && libraryID > 0) {
+          libraryIDs.add(libraryID);
+        }
+      }
+      if (!libraryIDs.size) {
+        invalidateWholeLibrarySnapshot();
+        invalidateLocalCitationExtractionCache();
+        clearCitationGraphSnapshots();
+        clearFocusGraphCaches();
+        return;
+      }
+      for (const libraryID of libraryIDs) {
+        invalidateWholeLibrarySnapshot(libraryID);
+        invalidateLocalCitationExtractionCache(libraryID);
+      }
+      clearCitationGraphSnapshots();
+      clearFocusGraphCaches();
+    },
+  };
+  librarySnapshotNotifierID = Zotero.Notifier.registerObserver(
+    observer,
+    ["item"],
+    "citation-map-library-snapshot-cache",
+  );
+}
+
+function unregisterLibrarySnapshotInvalidation(): void {
+  if (!librarySnapshotNotifierID) return;
+  Zotero.Notifier.unregisterObserver(librarySnapshotNotifierID);
+  librarySnapshotNotifierID = null;
+}
+
 function installUpdateRefreshListener(): void {
   if (unsubscribeUpdateListener) return;
   unsubscribeUpdateListener = subscribeToCitationUpdates(async (event) => {
-    // Trigger all requested presentation surfaces from the same event-loop
-    // turn. Each surface reads the same completed metric-store snapshot.
-    if (event.refreshColumns) refreshCitationColumns();
-    if (event.refreshItemPanes) refreshCitationItemPanes();
+    markWholeLibraryMetricsDirty();
+    // Presentation refreshes all read the same completed store snapshot, but
+    // must not execute as one uninterrupted main-thread burst. Give Zotero an
+    // input/paint opportunity between the item tree, item pane, and graph.
+    if (event.refreshColumns) {
+      refreshCitationColumns();
+      await yieldToUI(16);
+    }
+    if (event.refreshItemPanes) {
+      refreshCitationItemPanes();
+      await yieldToUI(16);
+    }
     if (event.refreshGraph) {
       await withDeadline(
         refreshOpenCitationMapViews(),
@@ -140,6 +213,11 @@ function beginTeardown(closeGraphTab = true): void {
   unsubscribeUpdateListener = null;
   stopProviderResponseCache();
   stopExternalDiscoveryRuntime();
+  clearCitationGraphSnapshots();
+  clearFocusGraphCaches();
+  clearWholeLibrarySnapshotCache();
+  clearLocalCitationExtractionCache();
+  unregisterLibrarySnapshotInvalidation();
   cancelPendingCitationMapRefreshes();
   for (const action of [
     unregisterAutomaticCitationUpdates,
@@ -172,6 +250,7 @@ async function onStartup(): Promise<void> {
   startExternalDiscoveryRuntime();
   startProviderResponseCache();
   installUpdateRefreshListener();
+  registerLibrarySnapshotInvalidation();
   await Zotero.uiReadyPromise;
   for (const win of Zotero.getMainWindows()) await onMainWindowLoad(win);
   await registerCitationColumns();

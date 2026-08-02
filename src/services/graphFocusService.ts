@@ -2,6 +2,7 @@ import type { RelatedWorkMetadata } from "../domain/citationTypes";
 import type {
   CitationGraphEdge,
   CitationGraphFocusRole,
+  CitationGraphIndex,
   CitationGraphModel,
   CitationGraphNode,
 } from "../domain/graphTypes";
@@ -38,6 +39,8 @@ export interface GraphFocusSeedRelationships {
 
 export interface GraphFocusInput {
   graph: CitationGraphModel;
+  /** Optional graph-ready indexes shared by Citation Map and Focus View. */
+  index?: CitationGraphIndex;
   state: GraphFocusState;
   /** Seed nodes may be local or temporary external nodes. */
   seeds: CitationGraphNode[];
@@ -200,9 +203,20 @@ export function synchronizeExternalFocusNode(
   return Boolean(stableIdentity);
 }
 
-function localIndexes(nodes: CitationGraphNode[]) {
+function localIndexes(
+  nodes: CitationGraphNode[],
+  graphIndex?: CitationGraphIndex,
+) {
   const byKey = new Map<string, CitationGraphNode>();
   const byAlias = new Map<string, CitationGraphNode[]>();
+  if (graphIndex) {
+    for (const [key, node] of graphIndex.nodeByKey) {
+      byKey.set(key.toLocaleUpperCase(), node);
+    }
+    for (const [alias, candidates] of graphIndex.nodesByAlias) {
+      byAlias.set(alias, [...candidates]);
+    }
+  }
   for (const node of nodes) {
     byKey.set(node.itemKey.toLocaleUpperCase(), node);
     byKey.set(node.key.toLocaleUpperCase(), node);
@@ -228,13 +242,13 @@ function localNodeForWork(
   const aliases = stableAliases.length
     ? stableAliases
     : bibliographicWorkAliases(work);
-  const candidates = new Set<CitationGraphNode>();
+  const candidates = new Map<string, CitationGraphNode>();
   for (const alias of aliases) {
     for (const candidate of indexes.byAlias.get(alias) ?? []) {
-      candidates.add(candidate);
+      candidates.set(candidate.key, candidate);
     }
   }
-  const matching = [...candidates].filter(
+  const matching = [...candidates.values()].filter(
     (candidate) =>
       matchRelatedWorkToGraphNode(work, candidate).decision === "same-work",
   );
@@ -315,21 +329,36 @@ function edge(
 function directionEntries(
   seed: CitationGraphNode,
   graph: CitationGraphModel,
+  graphIndex: CitationGraphIndex | undefined,
   works: RelatedWorkMetadata[],
   direction: "references" | "cited-by",
   indexes: ReturnType<typeof localIndexes>,
 ): RankedNode[] {
   const localKeys = new Set<string>();
-  for (const relation of graph.edges) {
-    if (direction === "references" && relation.source === seed.key) {
-      localKeys.add(relation.target);
-    } else if (direction === "cited-by" && relation.target === seed.key) {
-      localKeys.add(relation.source);
+  if (graphIndex) {
+    const relations =
+      direction === "references"
+        ? (graphIndex.outgoingEdgesByKey.get(seed.key) ?? [])
+        : (graphIndex.incomingEdgesByKey.get(seed.key) ?? []);
+    for (const relation of relations) {
+      localKeys.add(
+        direction === "references" ? relation.target : relation.source,
+      );
+    }
+  } else {
+    for (const relation of graph.edges) {
+      if (direction === "references" && relation.source === seed.key) {
+        localKeys.add(relation.target);
+      } else if (direction === "cited-by" && relation.target === seed.key) {
+        localKeys.add(relation.source);
+      }
     }
   }
   const result = new Map<string, RankedNode>();
   for (const key of localKeys) {
-    const node = graph.nodes.find((candidate) => candidate.key === key);
+    const node =
+      graphIndex?.nodeByKey.get(key) ??
+      graph.nodes.find((candidate) => candidate.key === key);
     if (node) result.set(node.key, { node, work: null, local: true });
   }
   for (const work of works) {
@@ -367,6 +396,7 @@ function cloneSeedNode(node: CitationGraphNode): CitationGraphNode {
 function aggregateDirection(
   seeds: CitationGraphNode[],
   graph: CitationGraphModel,
+  graphIndex: CitationGraphIndex | undefined,
   relationships: ReadonlyMap<string, GraphFocusSeedRelationships>,
   direction: "references" | "cited-by",
   indexes: ReturnType<typeof localIndexes>,
@@ -380,6 +410,7 @@ function aggregateDirection(
     for (const entry of directionEntries(
       seed,
       graph,
+      graphIndex,
       works,
       direction,
       indexes,
@@ -410,7 +441,9 @@ export function buildGraphFocusProjection(
   const { graph, state } = input;
   const requestedKeys = [...new Set(state.seedKeys.filter(Boolean))];
   const suppliedByKey = new Map(input.seeds.map((seed) => [seed.key, seed]));
-  const graphByKey = new Map(graph.nodes.map((node) => [node.key, node]));
+  const graphByKey =
+    input.index?.nodeByKey ??
+    new Map(graph.nodes.map((node) => [node.key, node]));
   const seeds = requestedKeys
     .map((key) => suppliedByKey.get(key) ?? graphByKey.get(key) ?? null)
     .filter((seed): seed is CitationGraphNode => Boolean(seed))
@@ -418,23 +451,33 @@ export function buildGraphFocusProjection(
   if (!seeds.length) return null;
 
   const seedKeys = new Set(seeds.map((seed) => seed.key));
-  const indexes = localIndexes([
-    ...graph.nodes.filter((node) => node.kind !== "external"),
-    ...seeds,
-  ]);
+  const indexes = localIndexes(
+    input.index
+      ? seeds
+      : [...graph.nodes.filter((node) => node.kind !== "external"), ...seeds],
+    input.index,
+  );
   const includeReferences = state.direction !== "cited-by";
   const includeCitedBy = state.direction !== "references";
   const refs = includeReferences
     ? aggregateDirection(
         seeds,
         graph,
+        input.index,
         input.relationships,
         "references",
         indexes,
       )
     : new Map<string, AggregatedNode>();
   const cites = includeCitedBy
-    ? aggregateDirection(seeds, graph, input.relationships, "cited-by", indexes)
+    ? aggregateDirection(
+        seeds,
+        graph,
+        input.index,
+        input.relationships,
+        "cited-by",
+        indexes,
+      )
     : new Map<string, AggregatedNode>();
 
   const filterSeedCandidates = (entries: Map<string, AggregatedNode>) => {
@@ -488,9 +531,19 @@ export function buildGraphFocusProjection(
   const edges = new Map<string, CitationGraphEdge>();
 
   // Preserve direct seed-to-seed relations already known in the library graph.
-  for (const relation of graph.edges) {
-    if (seedKeys.has(relation.source) && seedKeys.has(relation.target)) {
-      edges.set(`${relation.source}>${relation.target}`, { ...relation });
+  if (input.index) {
+    for (const source of seedKeys) {
+      for (const relation of input.index.outgoingEdgesByKey.get(source) ?? []) {
+        if (seedKeys.has(relation.target)) {
+          edges.set(`${relation.source}>${relation.target}`, { ...relation });
+        }
+      }
+    }
+  } else {
+    for (const relation of graph.edges) {
+      if (seedKeys.has(relation.source) && seedKeys.has(relation.target)) {
+        edges.set(`${relation.source}>${relation.target}`, { ...relation });
+      }
     }
   }
   // External seeds may not exist in the library graph. Detect their mutual

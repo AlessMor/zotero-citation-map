@@ -36,6 +36,12 @@ export interface ExternalRelationshipCacheEntry {
   fetchedAt: string;
 }
 
+export interface ExternalRelationshipCacheSummary {
+  relationshipKey: string;
+  count: number;
+  fetchedAt: string;
+}
+
 interface ExternalWorkCacheRow {
   identity_key: string;
   status: string;
@@ -415,10 +421,51 @@ export async function clearExternalWorkCache(): Promise<void> {
   });
 }
 
+export function getExternalRelationshipCacheSummary(
+  relationshipKey: string,
+): ExternalRelationshipCacheSummary | null {
+  const entry = relationshipMirror.get(relationshipKey);
+  return entry
+    ? {
+        relationshipKey,
+        count: entry.works.length,
+        fetchedAt: entry.fetchedAt,
+      }
+    : null;
+}
+
 export function getExternalRelationshipCacheSize(
   relationshipKey: string,
 ): number {
-  return relationshipMirror.get(relationshipKey)?.works.length ?? 0;
+  return getExternalRelationshipCacheSummary(relationshipKey)?.count ?? 0;
+}
+
+export function getExternalRelationshipCacheWorks(
+  relationshipKey: string,
+  maximum = Number.POSITIVE_INFINITY,
+): RelatedWorkMetadata[] {
+  const entry = relationshipMirror.get(relationshipKey);
+  if (!entry) return [];
+  const requestedMaximum = Number.isFinite(maximum)
+    ? Math.max(0, Math.floor(maximum))
+    : entry.works.length;
+  if (requestedMaximum === 0) return [];
+
+  // Small view projections should not hydrate and retain an entire 1,000+
+  // paper relationship list. Full callers still share one hydrated snapshot.
+  if (requestedMaximum < entry.works.length) {
+    return entry.works
+      .slice(0, requestedMaximum)
+      .map((work) => cloneRelatedWorkMetadata(hydrateRelationshipWork(work)));
+  }
+
+  let works = hydratedRelationshipMirror.get(relationshipKey);
+  if (!works) {
+    works = entry.works.map((work) => hydrateRelationshipWork(work));
+    hydratedRelationshipMirror.set(relationshipKey, works);
+    registerRelationshipDependencies(relationshipKey, entry.works);
+  }
+  return works.map((work) => cloneRelatedWorkMetadata(work));
 }
 
 export function getExternalRelationshipCacheEntry(
@@ -426,15 +473,9 @@ export function getExternalRelationshipCacheEntry(
 ): ExternalRelationshipCacheEntry | null {
   const entry = relationshipMirror.get(relationshipKey);
   if (!entry) return null;
-  let works = hydratedRelationshipMirror.get(relationshipKey);
-  if (!works) {
-    works = entry.works.map((work) => hydrateRelationshipWork(work));
-    hydratedRelationshipMirror.set(relationshipKey, works);
-    registerRelationshipDependencies(relationshipKey, entry.works);
-  }
   return {
     ...entry,
-    works: works.map((work) => cloneRelatedWorkMetadata(work)),
+    works: getExternalRelationshipCacheWorks(relationshipKey),
   };
 }
 
@@ -448,6 +489,7 @@ export async function saveExternalRelationshipCache(
   works: RelatedWorkMetadata[],
   options: { writeMetadata?: boolean; alreadyCanonical?: boolean } = {},
 ): Promise<void> {
+  const startedAt = Date.now();
   if (!(await ensureExternalWorkCache())) return;
   const fetchedAt = new Date().toISOString();
   const completeWorks = options.alreadyCanonical
@@ -515,11 +557,16 @@ export async function saveExternalRelationshipCache(
       fetchedAt,
     });
     registerRelationshipDependencies(relationshipKey, storedWorks);
-    hydratedRelationshipMirror.set(
-      relationshipKey,
-      completeWorks.map((work) => cloneRelatedWorkMetadata(work)),
-    );
+    // Do not retain a second fully cloned bibliography after every update.
+    // Full or limited hydrated views are constructed lazily when requested.
+    hydratedRelationshipMirror.delete(relationshipKey);
   });
+  const durationMs = Date.now() - startedAt;
+  if (durationMs >= 500) {
+    Zotero.debug(
+      `Citation Map: saved ${storedWorks.length} relationship members in ${durationMs} ms`,
+    );
+  }
 }
 
 export function getExternalWorkCacheEntry(
