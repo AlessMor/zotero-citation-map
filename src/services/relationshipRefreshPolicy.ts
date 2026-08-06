@@ -91,7 +91,7 @@ export function relationshipForegroundMetadataLimit(
 
 export interface AutomaticFocusSeedRefreshPlan {
   /** A newly introduced seed always verifies its current membership. */
-  forceRefresh: true;
+  forceRefresh: false;
   /** Delay long enough for the seed graph and progress popup to paint first. */
   startDelayMs: number;
   membershipLimit: number;
@@ -103,7 +103,7 @@ export interface AutomaticFocusSeedRefreshPlan {
 export function automaticFocusSeedRefreshPlan(): AutomaticFocusSeedRefreshPlan {
   const policy = relationshipRefreshPolicy("automatic");
   return {
-    forceRefresh: true,
+    forceRefresh: false,
     startDelayMs: 80,
     membershipLimit: policy.membershipLimit,
     foregroundMetadataLimit: 0,

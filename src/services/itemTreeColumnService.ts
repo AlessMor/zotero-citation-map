@@ -17,9 +17,77 @@ import { getShowMetricTooltipsEnabled } from "./citationPreferences";
 const registeredDataKeys: string[] = [];
 const descriptions = new Map<string, string>();
 const tooltipHandlers = new Map<Window, EventListener>();
+const pendingColumnResorts = new Map<
+  _ZoteroTypes.MainWindow,
+  ReturnType<typeof setTimeout>
+>();
+const activeColumnResorts = new Map<_ZoteroTypes.MainWindow, Promise<void>>();
 const VALUE_SEPARATOR = "\u001f";
+const COLUMN_RESORT_DELAY_MS = 100;
+const SORT_KEY_FIRST_LETTER_CODE = "a".charCodeAt(0);
 
 type ColumnMetricNode = ReturnType<typeof createMetricNodeForItem>;
+
+interface ItemTreeForColumnRefresh {
+  getSortField?: () => string;
+  sort?: () => Promise<void> | void;
+}
+
+function clearPendingColumnResorts(): void {
+  for (const timer of pendingColumnResorts.values()) {
+    clearTimeout(timer);
+  }
+  pendingColumnResorts.clear();
+}
+
+async function resortActiveCitationColumn(
+  win: _ZoteroTypes.MainWindow,
+): Promise<void> {
+  if (win.closed) return;
+  const itemTree = (win as any).ZoteroPane?.itemsView as
+    ItemTreeForColumnRefresh | false | undefined;
+  if (!itemTree || !itemTree.getSortField || !itemTree.sort) return;
+
+  const sortField = itemTree.getSortField();
+  if (!registeredDataKeys.includes(sortField)) return;
+
+  const startedAt = Date.now();
+  try {
+    resetColumnMetricNodeCache();
+    await itemTree.sort();
+    const durationMs = Date.now() - startedAt;
+    if (durationMs >= 500) {
+      Zotero.debug(
+        `Citation Map: resorted active metric column in ${durationMs} ms`,
+      );
+    }
+  } catch (error) {
+    Zotero.debug(
+      `Citation Map: could not resort active metric column: ${String(error)}`,
+    );
+  }
+}
+
+function scheduleActiveCitationColumnResort(): void {
+  for (const win of Zotero.getMainWindows()) {
+    if (win.closed) continue;
+    const previous = pendingColumnResorts.get(win);
+    if (previous) clearTimeout(previous);
+    const timer = setTimeout(() => {
+      pendingColumnResorts.delete(win);
+      const previous = activeColumnResorts.get(win) ?? Promise.resolve();
+      const next = previous
+        .then(() => resortActiveCitationColumn(win))
+        .finally(() => {
+          if (activeColumnResorts.get(win) === next) {
+            activeColumnResorts.delete(win);
+          }
+        });
+      activeColumnResorts.set(win, next);
+    }, COLUMN_RESORT_DELAY_MS);
+    pendingColumnResorts.set(win, timer);
+  }
+}
 
 let columnMetricNodeCache = new WeakMap<Zotero.Item, ColumnMetricNode>();
 let columnMetricNodeCacheResetScheduled = false;
@@ -72,7 +140,14 @@ function floatSortKey(value: number): string {
   let bits = view.getBigUint64(0, false);
   const sign = 1n << 63n;
   bits = bits & sign ? ~bits & ((1n << 64n) - 1n) : bits ^ sign;
-  return bits.toString(16).padStart(16, "0");
+  const hexadecimal = bits.toString(16).padStart(16, "0");
+  // Zotero uses natural collation, which splits digit runs inside hexadecimal
+  // keys. Mapping each nibble to a-p preserves byte order as plain text.
+  return Array.from(hexadecimal, (digit) =>
+    String.fromCharCode(
+      SORT_KEY_FIRST_LETTER_CODE + Number.parseInt(digit, 16),
+    ),
+  ).join("");
 }
 
 function stringSortKey(value: string): string {
@@ -258,6 +333,7 @@ export function refreshCitationColumns(): void {
   const startedAt = Date.now();
   try {
     Zotero.ItemTreeManager.refreshColumns();
+    scheduleActiveCitationColumnResort();
     const durationMs = Date.now() - startedAt;
     if (durationMs >= 500) {
       Zotero.debug(
@@ -271,6 +347,7 @@ export function refreshCitationColumns(): void {
 
 export function unregisterCitationColumns(): void {
   resetColumnMetricNodeCache();
+  clearPendingColumnResorts();
   for (const [win, handler] of tooltipHandlers) {
     win.document.removeEventListener("mouseover", handler, true);
     uninstallDataSourceHoverTooltips(win.document);
