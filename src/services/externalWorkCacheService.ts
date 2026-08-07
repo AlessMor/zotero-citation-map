@@ -440,6 +440,34 @@ export function getExternalRelationshipCacheSize(
   return getExternalRelationshipCacheSummary(relationshipKey)?.count ?? 0;
 }
 
+/** Return persisted relationship members without joining the rich metadata cache. */
+export function getExternalRelationshipCacheCompactWorks(
+  relationshipKey: string,
+  maximum = Number.POSITIVE_INFINITY,
+): RelatedWorkMetadata[] {
+  const entry = relationshipMirror.get(relationshipKey);
+  if (!entry) return [];
+  const requestedMaximum = Number.isFinite(maximum)
+    ? Math.max(0, Math.floor(maximum))
+    : entry.works.length;
+  return entry.works
+    .slice(0, requestedMaximum)
+    .map((work) => cloneRelatedWorkMetadata(work));
+}
+
+export function getExternalRelationshipCacheCompactEntry(
+  relationshipKey: string,
+  maximum = Number.POSITIVE_INFINITY,
+): ExternalRelationshipCacheEntry | null {
+  const entry = relationshipMirror.get(relationshipKey);
+  if (!entry) return null;
+  return {
+    relationshipKey: entry.relationshipKey,
+    works: getExternalRelationshipCacheCompactWorks(relationshipKey, maximum),
+    fetchedAt: entry.fetchedAt,
+  };
+}
+
 export function getExternalRelationshipCacheWorks(
   relationshipKey: string,
   maximum = Number.POSITIVE_INFINITY,

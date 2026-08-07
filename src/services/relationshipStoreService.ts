@@ -14,6 +14,7 @@ import {
 } from "../domain/relatedWorkMetadata";
 import {
   cachedExternalWorkMetadata,
+  getExternalRelationshipCacheCompactEntry,
   getExternalRelationshipCacheEntry,
   getExternalRelationshipCacheSize,
   getExternalRelationshipCacheWorks,
@@ -175,7 +176,22 @@ export function mergeRelatedWorkLists(
     .map(([, work]) => work);
 }
 
+/**
+ * Return the compact canonical membership stored with the relationship row.
+ * This path is used for navigation/status views and deliberately avoids
+ * hydrating every neighbour from the rich external-work metadata cache.
+ */
 export function getStoredRelationshipEntry(
+  node: RelationshipStoreSubject,
+  direction: StoredRelationshipDirection,
+): ExternalRelationshipCacheEntry | null {
+  return getExternalRelationshipCacheCompactEntry(
+    selectedRelationshipStoreKey(node, direction),
+  );
+}
+
+/** Rich relationship metadata for callers that explicitly need it. */
+export function getStoredRelationshipHydratedEntry(
   node: RelationshipStoreSubject,
   direction: StoredRelationshipDirection,
 ): ExternalRelationshipCacheEntry | null {

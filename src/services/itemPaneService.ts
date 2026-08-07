@@ -102,6 +102,8 @@ import { loadWholeLibrary } from "./zoteroLibraryService";
 const HTML_NS = "http://www.w3.org/1999/xhtml";
 const PANE_ID = "citation-map-item-pane";
 const RELATION_LIMIT = RELATIONSHIP_VIEW_LIMIT;
+const RELATION_PAGE_SIZE = 48;
+const ITEM_PANE_REFRESH_DEBOUNCE_MS = 150;
 type PaneTab = "overview" | "cited-by" | "references";
 interface PaneTabState {
   itemKey: string;
@@ -1217,7 +1219,6 @@ async function renderRelations(
     let updateOutcome: string | null = null;
     let shownCount = entries.length;
     let filtered = false;
-    let renderGeneration = 0;
     let descriptorCache = new Map<
       RelationEntry,
       ReturnType<typeof describeExternalWork>
@@ -1279,7 +1280,6 @@ async function renderRelations(
     container.append(status, list);
 
     renderList = (): void => {
-      const generation = ++renderGeneration;
       clear(list);
       const ordered = toolbar.apply(
         entries,
@@ -1305,10 +1305,15 @@ async function renderRelations(
         return;
       }
 
-      let index = 0;
-      const appendNextBatch = (): void => {
-        if (generation !== renderGeneration || !list.isConnected) return;
-        for (const entry of ordered.slice(index, index + 24)) {
+      let page = 0;
+      const renderPage = (): void => {
+        if (!list.isConnected) return;
+        clear(list);
+        const pageCount = Math.max(1, Math.ceil(ordered.length / RELATION_PAGE_SIZE));
+        page = Math.max(0, Math.min(page, pageCount - 1));
+        const start = page * RELATION_PAGE_SIZE;
+        const end = Math.min(ordered.length, start + RELATION_PAGE_SIZE);
+        for (const entry of ordered.slice(start, end)) {
           renderRelationCard(
             document,
             list,
@@ -1320,14 +1325,39 @@ async function renderRelations(
             rerender,
           );
         }
-        index += 24;
-        if (index < ordered.length) {
-          const view = document.defaultView;
-          if (view) view.requestAnimationFrame(appendNextBatch);
-          else setTimeout(appendNextBatch, 0);
-        }
+        if (ordered.length <= RELATION_PAGE_SIZE) return;
+
+        const pager = el(document, "div", "citation-map-pane-actions");
+        pager.style.justifyContent = "space-between";
+        pager.style.alignItems = "center";
+        const previous = el(document, "button");
+        previous.type = "button";
+        previous.textContent = "Previous";
+        previous.disabled = page === 0;
+        previous.addEventListener("click", () => {
+          if (page === 0) return;
+          page -= 1;
+          renderPage();
+        });
+        const position = txt(
+          document,
+          "span",
+          `${start + 1}–${end} of ${ordered.length}`,
+          "citation-map-secondary-text",
+        );
+        const next = el(document, "button");
+        next.type = "button";
+        next.textContent = "Next";
+        next.disabled = page >= pageCount - 1;
+        next.addEventListener("click", () => {
+          if (page >= pageCount - 1) return;
+          page += 1;
+          renderPage();
+        });
+        pager.append(previous, position, next);
+        list.appendChild(pager);
       };
-      appendNextBatch();
+      renderPage();
     };
 
     update.addEventListener("click", () => {
@@ -1579,7 +1609,9 @@ function scheduleCitationItemPaneRefresh(
   } else {
     pendingPaneRefreshes.add(itemPaneRefreshKey(libraryID, itemKey));
   }
-  if (scheduledPaneRefresh !== null) return;
+  // Debounce bursts of metadata publications instead of refreshing once every
+  // 30 ms while a large relationship set is being enriched in the background.
+  if (scheduledPaneRefresh !== null) clearTimeout(scheduledPaneRefresh);
   scheduledPaneRefresh = setTimeout(() => {
     scheduledPaneRefresh = null;
     const fullRefresh = pendingFullPaneRefresh;
@@ -1603,7 +1635,7 @@ function scheduleCitationItemPaneRefresh(
         ),
       );
     }
-  }, 30);
+  }, ITEM_PANE_REFRESH_DEBOUNCE_MS);
 }
 
 export function refreshCitationItemPanes(): void {
