@@ -15,6 +15,12 @@ import {
   renameCitationMapView,
 } from "./windowService";
 import { loadWholeLibrary } from "./zoteroLibraryService";
+import {
+  firstSelectedLibraryID,
+  readContextValue,
+  selectedCollectionIDs,
+  selectedLibraryIDsFromPane,
+} from "./zoteroSelectionService";
 
 const registeredMenuIDs: string[] = [];
 const ICON = `chrome://${config.addonRef}/content/icons/network.svg`;
@@ -25,7 +31,7 @@ type MenuData = Record<string, unknown>;
 
 interface MenuCommandContext {
   itemIDs: number[];
-  collectionID: number | null;
+  collectionIDs: number[];
   libraryID: number;
 }
 
@@ -36,22 +42,16 @@ type MenuContextResolver = (
 function register(definition: Record<string, unknown>): void {
   const manager = (Zotero as any).MenuManager;
   if (!manager?.registerMenu) {
-    throw new Error("Zotero.MenuManager is unavailable. Zotero 9 is required.");
+    throw new Error(
+      "Zotero.MenuManager is unavailable. Zotero 9 or later is required.",
+    );
   }
   const id = manager.registerMenu(definition);
   if (id) registeredMenuIDs.push(id);
 }
 
-function safeContextValue(context: any, key: string): any {
-  try {
-    return context?.[key];
-  } catch {
-    return null;
-  }
-}
-
 function contextWindow(context?: any): MainWindow {
-  const menuElem = safeContextValue(context, "menuElem") as
+  const menuElem = readContextValue(context, "menuElem") as
     HTMLElement | undefined;
   const candidate =
     (menuElem as any)?.ownerGlobal ?? menuElem?.ownerDocument?.defaultView;
@@ -65,17 +65,10 @@ function paneForContext(context?: any): any {
 }
 
 function activeLibraryID(context?: any): number {
-  const pane = paneForContext(context);
-  const direct = positiveInteger(pane?.getSelectedLibraryID?.());
-  if (direct) return direct;
-
-  const row = pane?.getCollectionTreeRow?.() as any;
-  const fromRow = positiveInteger(row?.libraryID ?? row?.ref?.libraryID);
-  if (fromRow) return fromRow;
-
-  const selected = pane?.getSelectedItems?.() ?? [];
-  const fromItem = positiveInteger(selected[0]?.libraryID);
-  return fromItem ?? Zotero.Libraries.userLibraryID;
+  return firstSelectedLibraryID(
+    paneForContext(context),
+    Zotero.Libraries.userLibraryID,
+  );
 }
 
 function selectedRegularItems(context: any): Zotero.Item[] {
@@ -86,66 +79,66 @@ function selectedRegularItems(context: any): Zotero.Item[] {
   );
 }
 
-function selectedCollection(context?: any): any | null {
-  const pane = paneForContext(context);
-  const candidates = [
-    safeContextValue(context, "collection"),
-    safeContextValue(context, "collectionTreeRow"),
-    safeContextValue(context, "row"),
-    pane?.getCollectionTreeRow?.(),
-    pane?.getSelectedCollection?.(),
-  ];
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    if (
-      typeof candidate.isCollection === "function" &&
-      !candidate.isCollection()
-    ) {
-      continue;
-    }
-    const ref = candidate.ref ?? candidate.collection ?? candidate;
-    const collectionID = positiveInteger(
-      ref.collectionID ?? ref.id ?? candidate.collectionID ?? candidate.id,
-    );
-    if (!collectionID) continue;
-    const collection = Zotero.Collections.get(collectionID) as any;
-    if (collection) return collection;
-  }
-  return null;
+function selectedCollections(context?: any): any[] {
+  return selectedCollectionIDs(paneForContext(context), context)
+    .map((id) => Zotero.Collections.get(id) as any)
+    .filter(Boolean);
 }
 
 async function activeLibraryRegularItems(
   context?: any,
 ): Promise<Zotero.Item[]> {
-  const items = (await Zotero.Items.getAll(
-    activeLibraryID(context),
-  )) as Zotero.Item[];
+  const libraryIDs = selectedLibraryIDsFromPane(paneForContext(context));
+  const ids = libraryIDs.length ? libraryIDs : [Zotero.Libraries.userLibraryID];
+  const items: Zotero.Item[] = [];
+  for (const libraryID of ids) {
+    items.push(...((await Zotero.Items.getAll(libraryID)) as Zotero.Item[]));
+  }
   return items.filter((item) => item?.isRegularItem?.() && !item.deleted);
 }
 
-async function collectionRegularItems(collection: any): Promise<Zotero.Item[]> {
-  const collectionID = positiveInteger(
-    collection?.id ?? collection?.collectionID,
-  );
-  const libraryID = positiveInteger(collection?.libraryID);
-  if (!collectionID || !libraryID) return [];
-  const snapshot = await loadWholeLibrary(libraryID);
-  const descriptor = snapshot.collections.find(
-    (entry) => entry.collectionID === collectionID,
-  );
-  const included = new Set(
-    descriptor?.includedCollectionIDs?.length
-      ? descriptor.includedCollectionIDs
-      : [collectionID],
-  );
-  return snapshot.papers
-    .filter((paper) =>
-      paper.collectionIDs.some((candidate) => included.has(candidate)),
-    )
-    .map((paper) => Zotero.Items.get(paper.itemID) as Zotero.Item | null)
-    .filter((item): item is Zotero.Item =>
-      Boolean(item?.isRegularItem?.() && !item.deleted),
+async function collectionRegularItems(
+  collections: readonly any[],
+): Promise<Zotero.Item[]> {
+  const byLibrary = new Map<number, Set<number>>();
+  for (const collection of collections) {
+    const collectionID = positiveInteger(
+      collection?.id ?? collection?.collectionID,
     );
+    const libraryID = positiveInteger(collection?.libraryID);
+    if (!collectionID || !libraryID) continue;
+    const ids = byLibrary.get(libraryID) ?? new Set<number>();
+    ids.add(collectionID);
+    byLibrary.set(libraryID, ids);
+  }
+
+  const items: Zotero.Item[] = [];
+  const seen = new Set<number>();
+  for (const [libraryID, collectionIDs] of byLibrary) {
+    const snapshot = await loadWholeLibrary(libraryID);
+    const included = new Set<number>();
+    for (const collectionID of collectionIDs) {
+      const descriptor = snapshot.collections.find(
+        (entry) => entry.collectionID === collectionID,
+      );
+      for (const id of descriptor?.includedCollectionIDs?.length
+        ? descriptor.includedCollectionIDs
+        : [collectionID]) {
+        included.add(id);
+      }
+    }
+    for (const paper of snapshot.papers) {
+      if (!paper.collectionIDs.some((candidate) => included.has(candidate))) {
+        continue;
+      }
+      if (seen.has(paper.itemID)) continue;
+      const item = Zotero.Items.get(paper.itemID) as Zotero.Item | null;
+      if (!item?.isRegularItem?.() || item.deleted) continue;
+      seen.add(paper.itemID);
+      items.push(item);
+    }
+  }
+  return items;
 }
 
 function itemIDs(items: readonly Zotero.Item[]): number[] {
@@ -179,9 +172,11 @@ function refreshItems(items: readonly Zotero.Item[]): void {
 
 async function focusItemIDs(command: MenuCommandContext): Promise<number[]> {
   if (command.itemIDs.length) return command.itemIDs;
-  if (!command.collectionID) return [];
-  const collection = Zotero.Collections.get(command.collectionID) as any;
-  return collection ? itemIDs(await collectionRegularItems(collection)) : [];
+  if (!command.collectionIDs.length) return [];
+  const collections = command.collectionIDs
+    .map((id) => Zotero.Collections.get(id) as any)
+    .filter(Boolean);
+  return itemIDs(await collectionRegularItems(collections));
 }
 
 async function openInNewMap(
@@ -192,7 +187,7 @@ async function openInNewMap(
     await openCitationMapAndSelectItemsInNewTab(command.itemIDs, hostWindow);
     return;
   }
-  if (command.collectionID) {
+  if (command.collectionIDs.length) {
     const ids = await focusItemIDs(command);
     if (ids.length) {
       await openCitationMapAndSelectItemsInNewTab(ids, hostWindow);
@@ -230,7 +225,7 @@ async function openInExistingView(
     );
     return;
   }
-  if (command.collectionID) {
+  if (command.collectionIDs.length) {
     const ids = await focusItemIDs(command);
     if (ids.length) {
       await openCitationMapAndSelectItemsInView(
@@ -284,7 +279,7 @@ function openInSubmenu(resolve: MenuContextResolver): MenuData {
     menus: [newMap, newFocus],
   };
   submenu.onShowing = (_event: Event, context: any) => {
-    const menuElem = safeContextValue(context, "menuElem") as
+    const menuElem = readContextValue(context, "menuElem") as
       HTMLElement | undefined;
     const popup = menuElem?.querySelector(
       ":scope > menupopup",
@@ -337,18 +332,18 @@ function itemResolver(context: any): MenuCommandContext {
   const items = selectedRegularItems(context);
   return {
     itemIDs: itemIDs(items),
-    collectionID: null,
+    collectionIDs: [],
     libraryID: positiveInteger(items[0]?.libraryID) ?? activeLibraryID(context),
   };
 }
 
 function collectionResolver(context: any): MenuCommandContext {
-  const collection = selectedCollection(context);
+  const collections = selectedCollections(context);
   return {
     itemIDs: [],
-    collectionID: positiveInteger(collection?.id ?? collection?.collectionID),
+    collectionIDs: selectedCollectionIDs(paneForContext(context), context),
     libraryID:
-      positiveInteger(collection?.libraryID) ?? activeLibraryID(context),
+      positiveInteger(collections[0]?.libraryID) ?? activeLibraryID(context),
   };
 }
 
@@ -377,15 +372,17 @@ function collectionSubmenu(): MenuData {
     l10nID: `${config.addonRef}-tools-submenu`,
     icon: ICON,
     onShowing: (_event: Event, context: any) => {
-      const collection = selectedCollection(context);
-      context.setVisible(Boolean(collection));
-      context.setEnabled(Boolean(collection));
+      const collections = selectedCollections(context);
+      context.setVisible(collections.length > 0);
+      context.setEnabled(collections.length > 0);
     },
     menus: [
       openInSubmenu(collectionResolver),
       commandItem(`${config.addonRef}-refresh-command`, async (context) => {
-        const collection = selectedCollection(context);
-        if (collection) refreshItems(await collectionRegularItems(collection));
+        const collections = selectedCollections(context);
+        if (collections.length) {
+          refreshItems(await collectionRegularItems(collections));
+        }
       }),
     ],
   };
@@ -431,13 +428,13 @@ function tabRenameItem(): MenuData {
     l10nID: `${config.addonRef}-rename-view-command`,
     onShowing: (_event: Event, context: any) => {
       const tabType = String(
-        safeContextValue(context, "tabType") ?? "",
+        readContextValue(context, "tabType") ?? "",
       ).replace(/-unloaded$/, "");
       context.setVisible(tabType === "citationmap");
       context.setEnabled(tabType === "citationmap");
     },
     onCommand: (_event: Event, context: any) => {
-      const tabID = String(safeContextValue(context, "tabID") ?? "");
+      const tabID = String(readContextValue(context, "tabID") ?? "");
       if (!tabID || tabID === "zotero-pane") return;
       const hostWindow = contextWindow(context);
       const current = getOpenCitationMapViews(hostWindow).find(

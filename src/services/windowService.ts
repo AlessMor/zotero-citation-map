@@ -7,6 +7,7 @@ import {
   renderCitationMapView,
 } from "./graphViewService";
 import { loadWholeLibrary } from "./zoteroLibraryService";
+import { selectedLibraryIDsFromPane } from "./zoteroSelectionService";
 import {
   installDataSourceHoverTooltips,
   uninstallDataSourceHoverTooltips,
@@ -154,12 +155,9 @@ function selectedLibraryID(win: _ZoteroTypes.MainWindow): number {
   const panes = [Zotero.getActiveZoteroPane?.(), win.ZoteroPane].filter(
     (pane, index, values) => pane && values.indexOf(pane) === index,
   );
-  for (const pane of panes as any[]) {
-    const direct = positiveInteger(pane.getSelectedLibraryID?.());
-    if (direct) return direct;
-    const selectedItems = pane.getSelectedItems?.() ?? [];
-    const fromItem = positiveInteger(selectedItems[0]?.libraryID);
-    if (fromItem) return fromItem;
+  for (const pane of panes) {
+    const libraryID = selectedLibraryIDsFromPane(pane)[0];
+    if (libraryID) return libraryID;
   }
   return Zotero.Libraries.userLibraryID;
 }
