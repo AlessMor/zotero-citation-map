@@ -150,7 +150,9 @@ export function localExternalWorkIndexes(
   const byDOI = new Map<string, LibraryWorkIdentity>();
   const byTitle = new Map<string, LibraryWorkIdentity>();
   for (const node of nodes) {
-    const key = String(node.itemKey ?? "").trim().toLocaleUpperCase();
+    const key = String(node.itemKey ?? "")
+      .trim()
+      .toLocaleUpperCase();
     const doi = normalizeDOI(node.doi);
     const title = normalizeExactTitle(node.title);
     if (key && !byKey.has(key)) byKey.set(key, node);
@@ -166,9 +168,7 @@ function localWorkForExternal(
   localByTitle: Map<string, LibraryWorkIdentity>,
   localByKey?: Map<string, LibraryWorkIdentity>,
 ): LibraryWorkIdentity | null {
-  const explicitKey = String(
-    work.inLibraryItemKey ?? work.zoteroItemKey ?? "",
-  )
+  const explicitKey = String(work.inLibraryItemKey ?? work.zoteroItemKey ?? "")
     .trim()
     .toLocaleUpperCase();
   if (explicitKey && localByKey) {
@@ -207,7 +207,9 @@ function mergeLocalZoteroMetadata<T extends RelatedWorkMetadata>(
   const localDOI = normalizeDOI(local.doi);
   const workTitle = usableExternalTitle(work.title, workDOI);
   const localTitle = usableExternalTitle(local.title, localDOI);
-  const workAuthors = work.authors.map((author) => author.trim()).filter(Boolean);
+  const workAuthors = work.authors
+    .map((author) => author.trim())
+    .filter(Boolean);
   const localAuthors = (local.authors ?? [])
     .map((author) => String(author ?? "").trim())
     .filter(Boolean);
@@ -239,7 +241,10 @@ function mergeLocalZoteroMetadata<T extends RelatedWorkMetadata>(
     authors: workAuthors.length ? workAuthors : localAuthors,
     year: work.year ?? local.year ?? null,
     publicationDate:
-      workPublicationDate || localPublicationDate || work.publicationDate || null,
+      workPublicationDate ||
+      localPublicationDate ||
+      work.publicationDate ||
+      null,
     sourceTitle: workSourceTitle ?? localSourceTitle,
     abstract: workAbstract ?? localAbstract,
     zoteroItemKey: work.zoteroItemKey ?? local.itemKey,

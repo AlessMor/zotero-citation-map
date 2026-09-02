@@ -23,6 +23,11 @@ import {
   stableExternalWorkIdentity,
 } from "../domain/workIdentity";
 import { getOpenAlexAPIKey } from "./citationPreferences";
+import {
+  mergeDataCiteMetadata,
+  needsDataCiteMetadata,
+  resolveDataCiteMetadata,
+} from "./dataCiteMetadataService";
 import { providerExecutionPolicy } from "./providerExecutionPolicy";
 import {
   projectRelatedWorkSummary,
@@ -654,6 +659,22 @@ export async function resolveRelatedWorkSummaries(
       ? Math.max(0, remaining - fallback.used)
       : remaining;
   }
+
+  const dataCiteCandidates = works
+    .map((work, index) => ({ work, index }))
+    .filter(({ work }) => needsDataCiteMetadata(work))
+    .map(({ index }) => index);
+  await mapBounded(
+    dataCiteCandidates,
+    2,
+    async (index) => {
+      const metadata = await resolveDataCiteMetadata(works[index].doi);
+      if (!metadata) return;
+      works[index] = mergeDataCiteMetadata(works[index], metadata);
+      successfullyResolved.add(index);
+    },
+    { yieldAfterEach: true },
+  );
 
   return works.map((work, index) => {
     const identity = stableExternalWorkIdentity(work);
