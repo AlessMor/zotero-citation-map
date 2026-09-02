@@ -1,6 +1,6 @@
 # Zotero Citation Map:
 
-Zotero Citation Map is a plugin for Zotero 9 that brings citation networks,bibliometric data, and paper discovery directly into your Zotero library.
+Zotero Citation Map is a plugin for Zotero 9 and 10 that brings citation networks,bibliometric data, and paper discovery directly into your Zotero library.
 
 The project began as a weekend experiment. I wanted to test how far I could take ChatGPT 5.6 SOL while solving a minor annoyance in my own research workflow.
 
