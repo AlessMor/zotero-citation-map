@@ -34,6 +34,21 @@ jobs:
           NPM_CONFIG_STRICT_ALLOW_SCRIPTS: "false"
         run: npm ci
 
+      - name: Format ADS provider and keep repository clean
+        id: format
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx prettier --write src/providers/nasaADSProvider.ts
+          if ! git diff --quiet -- src/providers/nasaADSProvider.ts; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/providers/nasaADSProvider.ts
+            git commit -m "Format NASA ADS provider"
+            git push origin HEAD:main
+          fi
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Verify source
         run: npm run check
 
@@ -75,6 +90,7 @@ jobs:
       - name: Create version release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.format.outputs.release_sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -82,7 +98,7 @@ jobs:
             gh release upload v0.6.1 zotero-citation-map.xpi --clobber
           else
             gh release create v0.6.1 zotero-citation-map.xpi \
-              --target "$GITHUB_SHA" \
+              --target "$RELEASE_SHA" \
               --title "v0.6.1 — NASA ADS provider" \
               --notes "Adds NASA ADS as a first-class Citation Map data provider for astronomy. Supports DOI/arXiv/title resolution, ADS citation and reference counts, References and Cited by lists, ADS links, and token-aware Automatic mode. Based on the current Citation Map 0.6.x codebase for Zotero 9 and 10."
           fi
@@ -90,6 +106,7 @@ jobs:
       - name: Publish update manifests
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.format.outputs.release_sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -97,7 +114,7 @@ jobs:
             gh release upload release update.json update-beta.json --clobber
           else
             gh release create release update.json update-beta.json \
-              --target "$GITHUB_SHA" \
+              --target "$RELEASE_SHA" \
               --title "Release Manifest" \
               --notes "Update manifests for Zotero automatic updates. Do not delete this release." \
               --prerelease
