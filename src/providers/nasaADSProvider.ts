@@ -60,7 +60,10 @@ function searchURL(query: string, rows: number, start: number): string {
   const url = new URL(NASA_ADS_SEARCH_URL);
   url.searchParams.set("q", query);
   url.searchParams.set("fl", NASA_ADS_FIELDS);
-  url.searchParams.set("rows", String(Math.max(1, Math.min(2000, Math.floor(rows)))));
+  url.searchParams.set(
+    "rows",
+    String(Math.max(1, Math.min(2000, Math.floor(rows)))),
+  );
   url.searchParams.set("start", String(Math.max(0, Math.floor(start))));
   return url.toString();
 }
@@ -176,7 +179,8 @@ function matchRecord(
     return (
       records.find(
         (record) =>
-          String(arxivID(record.identifier) ?? "").toLocaleLowerCase() === wanted,
+          String(arxivID(record.identifier) ?? "").toLocaleLowerCase() ===
+          wanted,
       ) ?? records[0]
     );
   }
@@ -327,7 +331,8 @@ export const nasaADSProvider: CitationProvider = {
   supports: (identifiers) => Boolean(identifiers.doi || identifiers.arxiv),
   lookup: (identifiers, options) => lookup(identifiers, options),
   lookupForRelations: (identifiers, options) => lookup(identifiers, options),
-  searchExactTitle: (identifiers, options) => lookup(identifiers, options, true),
+  searchExactTitle: (identifiers, options) =>
+    lookup(identifiers, options, true),
   fetchCitingWorks: (bibcode, maximum, offset, options) =>
     fetchRelations(bibcode, "citations", maximum, offset, options),
   fetchReferencedWorks: (bibcode, maximum, offset, options) =>
