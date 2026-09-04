@@ -1,6 +1,8 @@
-# Zotero Citation Map:
+# Zotero Citation Map
 
-Zotero Citation Map is a plugin for Zotero 9 and 10 that brings citation networks,bibliometric data, and paper discovery directly into your Zotero library.
+Zotero Citation Map is a plugin for Zotero 9 and 10 that brings citation networks, bibliometric data, and paper discovery directly into your Zotero library.
+
+This fork keeps the original Citation Map workflow and adds **NASA ADS** as a first-class citation-data provider for astronomy and astrophysics.
 
 The project began as a weekend experiment. I wanted to test how far I could take ChatGPT 5.6 SOL while solving a minor annoyance in my own research workflow.
 
@@ -10,26 +12,26 @@ So I decided to see if something along those lines could be integrated directly 
 
 ![zotero-citation-map overview](docs/assets/Registrazione%202026-07-20%20231456.gif)
 
-## Installation:
+## Installation
 
-1. Open the last [release](https://github.com/AlessMor/zotero-citation-map/releases/latest) page.
+1. Open the latest [release](https://github.com/RickWashon/zotero-citation-map/releases/latest) page.
 
 2. Under **Assets**, download the latest `.xpi` file.
 
    > Do not download the automatically generated **Source code** `.zip` or `.tar.gz` archives.
 
-3. in Zotero, open **Tools → Plugins**.
+3. In Zotero, open **Tools → Plugins**.
 
 4. Drag the downloaded `.xpi` file into the Plugins window and confirm the installation when prompted.
 
 5. Restart Zotero if required.
 
-To **update** the plugin, install the newer `.xpi` in the same way. Zotero willreplace the existing version.
+To **update** the plugin, install the newer `.xpi` in the same way. Zotero will replace the existing version.
 
 ## Main Features
 
 - **See how papers in your library are connected**
-  Build an interactive citation map for a library, collection, or selectedpapers. Search and filter the graph, inspect a paper, and return directly toits Zotero item, notes, or PDF.
+  Build an interactive citation map for a library, collection, or selected papers. Search and filter the graph, inspect a paper, and return directly to its Zotero item, notes, or PDF.
   ![graph](docs/assets/FreeGraph.png)
 
 - **Focus on one or more papers**
@@ -50,8 +52,22 @@ To **update** the plugin, install the newer `.xpi` in the same way. Zotero willr
   Open several Citation Map and Focus View tabs at once. Rename views and use `Open in ›` to create a new view or add a paper to an existing one. Each view keeps its own scope, filters, selection, camera, and navigation history.
 
 - **Control providers and updates**
-  Choose which scholarly-data providers to use, which Zotero libraries shouldupdate automatically, and when cached data become stale. Refresh data manually when needed; long updates show progress and can be cancelled.
+  Choose which scholarly-data providers to use, which Zotero libraries should update automatically, and when cached data become stale. Refresh data manually when needed; long updates show progress and can be cancelled.
   ![settings](docs/assets/Settings.png)
+
+## NASA ADS support
+
+NASA ADS support is intended for astronomy and astrophysics users. In **Settings → Citation Map → Citation Data Providers**, enable **NASA ADS** and paste your ADS API token.
+
+The provider can resolve papers by DOI or arXiv ID, with exact-title fallback when enabled, and contributes:
+
+- citation counts;
+- reference counts;
+- references;
+- citing papers;
+- astronomy-focused bibliographic metadata and ADS bibcodes.
+
+When Automatic provider mode is enabled but no ADS token is configured, Citation Map skips ADS rather than delaying the other providers.
 
 ## Data sources
 
@@ -62,25 +78,20 @@ Citation and bibliographic data can be retrieved from:
 - [OpenCitations](https://opencitations.net/)
 - [INSPIRE-HEP](https://inspirehep.net/)
 - [OpenAlex](https://openalex.org/) (requires API key)
+- [NASA ADS](https://ui.adsabs.harvard.edu/) (requires API token)
 
-These services are independent of this project. Their terms, coverage, rate
-limits, and data-quality limitations apply. Counts and relationship lists may
-differ between providers. The plugin will try to integrate their data, preferring largest citation count.
+These services are independent of this project. Their terms, coverage, rate limits, and data-quality limitations apply. Counts and relationship lists may differ between providers. The plugin integrates their data and can combine provider results in Automatic mode.
 
-## Acknowledgements:
+## Acknowledgements
+
+This repository is a fork of [AlessMor/zotero-citation-map](https://github.com/AlessMor/zotero-citation-map). The NASA ADS integration in this fork is an astronomy-focused extension; the original Citation Map design, visualization, and provider architecture are credited to the upstream project and its contributors.
 
 The project was mainly inspired by other Zotero plugins:
 
 - [windingwind/zotero-plugin-template](https://github.com/windingwind/zotero-plugin-template): initial template for the plugin.
-
 - [zotero-cita/zotero-cita](https://github.com/zotero-cita/zotero-cita)
-
 - [phdemotions/zotero-citegeist](https://github.com/phdemotions/zotero-citegeist)
-
 - [eschnett/zotero-citationcounts](https://github.com/eschnett/zotero-citationcounts)
-
 - [MuiseDestiny/zotero-style](https://github.com/MuiseDestiny/zotero-style)
-
 - [danieleongari/zotero-openalex](https://github.com/danieleongari/zotero-openalex)
-
 - [zotero-INSPIRE](https://github.com/fkguo/zotero-inspire)

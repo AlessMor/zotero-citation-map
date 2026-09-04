@@ -1,0 +1,104 @@
+name: Publish NASA ADS v0.6.1
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: contains(github.event.head_commit.message, '[publish-ads-v0.6.1]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Pin npm
+        run: npm install --global npm@11.18.0
+
+      - name: Install dependencies
+        env:
+          NPM_CONFIG_STRICT_ALLOW_SCRIPTS: "false"
+        run: npm ci
+
+      - name: Verify source
+        run: npm run check
+
+      - name: Build XPI
+        run: npm run build
+
+      - name: Prepare release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          XPI="$(find .scaffold -type f -name '*.xpi' -print -quit)"
+          if [ -z "$XPI" ]; then
+            echo "No XPI produced by the build" >&2
+            exit 1
+          fi
+          cp "$XPI" zotero-citation-map.xpi
+          cat > update.json <<'JSON'
+          {
+            "addons": {
+              "citation-map@alessmor": {
+                "updates": [
+                  {
+                    "version": "0.6.1",
+                    "update_link": "https://github.com/RickWashon/zotero-citation-map/releases/download/v0.6.1/zotero-citation-map.xpi",
+                    "applications": {
+                      "zotero": {
+                        "strict_min_version": "9.0",
+                        "strict_max_version": "10.0.*"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+          JSON
+          cp update.json update-beta.json
+
+      - name: Create version release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view v0.6.1 >/dev/null 2>&1; then
+            gh release upload v0.6.1 zotero-citation-map.xpi --clobber
+          else
+            gh release create v0.6.1 zotero-citation-map.xpi \
+              --target "$GITHUB_SHA" \
+              --title "v0.6.1 — NASA ADS provider" \
+              --notes "Adds NASA ADS as a first-class Citation Map data provider for astronomy. Supports DOI/arXiv/title resolution, ADS citation and reference counts, References and Cited by lists, ADS links, and token-aware Automatic mode. Based on the current Citation Map 0.6.x codebase for Zotero 9 and 10."
+          fi
+
+      - name: Publish update manifests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view release >/dev/null 2>&1; then
+            gh release upload release update.json update-beta.json --clobber
+          else
+            gh release create release update.json update-beta.json \
+              --target "$GITHUB_SHA" \
+              --title "Release Manifest" \
+              --notes "Update manifests for Zotero automatic updates. Do not delete this release." \
+              --prerelease
+          fi

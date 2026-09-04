@@ -25,7 +25,6 @@ pref-refresh-interval-heading = Refresh Interval
 pref-cache-days = Refresh citation data after this many days
 pref-cache-days-help = Entries older than this interval are considered stale and can be refreshed automatically.
 
-
 pref-update-all-heading = Update selected libraries now
 pref-update-all-help = Refreshes every regular item in the selected libraries. Libraries are processed separately, and the update remains visible and cancellable.
 pref-refresh-all = Update selected libraries now
@@ -42,6 +41,7 @@ pref-provider-semantic-scholar = Semantic Scholar
 pref-provider-opencitations = OpenCitations
 pref-provider-inspire = INSPIRE-HEP
 pref-provider-openalex = OpenAlex
+pref-provider-ads = NASA ADS
 pref-provider-selection-help = Provider choices apply to new requests. Existing cached values remain available until they are refreshed or the cache is cleared.
 
 pref-openalex-api-key = API key — required
@@ -49,6 +49,9 @@ pref-openalex-api-key-help = Required to use OpenAlex. The key is stored only in
 pref-openalex-create-key = Create a free key in your OpenAlex account.
 pref-semantic-scholar-api-key = API key — optional
 pref-semantic-scholar-api-key-help = Optional but recommended for more reliable access. Without a key, Semantic Scholar requests use shared public rate limits.
+pref-ads-api-key = API token — required
+pref-ads-api-key-help = Required for NASA ADS. The token is stored only in Zotero preferences and is sent only to api.adsabs.harvard.edu.
+pref-ads-create-key = Open your NASA ADS token page.
 
 pref-matching-heading = Matching
 pref-title-fallback =

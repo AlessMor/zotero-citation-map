@@ -3,15 +3,17 @@
   "private": true,
   "type": "module",
   "packageManager": "npm@11.18.0",
-  "version": "0.6.0",
-  "description": "Citation and reference metrics with an interactive citation-network graph for Zotero 9 and 10.",
+  "version": "0.6.1",
+  "description": "Citation and reference metrics with an interactive citation-network graph for Zotero 9 and 10, with NASA ADS support for astronomy.",
   "keywords": [
     "zotero",
     "zotero-plugin",
     "citations",
     "references",
     "bibliometrics",
-    "citation-network"
+    "citation-network",
+    "astronomy",
+    "nasa-ads"
   ],
   "config": {
     "addonName": "Zotero Citation Map",
@@ -22,13 +24,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AlessMor/zotero-citation-map.git"
+    "url": "git+https://github.com/RickWashon/zotero-citation-map.git"
   },
   "author": "AlessMor",
   "bugs": {
-    "url": "https://github.com/AlessMor/zotero-citation-map/issues"
+    "url": "https://github.com/RickWashon/zotero-citation-map/issues"
   },
-  "homepage": "https://github.com/AlessMor/zotero-citation-map#readme",
+  "homepage": "https://github.com/RickWashon/zotero-citation-map#readme",
   "license": "AGPL-3.0-or-later",
   "engines": {
     "node": ">=24 <27",

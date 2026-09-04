@@ -1,7 +1,12 @@
 export type CitationProviderPreference = "auto" | CitationProviderID;
 
 export type CitationProviderID =
-  "crossref" | "semantic-scholar" | "opencitations" | "inspire" | "openalex";
+  | "crossref"
+  | "semantic-scholar"
+  | "opencitations"
+  | "inspire"
+  | "openalex"
+  | "ads";
 
 export const CITATION_PROVIDER_IDS: readonly CitationProviderID[] = [
   "crossref",
@@ -9,6 +14,7 @@ export const CITATION_PROVIDER_IDS: readonly CitationProviderID[] = [
   "opencitations",
   "inspire",
   "openalex",
+  "ads",
 ];
 
 export type IdentifierKind = "doi" | "pmid" | "arxiv" | "isbn" | "title";
