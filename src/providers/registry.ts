@@ -3,8 +3,10 @@ import type {
   CitationProviderPreference,
   ProviderLookupFailure,
 } from "../domain/citationTypes";
+import { getNASAADSAPIKey } from "../services/citationPreferences";
 import { crossrefProvider } from "./crossrefProvider";
 import { inspireProvider } from "./inspireProvider";
+import { nasaADSProvider } from "./nasaADSProvider";
 import { openAlexProvider } from "./openAlexProvider";
 import { openCitationsProvider } from "./openCitationsProvider";
 import { semanticScholarProvider } from "./semanticScholarProvider";
@@ -16,6 +18,7 @@ const PROVIDERS: Record<CitationProviderID, CitationProvider> = {
   opencitations: openCitationsProvider,
   inspire: inspireProvider,
   openalex: openAlexProvider,
+  ads: nasaADSProvider,
 };
 
 export type ProviderOperation =
@@ -47,12 +50,14 @@ const AUTOMATIC_PROVIDER_ORDERS: Record<
 > = {
   "work-lookup": [
     "crossref",
+    "ads",
     "semantic-scholar",
     "opencitations",
     "inspire",
     "openalex",
   ],
   "field-enrichment": [
+    "ads",
     "semantic-scholar",
     "opencitations",
     "inspire",
@@ -60,12 +65,14 @@ const AUTOMATIC_PROVIDER_ORDERS: Record<
     "crossref",
   ],
   "metadata-resolution": [
+    "ads",
     "semantic-scholar",
     "openalex",
     "crossref",
     "inspire",
   ],
   references: [
+    "ads",
     "semantic-scholar",
     "crossref",
     "inspire",
@@ -73,6 +80,7 @@ const AUTOMATIC_PROVIDER_ORDERS: Record<
     "openalex",
   ],
   citations: [
+    "ads",
     "semantic-scholar",
     "opencitations",
     "inspire",
@@ -111,6 +119,7 @@ export function resetCitationProviderSessionState(): void {
 }
 
 function automaticProviderIsAvailable(providerID: CitationProviderID): boolean {
+  if (providerID === "ads" && !getNASAADSAPIKey()) return false;
   const state = providerHealth.get(providerID);
   if (!state) return true;
   if (state.unavailableUntil <= Date.now()) {

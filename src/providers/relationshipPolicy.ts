@@ -42,6 +42,11 @@ const RELATIONSHIP_POLICIES: Readonly<
     metadataBatchSize: 100,
     referenceAuthorityPriority: 50,
   },
+  ads: {
+    relationshipFetchLimit: 2000,
+    metadataBatchSize: 1,
+    referenceAuthorityPriority: 95,
+  },
 };
 
 export function relationshipPolicyFor(

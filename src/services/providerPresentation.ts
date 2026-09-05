@@ -12,6 +12,7 @@ const PROVIDER_LABELS: Record<CitationDataSourceID, string> = {
   opencitations: "OpenCitations",
   inspire: "INSPIRE-HEP",
   openalex: "OpenAlex",
+  ads: "NASA ADS",
   zotero: "Zotero",
   "citation-map": "Citation Map",
   manual: "Manual",
@@ -41,6 +42,8 @@ export function externalWorkURL(
         : `https://openalex.org/${encodeURIComponent(providerWorkID)}`;
     case "inspire":
       return `https://inspirehep.net/literature/${encodeURIComponent(providerWorkID)}`;
+    case "ads":
+      return `https://ui.adsabs.harvard.edu/abs/${encodeURIComponent(providerWorkID)}/abstract`;
     case "crossref":
     case "opencitations":
       return providerWorkID.includes("/")
