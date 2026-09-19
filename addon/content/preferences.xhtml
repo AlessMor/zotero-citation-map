@@ -236,6 +236,45 @@
       >
         <html:label class="citation-map-provider-option">
           <html:input
+            id="zotero-prefpane-citationmap-provider-ads"
+            type="checkbox"
+            checked="checked"
+            data-provider-pref="providerNASAADSEnabled"
+          />
+          <html:span data-l10n-id="pref-provider-ads"></html:span>
+        </html:label>
+        <html:div class="citation-map-provider-credential-row">
+          <html:label
+            class="citation-map-provider-key-label"
+            for="zotero-prefpane-citationmap-ads-api-key"
+            data-l10n-id="pref-ads-api-key"
+          ></html:label>
+          <html:input
+            class="citation-map-provider-key-input"
+            id="zotero-prefpane-citationmap-ads-api-key"
+            type="password"
+            preference="nasaADSAPIKey"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </html:div>
+        <description
+          class="citation-map-pref-help citation-map-provider-key-help"
+        >
+          <html:span data-l10n-id="pref-ads-api-key-help"></html:span>
+          <html:span>&#160;</html:span>
+          <html:a
+            href="https://ui.adsabs.harvard.edu/user/settings/token"
+            data-l10n-id="pref-ads-create-key"
+          ></html:a>
+        </description>
+      </html:div>
+
+      <html:div
+        class="citation-map-provider-entry citation-map-provider-entry-with-key"
+      >
+        <html:label class="citation-map-provider-option">
+          <html:input
             id="zotero-prefpane-citationmap-provider-openalex"
             type="checkbox"
             checked="checked"

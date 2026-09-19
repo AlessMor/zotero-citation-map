@@ -24,6 +24,10 @@ import {
   semanticScholarWork,
 } from "../providers/semanticScholarMapper";
 import {
+  collectNASAADSRecords,
+  nasaADSWork,
+} from "../providers/nasaADSProvider";
+import {
   cachedExternalWorkMetadata,
   saveExternalWorkCacheSuccesses,
 } from "./externalWorkCacheService";
@@ -51,6 +55,11 @@ function providerRecords(
       .map(crossrefWorkMetadata)
       .filter((work): work is RelatedWorkMetadata => Boolean(work));
   }
+  if (context.provider === "ads") {
+    return collectNASAADSRecords(context.data)
+      .map(nasaADSWork)
+      .filter((work): work is RelatedWorkMetadata => Boolean(work));
+  }
   return [];
 }
 
@@ -69,7 +78,9 @@ function mergeMetadata(
 function isRelationshipResponse(url: string): boolean {
   if (/\/(?:references|citations)(?:\?|$)/i.test(url)) return true;
   const parsed = new URL(url);
-  return /^cites:/i.test(parsed.searchParams.get("filter") ?? "");
+  if (/^cites:/i.test(parsed.searchParams.get("filter") ?? "")) return true;
+  const query = parsed.searchParams.get("q") ?? "";
+  return /^(?:references|citations)\(/i.test(query);
 }
 
 const persistenceQueue = new SerializedTaskQueue();
