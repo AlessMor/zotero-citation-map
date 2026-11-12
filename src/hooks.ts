@@ -241,6 +241,17 @@ function beginTeardown(closeGraphTab = true): void {
 }
 
 async function onStartup(): Promise<void> {
+  try {
+    await initializePlugin();
+  } catch (error) {
+    addon.data.startupError =
+      error instanceof Error ? error.message : String(error);
+    Zotero.logError(error);
+    throw error;
+  }
+}
+
+async function initializePlugin(): Promise<void> {
   teardownStarted = false;
   addon.data.alive = true;
   await Promise.all([Zotero.initializationPromise, Zotero.unlockPromise]);
