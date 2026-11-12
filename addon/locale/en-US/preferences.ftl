@@ -45,10 +45,10 @@ pref-provider-openalex = OpenAlex
 pref-provider-selection-help = Provider choices apply to new requests. Existing cached values remain available until they are refreshed or the cache is cleared.
 
 pref-openalex-api-key = API key — required
-pref-openalex-api-key-help = Required to use OpenAlex. The key is stored in Zotero?s login manager and is sent to api.openalex.org.
+pref-openalex-api-key-help = Required to use OpenAlex. The key is stored in Zotero's login manager and is sent to api.openalex.org.
 pref-openalex-create-key = Create a free key in your OpenAlex account.
 pref-semantic-scholar-api-key = API key — optional
-pref-semantic-scholar-api-key-help = Optional but recommended for more reliable access. Keys are stored in Zotero?s login manager. Without a key, Semantic Scholar requests use shared public rate limits.
+pref-semantic-scholar-api-key-help = Optional but recommended for more reliable access. Keys are stored in Zotero's login manager. Without a key, Semantic Scholar requests use shared public rate limits.
 
 pref-matching-heading = Matching
 pref-title-fallback =
