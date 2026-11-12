@@ -1,3 +1,4 @@
+import { validateMetadataCollections } from "./responseValidation";
 import type { RelatedWorkMetadata } from "../domain/citationTypes";
 import { publicationYearOrNull } from "../domain/valueNormalization";
 import { normalizeDOI } from "../domain/workIdentity";
@@ -40,6 +41,7 @@ export function semanticScholarAuthors(paper: SemanticScholarPaper): string[] {
 export function semanticScholarWork(
   paper: SemanticScholarPaper,
 ): RelatedWorkMetadata | null {
+  validateMetadataCollections(paper, "semanticScholarWork");
   const providerWorkID = stringOrNull(paper.paperId);
   const title = stringOrNull(paper.title);
   if (!providerWorkID || !title) return null;

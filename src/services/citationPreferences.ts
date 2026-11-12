@@ -1,3 +1,4 @@
+import { getProviderCredential } from "./providerCredentialService";
 import { config } from "../../package.json";
 import {
   CITATION_PROVIDER_IDS,
@@ -90,13 +91,11 @@ export function isProviderEnabled(provider: CitationProviderID): boolean {
 }
 
 export function getOpenAlexAPIKey(): string {
-  return String(Zotero.Prefs.get(key("openAlexAPIKey"), true) ?? "").trim();
+  return getProviderCredential("openAlexAPIKey");
 }
 
 export function getSemanticScholarAPIKey(): string {
-  return String(
-    Zotero.Prefs.get(key("semanticScholarAPIKey"), true) ?? "",
-  ).trim();
+  return getProviderCredential("semanticScholarAPIKey");
 }
 
 export function getShowMetricTooltipsEnabled(): boolean {
@@ -159,6 +158,10 @@ export function getCacheDays(): number {
 
 export function getExactTitleFallbackEnabled(): boolean {
   return boolPref("exactTitleFallback", true);
+}
+
+export function getExternalRequestsEnabled(): boolean {
+  return boolPref("externalRequestsEnabled", false);
 }
 
 export function getDebugLoggingEnabled(): boolean {

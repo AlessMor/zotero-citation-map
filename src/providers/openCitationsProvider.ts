@@ -1,3 +1,8 @@
+import {
+  requireArray,
+  requireResponseData,
+  requireRecord,
+} from "./responseValidation";
 import type {
   ProviderLookupResult,
   RelatedWorkMetadata,
@@ -63,8 +68,19 @@ async function fetchLinks(
     `https://opencitations.net/index/coci/api/v1/${direction}/${encodeURIComponent(doi)}`,
     { signal: options?.signal },
   );
-  if (!response.ok || !Array.isArray(response.data)) return [];
-  return response.data
+  const data = requireArray(
+    requireResponseData(response, `OpenCitations ${direction} for ${doi}`),
+    "OpenCitations relationship page",
+  );
+  for (const entry of data) {
+    const record = requireRecord(entry, "OpenCitations relationship");
+    if (
+      !normalizeDOI(direction === "citations" ? record.citing : record.cited)
+    ) {
+      throw new TypeError("OpenCitations relationship has no valid DOI");
+    }
+  }
+  return data
     .slice(offset, offset + Math.min(MAX_RELATION_RESULTS, maximum))
     .map((link) => relatedFromLink(link, direction))
     .filter((work): work is RelatedWorkMetadata => Boolean(work));
@@ -135,8 +151,7 @@ export const openCitationsProvider: CitationProvider = {
       abstract: null,
       citationCount: numberOrNull(metadata.citation_count),
       citationCountProvider: "opencitations",
-      referenceCount:
-        numberOrNull(metadata.reference_count) ?? references.length,
+      referenceCount: numberOrNull(metadata.reference_count),
       referenceCountProvider: "opencitations",
       resolvedReferenceCount: references.length,
       references,

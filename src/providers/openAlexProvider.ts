@@ -1,3 +1,8 @@
+import {
+  requireArray,
+  requireResponseData,
+  requireRecord,
+} from "./responseValidation";
 import type {
   ProviderLookupResult,
   RelatedWorkMetadata,
@@ -82,7 +87,9 @@ async function fetchWorkByID(
     `/works/${encodeURIComponent(normalizedID)}`,
     {},
     options,
-  ).then((response) => (response.ok && response.data ? response.data : null));
+  ).then((response) =>
+    requireResponseData(response, `OpenAlex work ${normalizedID}`),
+  );
   if (!options?.signal) workByIDCache.set(key, request);
   return request;
 }
@@ -315,9 +322,16 @@ async function listByFilter(
       },
       options,
     );
-    if (!response.ok || !response.data) break;
-
-    const pageResults = response.data.results ?? [];
+    const data = requireResponseData(
+      response,
+      `OpenAlex relationships ${filter}`,
+    );
+    const pageResults = requireArray(
+      data.results,
+      "OpenAlex relationship page",
+    );
+    for (const entry of pageResults)
+      requireRecord(entry, "OpenAlex relationship");
     const raw = pageResults.slice(
       withinPage,
       withinPage + (requested - works.length),
@@ -560,8 +574,8 @@ export const openAlexProvider: CitationProvider = {
   },
   fetchReferencedWorks: async (id, maximum, offset = 0, options) => {
     const work = await fetchWorkByID(id, options);
-    if (!work) return [];
-    return (work.referenced_works ?? [])
+    if (!work) throw new Error(`OpenAlex reference lookup failed for ${id}`);
+    return requireArray(work.referenced_works, "OpenAlex reference IDs")
       .slice(offset, offset + Math.min(ON_DEMAND_REFERENCE_LIMIT, maximum))
       .map(shortID)
       .filter((target): target is string => Boolean(target))

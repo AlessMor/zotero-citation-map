@@ -1,3 +1,4 @@
+import { initializeProviderCredentials } from "./services/providerCredentialService";
 import { config } from "../package.json";
 import {
   closeCitationMetricsStore,
@@ -243,6 +244,7 @@ async function onStartup(): Promise<void> {
   teardownStarted = false;
   addon.data.alive = true;
   await Promise.all([Zotero.initializationPromise, Zotero.unlockPromise]);
+  await initializeProviderCredentials();
   // Restored Citation Map tabs can render during UI restoration. Initialize
   // both persistent stores before waiting for uiReady so no restored tab can
   // read from, or write to, an uninitialized external-work cache.

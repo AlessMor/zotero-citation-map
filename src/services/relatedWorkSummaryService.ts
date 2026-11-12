@@ -1,3 +1,8 @@
+import {
+  requireArray,
+  requireResponseData,
+  requireRecord,
+} from "../providers/responseValidation";
 import type {
   CitationProviderID,
   CitationProviderPreference,
@@ -520,8 +525,21 @@ export async function fetchRelatedWorkSummaryPage(
       `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(providerWorkID)}/${kind}?offset=${start}&limit=${Math.min(200, requested)}&fields=${encodeURIComponent(SEMANTIC_SCHOLAR_SUMMARY_FIELDS)}`,
       { signal: requestOptions?.signal },
     );
-    if (!response.ok || !response.data) return [];
-    return (response.data.data ?? [])
+    const data = requireResponseData(
+      response,
+      `Semantic Scholar ${kind} summaries for ${providerWorkID}`,
+    );
+    for (const entry of requireArray(
+      data.data,
+      "Semantic Scholar summary page",
+    )) {
+      requireRecord(entry, "Semantic Scholar relationship");
+      requireRecord(
+        direction === "references" ? entry.citedPaper : entry.citingPaper,
+        "Semantic Scholar related paper",
+      );
+    }
+    return requireArray(data.data, "Semantic Scholar summary page")
       .map((entry) =>
         summaryFromSemanticScholar(
           direction === "references"
@@ -548,8 +566,13 @@ export async function fetchRelatedWorkSummaryPage(
       }),
       { signal: requestOptions?.signal },
     );
-    if (!response.ok || !response.data) return [];
-    return (response.data.results ?? [])
+    const data = requireResponseData(
+      response,
+      `OpenAlex citing summaries for ${providerWorkID}`,
+    );
+    for (const entry of requireArray(data.results, "OpenAlex summary page"))
+      requireRecord(entry, "OpenAlex related paper");
+    return requireArray(data.results, "OpenAlex summary page")
       .slice(withinPage, withinPage + requested)
       .map(summaryFromOpenAlex)
       .filter((work): work is RelatedWorkMetadata => Boolean(work));
@@ -564,8 +587,11 @@ export async function fetchRelatedWorkSummaryPage(
       }),
       { signal: requestOptions?.signal },
     );
-    if (!source.ok || !source.data) return [];
-    referenceIDs = (source.data.referenced_works ?? [])
+    const data = requireResponseData(
+      source,
+      `OpenAlex reference IDs for ${providerWorkID}`,
+    );
+    referenceIDs = requireArray(data.referenced_works, "OpenAlex reference IDs")
       .map(shortOpenAlexID)
       .filter((id): id is string => Boolean(id));
     cacheOpenAlexReferenceIDs(normalizedID, referenceIDs);
@@ -585,7 +611,7 @@ export async function fetchRelatedWorkSummaryPage(
     summaries.map((_, index) => index),
     requestOptions,
   );
-  return summaries.filter((work) => Boolean(work.title));
+  return summaries;
 }
 
 export interface RelatedWorkSummaryResolutionOptions {

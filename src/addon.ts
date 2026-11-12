@@ -10,6 +10,8 @@ export interface CitationMapCacheStatus {
 }
 
 export interface CitationMapAPI {
+  providerCredentialIsConfigured(name: string): boolean;
+  saveProviderCredential(name: string, value: string): Promise<void>;
   refreshAll(): void;
   clearAllCachedData(): void;
   providerSelectionChanged(): void;
@@ -25,6 +27,8 @@ function unavailableAPI(): CitationMapAPI {
     throw new Error("Citation Map API is not initialized.");
   };
   return Object.freeze({
+    providerCredentialIsConfigured: unavailable,
+    saveProviderCredential: unavailable,
     refreshAll: unavailable,
     clearAllCachedData: unavailable,
     providerSelectionChanged: unavailable,

@@ -1,3 +1,4 @@
+import { getExternalRequestsEnabled } from "./citationPreferences";
 import type { RelatedWorkMetadata } from "../domain/citationTypes";
 import { normalizeDOI } from "../domain/workIdentity";
 import { publicationYearOrNull } from "../domain/valueNormalization";
@@ -181,7 +182,7 @@ async function requestDataCiteMetadata(
   doi: string,
   options?: ProviderRequestOptions,
 ): Promise<DataCiteMetadata | null> {
-  if (options?.signal?.cancelled) return null;
+  if (!getExternalRequestsEnabled() || options?.signal?.cancelled) return null;
   let requestCanceller: (() => void) | null = null;
   const unsubscribe = options?.signal?.subscribe(() => {
     try {
@@ -200,6 +201,7 @@ async function requestDataCiteMetadata(
           "User-Agent":
             "Zotero-Citation-Map/0.6 (metadata fallback; public API pool)",
         },
+        anon: true,
         responseType: "text",
         timeout: DATACITE_REQUEST_TIMEOUT_MS,
         successCodes: false,
@@ -209,7 +211,8 @@ async function requestDataCiteMetadata(
         },
       },
     );
-    if (options?.signal?.cancelled) return null;
+    if (!getExternalRequestsEnabled() || options?.signal?.cancelled)
+      return null;
     if (response.status < 200 || response.status >= 300) return null;
     const raw = String((response as any).responseText ?? "").trim();
     if (!raw) return null;
@@ -229,7 +232,8 @@ export function resolveDataCiteMetadata(
   options?: ProviderRequestOptions,
 ): Promise<DataCiteMetadata | null> {
   const normalized = normalizeDOI(doi);
-  if (!normalized) return Promise.resolve(null);
+  if (!normalized || !getExternalRequestsEnabled())
+    return Promise.resolve(null);
   const cached = dataCiteRequests.get(normalized);
   if (cached) return cached;
   const request = requestDataCiteMetadata(normalized, options);

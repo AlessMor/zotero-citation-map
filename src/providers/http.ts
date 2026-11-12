@@ -1,6 +1,7 @@
 import type { CitationProviderID } from "../domain/citationTypes";
 import {
   getSemanticScholarAPIKey,
+  getExternalRequestsEnabled,
   isProviderEnabled,
 } from "../services/citationPreferences";
 import { providerExecutionPolicy } from "../services/providerExecutionPolicy";
@@ -61,6 +62,13 @@ const providerQueues = new Map<CitationProviderID, ProviderQueueState>();
 // retries used to block every request queued behind one unavailable provider.
 const RETRY_DELAYS_MS = [1500];
 const REQUEST_TIMEOUT_MS = 15000;
+const PROVIDER_HOSTS: Readonly<Record<CitationProviderID, string>> = {
+  crossref: "api.crossref.org",
+  "semantic-scholar": "api.semanticscholar.org",
+  opencitations: "opencitations.net",
+  inspire: "inspirehep.net",
+  openalex: "api.openalex.org",
+};
 const MAX_RETRY_AFTER_MS = 15000;
 const activeRequestCancellers = new Set<() => void>();
 const responseObservers = new Set<ProviderJSONResponseObserver>();
@@ -312,6 +320,27 @@ export async function requestJSON<T>(
   url: string,
   options: JSONRequestOptions,
 ): Promise<HTTPResult<T>> {
+  const target = new URL(url);
+  if (
+    target.protocol !== "https:" ||
+    target.hostname !== PROVIDER_HOSTS[provider] ||
+    target.username ||
+    target.password ||
+    target.port
+  ) {
+    throw new TypeError(
+      `Unexpected request destination for provider ${provider}`,
+    );
+  }
+  if (!getExternalRequestsEnabled()) {
+    return {
+      ok: false,
+      status: 403,
+      data: null,
+      message:
+        "External requests are disabled. Enable them in Settings ? Citation Map.",
+    };
+  }
   if (!isProviderEnabled(provider)) return disabledProviderResult<T>(provider);
 
   const requestedRetryLimit = Number.isFinite(options.retryLimit)
@@ -323,6 +352,8 @@ export async function requestJSON<T>(
   );
   for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
     if (requestWasCancelled(options.signal)) return cancelledResult<T>();
+    if (!getExternalRequestsEnabled())
+      return disabledProviderResult<T>(provider);
     try {
       const response = await runInProviderQueue(
         provider,
@@ -346,7 +377,14 @@ export async function requestJSON<T>(
                 : typeof options.body === "string"
                   ? options.body
                   : JSON.stringify(options.body);
+            if (!getExternalRequestsEnabled() || !isProviderEnabled(provider)) {
+              throw new Error(
+                "External provider request disabled in Citation Map settings",
+              );
+            }
             const requestOptions: ZoteroHTTPRequestOptions = {
+              anon: true,
+              followRedirects: false,
               headers,
               body,
               responseType: "text",

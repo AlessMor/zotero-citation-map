@@ -1,3 +1,4 @@
+import { validateMetadataCollections } from "./responseValidation";
 import type {
   CitationYearCount,
   RelatedWorkMetadata,
@@ -113,6 +114,7 @@ export function openAlexSourceMetrics(
 export function openAlexWorkMetadata(
   work: OpenAlexWork,
 ): RelatedWorkMetadata | null {
+  validateMetadataCollections(work, "openAlexWorkMetadata");
   const providerWorkID = shortOpenAlexID(work.id);
   const title = stringOrNull(work.display_name ?? work.title);
   if (!providerWorkID || !title) return null;

@@ -281,6 +281,53 @@
     selectAll.addEventListener("click", () => setAllUpdateLibraries(true));
     clearAll.addEventListener("click", () => setAllUpdateLibraries(false));
 
+    for (const input of document.querySelectorAll(
+      "input[data-provider-credential]",
+    )) {
+      const name = input.getAttribute("data-provider-credential");
+      input.placeholder = api.providerCredentialIsConfigured(name)
+        ? "Saved ? enter a new key to replace, or clear to remove"
+        : "No key saved";
+      input.addEventListener("change", async () => {
+        input.disabled = true;
+        try {
+          await api.saveProviderCredential(name, input.value);
+          input.value = "";
+          input.placeholder = api.providerCredentialIsConfigured(name)
+            ? "Key saved"
+            : "No key saved";
+        } catch (error) {
+          Zotero.logError(error);
+          input.setCustomValidity(
+            "Could not save API key. Check Zotero error output and try again.",
+          );
+          input.reportValidity();
+        } finally {
+          input.disabled = false;
+        }
+      });
+      input.addEventListener("input", () => input.setCustomValidity(""));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "Remove saved key";
+      remove.addEventListener("click", async () => {
+        remove.disabled = true;
+        input.disabled = true;
+        try {
+          await api.saveProviderCredential(name, "");
+          input.value = "";
+          input.placeholder = "No key saved";
+        } catch (error) {
+          Zotero.logError(error);
+          input.setCustomValidity("Could not remove API key. Try again.");
+          input.reportValidity();
+        } finally {
+          remove.disabled = false;
+          input.disabled = false;
+        }
+      });
+      input.parentNode.appendChild(remove);
+    }
     renderProviderMode();
     renderUpdateLibraries();
     renderUpdateMode();

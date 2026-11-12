@@ -1,3 +1,8 @@
+import {
+  requireArray,
+  requireResponseData,
+  requireRecord,
+} from "./responseValidation";
 import type {
   ProviderLookupResult,
   ProviderLookupSuccess,
@@ -113,8 +118,21 @@ async function fetchRelations(
     `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(paperID)}/${kind}?offset=${Math.max(0, offset)}&limit=${Math.min(MAX_RELATION_PAGE_SIZE, maximum)}&fields=${encodeURIComponent(RELATIONSHIP_FIELDS)}`,
     { signal: options?.signal },
   );
-  if (!response.ok || !response.data) return [];
-  return (response.data.data ?? [])
+  const data = requireResponseData(
+    response,
+    `Semantic Scholar ${kind} for ${paperID}`,
+  );
+  for (const entry of requireArray(
+    data.data,
+    "Semantic Scholar relationship page",
+  )) {
+    requireRecord(entry, "Semantic Scholar relationship");
+    requireRecord(
+      kind === "references" ? entry.citedPaper : entry.citingPaper,
+      "Semantic Scholar related paper",
+    );
+  }
+  return requireArray(data.data, "Semantic Scholar relationship page")
     .map((entry) =>
       toRelated(
         kind === "references"
@@ -415,8 +433,14 @@ export async function fetchSemanticScholarRecommendations(
       signal: options?.signal,
     },
   );
-  if (!response.ok || !response.data) return [];
-  return (response.data.recommendedPapers ?? [])
+  const data = requireResponseData(
+    response,
+    "Semantic Scholar recommendations",
+  );
+  return requireArray(
+    data.recommendedPapers,
+    "Semantic Scholar recommendations",
+  )
     .map(toRelated)
     .filter((work): work is RelatedWorkMetadata => Boolean(work))
     .slice(0, limit);

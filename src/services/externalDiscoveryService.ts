@@ -1767,7 +1767,16 @@ async function runExternalRelationshipRefresh(
       `Saving ${selection.works.length} identified ${relationshipLabel}`,
     );
     const selectedMembership = await mapCooperatively(
-      selection.works,
+      selection.complete
+        ? selection.works
+        : mergeRelatedWorkLists(
+            getStoredRelationshipWorks(
+              node,
+              direction,
+              Number.POSITIVE_INFINITY,
+            ),
+            selection.works,
+          ),
       (work) => compactRelationshipWork(work as ExternalWork),
       { forceEvery: 25 },
     );
