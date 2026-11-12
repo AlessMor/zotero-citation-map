@@ -1,6 +1,7 @@
 import { config } from "../../package.json";
 
-export type ProviderCredential = "openAlexAPIKey" | "semanticScholarAPIKey";
+export type ProviderCredential =
+  "openAlexAPIKey" | "semanticScholarAPIKey" | "nasaADSAPIKey";
 
 interface CredentialLogin extends nsILoginInfo {
   init(
@@ -17,6 +18,7 @@ interface CredentialLogin extends nsILoginInfo {
 const CREDENTIAL_NAMES: readonly ProviderCredential[] = [
   "openAlexAPIKey",
   "semanticScholarAPIKey",
+  "nasaADSAPIKey",
 ];
 const CREDENTIAL_ORIGIN = "chrome://citationmap";
 const CREDENTIAL_REALM = "Citation Map provider API credentials";
@@ -34,12 +36,13 @@ function credentialName(value: string): ProviderCredential {
   return name;
 }
 
-function storedLogin(name: ProviderCredential): nsILoginInfo | null {
-  const logins = loginManager().findLogins(
-    CREDENTIAL_ORIGIN,
-    "",
-    CREDENTIAL_REALM,
-  );
+async function storedLogin(
+  name: ProviderCredential,
+): Promise<nsILoginInfo | null> {
+  const logins: nsILoginInfo[] = await loginManager().searchLoginsAsync({
+    origin: CREDENTIAL_ORIGIN,
+    httpRealm: CREDENTIAL_REALM,
+  });
   const matches = logins.filter((login) => login.username === name);
   if (matches.length > 1)
     throw new Error(`Duplicate stored credential: ${name}`);
@@ -56,7 +59,7 @@ export async function saveProviderCredential(
 ): Promise<void> {
   const validatedName = credentialName(name);
   const password = value.trim();
-  const previous = storedLogin(validatedName);
+  const previous = await storedLogin(validatedName);
   if (!password) {
     if (previous) loginManager().removeLogin(previous);
   } else {
@@ -84,7 +87,7 @@ export async function initializeProviderCredentials(): Promise<void> {
   for (const name of CREDENTIAL_NAMES) {
     const legacyKey = `${config.prefsPrefix}.${name}`;
     const legacy = String(Zotero.Prefs.get(legacyKey, true) ?? "").trim();
-    const existing = storedLogin(name);
+    const existing = await storedLogin(name);
     if (legacy && !existing) await saveProviderCredential(name, legacy);
     else credentials.set(name, existing?.password ?? "");
     if (legacy) Zotero.Prefs.clear(legacyKey, true);

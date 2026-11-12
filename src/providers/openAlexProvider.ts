@@ -1,5 +1,6 @@
 import {
   requireArray,
+  requireRelatedWorks,
   requireResponseData,
   requireRecord,
 } from "./responseValidation";
@@ -337,9 +338,7 @@ async function listByFilter(
       withinPage + (requested - works.length),
     );
     works.push(
-      ...raw
-        .map(toRelated)
-        .filter((work): work is RelatedWorkMetadata => Boolean(work)),
+      ...requireRelatedWorks(raw.map(toRelated), "OpenAlex relationships"),
     );
     currentOffset += raw.length;
 

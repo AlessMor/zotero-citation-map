@@ -22,6 +22,7 @@ const PROVIDER_PREF_NAMES: Record<CitationProviderID, string> = {
   opencitations: "providerOpenCitationsEnabled",
   inspire: "providerInspireEnabled",
   openalex: "providerOpenAlexEnabled",
+  ads: "providerNASAADSEnabled",
 };
 
 function boolPref(name: string, fallback: boolean): boolean {
@@ -69,9 +70,6 @@ export function getEnabledProviders(): CitationProviderID[] {
   );
   if (selected.length) return selected;
 
-  // Older or externally edited preferences can leave custom mode with no
-  // provider selected. Recover to the documented safe default instead of
-  // aborting startup before the preference pane can be opened.
   setBoolPref("providerAutomatic", true);
   for (const name of Object.values(PROVIDER_PREF_NAMES))
     setBoolPref(name, true);
@@ -96,6 +94,10 @@ export function getOpenAlexAPIKey(): string {
 
 export function getSemanticScholarAPIKey(): string {
   return getProviderCredential("semanticScholarAPIKey");
+}
+
+export function getNASAADSAPIKey(): string {
+  return getProviderCredential("nasaADSAPIKey");
 }
 
 export function getShowMetricTooltipsEnabled(): boolean {

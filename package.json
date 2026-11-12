@@ -11,7 +11,9 @@
     "citations",
     "references",
     "bibliometrics",
-    "citation-network"
+    "citation-network",
+    "astronomy",
+    "nasa-ads"
   ],
   "config": {
     "addonName": "Zotero Citation Map",

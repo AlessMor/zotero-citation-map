@@ -46,6 +46,7 @@ class Addon {
     config: typeof config;
     env: "development" | "production";
     initialized: boolean;
+    startupError?: string;
     locale?: { current: any };
   };
 

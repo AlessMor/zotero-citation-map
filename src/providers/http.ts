@@ -68,6 +68,7 @@ const PROVIDER_HOSTS: Readonly<Record<CitationProviderID, string>> = {
   opencitations: "opencitations.net",
   inspire: "inspirehep.net",
   openalex: "api.openalex.org",
+  ads: "api.adsabs.harvard.edu",
 };
 const MAX_RETRY_AFTER_MS = 15000;
 const activeRequestCancellers = new Set<() => void>();

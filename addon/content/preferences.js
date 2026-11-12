@@ -286,9 +286,10 @@
     )) {
       const name = input.getAttribute("data-provider-credential");
       input.placeholder = api.providerCredentialIsConfigured(name)
-        ? "Saved ? enter a new key to replace, or clear to remove"
+        ? "Saved; enter a new key to replace, or clear to remove"
         : "No key saved";
       input.addEventListener("change", async () => {
+        if (input.disabled) return;
         input.disabled = true;
         try {
           await api.saveProviderCredential(name, input.value);
@@ -311,6 +312,7 @@
       remove.type = "button";
       remove.textContent = "Remove saved key";
       remove.addEventListener("click", async () => {
+        if (input.disabled) return;
         remove.disabled = true;
         input.disabled = true;
         try {

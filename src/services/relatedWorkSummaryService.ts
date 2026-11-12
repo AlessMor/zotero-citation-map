@@ -1,5 +1,6 @@
 import {
   requireArray,
+  requireRelatedWorks,
   requireResponseData,
   requireRecord,
 } from "../providers/responseValidation";
@@ -164,6 +165,13 @@ function stringOrNull(value: unknown): string | null {
 }
 
 function numberOrNull(value: unknown): number | null {
+  if (
+    value === null ||
+    value === undefined ||
+    value === "" ||
+    typeof value === "boolean"
+  )
+    return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -539,15 +547,14 @@ export async function fetchRelatedWorkSummaryPage(
         "Semantic Scholar related paper",
       );
     }
-    return requireArray(data.data, "Semantic Scholar summary page")
-      .map((entry) =>
+    return requireRelatedWorks(
+      requireArray(data.data, "Semantic Scholar summary page").map((entry) =>
         summaryFromSemanticScholar(
-          direction === "references"
-            ? (entry.citedPaper ?? {})
-            : (entry.citingPaper ?? {}),
+          direction === "references" ? entry.citedPaper! : entry.citingPaper!,
         ),
-      )
-      .filter((work): work is RelatedWorkMetadata => Boolean(work));
+      ),
+      "Semantic Scholar summaries",
+    );
   }
 
   if (!getOpenAlexAPIKey()) return [];
@@ -572,10 +579,12 @@ export async function fetchRelatedWorkSummaryPage(
     );
     for (const entry of requireArray(data.results, "OpenAlex summary page"))
       requireRecord(entry, "OpenAlex related paper");
-    return requireArray(data.results, "OpenAlex summary page")
-      .slice(withinPage, withinPage + requested)
-      .map(summaryFromOpenAlex)
-      .filter((work): work is RelatedWorkMetadata => Boolean(work));
+    return requireRelatedWorks(
+      requireArray(data.results, "OpenAlex summary page")
+        .slice(withinPage, withinPage + requested)
+        .map(summaryFromOpenAlex),
+      "OpenAlex summaries",
+    );
   }
 
   let referenceIDs = cachedOpenAlexReferenceIDs(normalizedID);

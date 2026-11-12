@@ -13,6 +13,7 @@ declare namespace _ZoteroTypes {
       "providerOpenCitationsEnabled": boolean;
       "providerInspireEnabled": boolean;
       "providerOpenAlexEnabled": boolean;
+      "providerNASAADSEnabled": boolean;
       "externalRequestsEnabled": boolean;
       "openAlexAPIKey": string;
       "semanticScholarAPIKey": string;

@@ -42,6 +42,12 @@ const STATIC_POLICY: Record<CitationProviderID, ProviderExecutionPolicy> = {
     minimumStartDelayMs: 250,
     relationshipPageSize: 100,
   },
+  ads: {
+    batchSize: 1,
+    requestParallelism: 2,
+    minimumStartDelayMs: 250,
+    relationshipPageSize: 200,
+  },
 };
 
 /**

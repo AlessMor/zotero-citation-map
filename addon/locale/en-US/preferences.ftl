@@ -45,10 +45,10 @@ pref-provider-openalex = OpenAlex
 pref-provider-selection-help = Provider choices apply to new requests. Existing cached values remain available until they are refreshed or the cache is cleared.
 
 pref-openalex-api-key = API key — required
-pref-openalex-api-key-help = Required to use OpenAlex. The key is stored in Zotero?s login manager and is sent to api.openalex.org.
+pref-openalex-api-key-help = Required to use OpenAlex. The key is stored in Zotero's login manager and is sent to api.openalex.org.
 pref-openalex-create-key = Create a free key in your OpenAlex account.
 pref-semantic-scholar-api-key = API key — optional
-pref-semantic-scholar-api-key-help = Optional but recommended for more reliable access. Keys are stored in Zotero?s login manager. Without a key, Semantic Scholar requests use shared public rate limits.
+pref-semantic-scholar-api-key-help = Optional but recommended for more reliable access. Keys are stored in Zotero's login manager. Without a key, Semantic Scholar requests use shared public rate limits.
 
 pref-matching-heading = Matching
 pref-title-fallback =
@@ -66,3 +66,8 @@ pref-check-stale-startup-text = Check for stale entries when Zotero starts
 pref-external-requests =
     .label = Allow requests to external scholarly-data providers
 pref-external-requests-help = Requests send paper identifiers and, when title matching is enabled, titles to the selected providers and DataCite. PDFs and notes are not uploaded. This permission applies to manual and automatic requests; existing cached data remain available when it is off.
+
+pref-provider-ads = NASA ADS
+pref-ads-api-key = API token - required
+pref-ads-api-key-help = Required for NASA ADS. The token is stored in Zotero's login manager and is sent only to api.adsabs.harvard.edu. External requests must also be enabled.
+pref-ads-create-key = Open your NASA ADS token page.

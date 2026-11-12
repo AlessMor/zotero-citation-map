@@ -1,4 +1,18 @@
 import type { HTTPResult } from "./http";
+import type { RelatedWorkMetadata } from "../domain/citationTypes";
+
+export function requireRelatedWorks(
+  works: (RelatedWorkMetadata | null)[],
+  operation: string,
+): RelatedWorkMetadata[] {
+  return works.map((work) => {
+    if (!work)
+      throw new TypeError(
+        `${operation}: a relationship record has no usable identity or title`,
+      );
+    return work;
+  });
+}
 
 /** Reject failed requests before callers can mistake them for empty pages. */
 export function requireResponseData<T>(

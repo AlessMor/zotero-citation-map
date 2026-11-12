@@ -1,5 +1,6 @@
 import {
   requireArray,
+  requireRelatedWorks,
   requireResponseData,
   requireRecord,
 } from "./responseValidation";
@@ -132,15 +133,12 @@ async function fetchRelations(
       "Semantic Scholar related paper",
     );
   }
-  return requireArray(data.data, "Semantic Scholar relationship page")
-    .map((entry) =>
-      toRelated(
-        kind === "references"
-          ? (entry.citedPaper ?? {})
-          : (entry.citingPaper ?? {}),
-      ),
-    )
-    .filter((work): work is RelatedWorkMetadata => Boolean(work));
+  return requireRelatedWorks(
+    requireArray(data.data, "Semantic Scholar relationship page").map((entry) =>
+      toRelated(kind === "references" ? entry.citedPaper! : entry.citingPaper!),
+    ),
+    "Semantic Scholar relationships",
+  );
 }
 
 async function successFromPaper(
