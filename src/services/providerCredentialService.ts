@@ -3,6 +3,22 @@ import { config } from "../../package.json";
 export type ProviderCredential =
   "openAlexAPIKey" | "semanticScholarAPIKey" | "nasaADSAPIKey";
 
+interface CredentialLoginManager {
+  initializationPromise: Promise<void>;
+  searchLoginsAsync(query: {
+    origin: string;
+    httpRealm: string;
+  }): Promise<nsILoginInfo[]>;
+  addLoginAsync(login: nsILoginInfo): Promise<unknown>;
+  removeLoginAsync?: (login: nsILoginInfo) => Promise<void>;
+  modifyLoginAsync?: (
+    previous: nsILoginInfo,
+    login: nsILoginInfo,
+  ) => Promise<void>;
+  removeLogin?: (login: nsILoginInfo) => void;
+  modifyLogin?: (previous: nsILoginInfo, login: nsILoginInfo) => void;
+}
+
 interface CredentialLogin extends nsILoginInfo {
   init(
     origin: string,
@@ -24,10 +40,10 @@ const CREDENTIAL_ORIGIN = "chrome://citationmap";
 const CREDENTIAL_REALM = "Citation Map provider API credentials";
 const credentials = new Map<ProviderCredential, string>();
 
-function loginManager(): nsILoginManager {
+function loginManager(): CredentialLoginManager {
   return Components.classes["@mozilla.org/login-manager;1"].getService(
     Components.interfaces.nsILoginManager,
-  ) as nsILoginManager;
+  ) as CredentialLoginManager;
 }
 
 function credentialName(value: string): ProviderCredential {
@@ -61,7 +77,15 @@ export async function saveProviderCredential(
   const password = value.trim();
   const previous = await storedLogin(validatedName);
   if (!password) {
-    if (previous) loginManager().removeLogin(previous);
+    if (previous) {
+      const manager = loginManager();
+      if (manager.removeLoginAsync) await manager.removeLoginAsync(previous);
+      else if (manager.removeLogin) manager.removeLogin(previous);
+      else
+        throw new TypeError(
+          "Zotero login manager does not support removing credentials",
+        );
+    }
   } else {
     const login = Components.classes[
       "@mozilla.org/login-manager/loginInfo;1"
@@ -75,8 +99,16 @@ export async function saveProviderCredential(
       "",
       "",
     );
-    if (previous) loginManager().modifyLogin(previous, login);
-    else await loginManager().addLoginAsync(login);
+    if (previous) {
+      const manager = loginManager();
+      if (manager.modifyLoginAsync)
+        await manager.modifyLoginAsync(previous, login);
+      else if (manager.modifyLogin) manager.modifyLogin(previous, login);
+      else
+        throw new TypeError(
+          "Zotero login manager does not support updating credentials",
+        );
+    } else await loginManager().addLoginAsync(login);
   }
   credentials.set(validatedName, password);
 }

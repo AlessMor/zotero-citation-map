@@ -58,6 +58,7 @@ interface ProviderQueueState {
 }
 
 const providerQueues = new Map<CitationProviderID, ProviderQueueState>();
+const providerQuotaResetAt = new Map<CitationProviderID, number>();
 // One bounded retry is enough for interactive updates. Multiple 30-second
 // retries used to block every request queued behind one unavailable provider.
 const RETRY_DELAYS_MS = [1500];
@@ -238,6 +239,18 @@ function runInProviderQueue<T>(
   });
 }
 
+function rememberProviderQuota(
+  provider: CitationProviderID,
+  response: ZoteroHTTPResponse,
+): void {
+  const remaining = response.getResponseHeader?.("x-ratelimit-remaining");
+  const reset = response.getResponseHeader?.("x-ratelimit-reset");
+  if (remaining !== "0" || !reset) return;
+  const resetAt = Number(reset) * 1000;
+  if (Number.isFinite(resetAt) && resetAt > Date.now())
+    providerQuotaResetAt.set(provider, resetAt + 1000);
+}
+
 function parseRetryAfter(response: ZoteroHTTPResponse): number | null {
   try {
     const header = response.getResponseHeader?.("retry-after") ?? null;
@@ -405,11 +418,16 @@ export async function requestJSON<T>(
               }
             });
             try {
-              return await Zotero.HTTP.request(
+              const resetAt = providerQuotaResetAt.get(provider) ?? 0;
+              if (resetAt > Date.now())
+                return { status: 429, responseText: "{}" };
+              const response = await Zotero.HTTP.request(
                 options.method ?? "GET",
                 url,
                 requestOptions,
               );
+              rememberProviderQuota(provider, response);
+              return response;
             } finally {
               unsubscribe?.();
             }
