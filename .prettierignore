@@ -1,5 +1,6 @@
 node_modules/
 .scaffold/
+/Zotero_linux-*/
 build/
 dist/
 coverage/
