@@ -62,7 +62,3 @@ pref-automatic-updates-text = Automatically update citation data
 pref-update-new-items-text = Update newly added entries
 pref-update-modified-items-text = Update modified entries
 pref-check-stale-startup-text = Check for stale entries when Zotero starts
-
-pref-external-requests =
-    .label = Allow requests to external scholarly-data providers
-pref-external-requests-help = Requests send paper identifiers and, when title matching is enabled, titles to the selected providers and DataCite. PDFs and notes are not uploaded. This permission applies to manual and automatic requests; existing cached data remain available when it is off.

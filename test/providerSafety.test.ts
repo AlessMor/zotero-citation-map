@@ -20,18 +20,22 @@ describe("Provider safety", function () {
     );
   });
 
-  it("blocks external requests without permission", async function () {
+  it("retrieves public provider data without an external-request opt-in", async function () {
+    this.timeout(45000);
     const key = "extensions.zotero.citationmap.externalRequestsEnabled";
     const previous = Zotero.Prefs.get(key, true);
     Zotero.Prefs.set(key, false, true);
     try {
-      const result = await requestJSON(
+      const result = await requestJSON<{ message: { DOI: string } }>(
         "crossref",
-        "https://api.crossref.org/works/10.0000/blocked",
+        "https://api.crossref.org/works/10.1038/nphys1170",
         {},
       );
-      expect(result.ok).to.equal(false);
-      expect(result.status).to.equal(403);
+      expect(result.status, result.message).to.equal(200);
+      expect(result.ok, result.message).to.equal(true);
+      expect(result.data?.message.DOI.toLowerCase()).to.equal(
+        "10.1038/nphys1170",
+      );
     } finally {
       if (previous === undefined) Zotero.Prefs.clear(key, true);
       else Zotero.Prefs.set(key, previous, true);

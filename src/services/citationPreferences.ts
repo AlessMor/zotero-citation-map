@@ -160,10 +160,6 @@ export function getExactTitleFallbackEnabled(): boolean {
   return boolPref("exactTitleFallback", true);
 }
 
-export function getExternalRequestsEnabled(): boolean {
-  return boolPref("externalRequestsEnabled", false);
-}
-
 export function getDebugLoggingEnabled(): boolean {
   return boolPref("debugLogging", false);
 }

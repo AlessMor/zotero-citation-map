@@ -1,7 +1,6 @@
 import type { CitationProviderID } from "../domain/citationTypes";
 import {
   getSemanticScholarAPIKey,
-  getExternalRequestsEnabled,
   isProviderEnabled,
 } from "../services/citationPreferences";
 import { providerExecutionPolicy } from "../services/providerExecutionPolicy";
@@ -332,15 +331,6 @@ export async function requestJSON<T>(
       `Unexpected request destination for provider ${provider}`,
     );
   }
-  if (!getExternalRequestsEnabled()) {
-    return {
-      ok: false,
-      status: 403,
-      data: null,
-      message:
-        "External requests are disabled. Enable them in Settings ? Citation Map.",
-    };
-  }
   if (!isProviderEnabled(provider)) return disabledProviderResult<T>(provider);
 
   const requestedRetryLimit = Number.isFinite(options.retryLimit)
@@ -352,8 +342,6 @@ export async function requestJSON<T>(
   );
   for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
     if (requestWasCancelled(options.signal)) return cancelledResult<T>();
-    if (!getExternalRequestsEnabled())
-      return disabledProviderResult<T>(provider);
     try {
       const response = await runInProviderQueue(
         provider,
@@ -377,7 +365,7 @@ export async function requestJSON<T>(
                 : typeof options.body === "string"
                   ? options.body
                   : JSON.stringify(options.body);
-            if (!getExternalRequestsEnabled() || !isProviderEnabled(provider)) {
+            if (!isProviderEnabled(provider)) {
               throw new Error(
                 "External provider request disabled in Citation Map settings",
               );
