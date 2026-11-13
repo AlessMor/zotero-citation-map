@@ -248,10 +248,12 @@ export function getRelationshipViewSnapshotFromWorks(
     direction === "references"
       ? getCachedExternalReferences(node, libraryWorks, maximum, 0, options)
       : getCachedExternalCitedBy(node, libraryWorks, maximum, 0, options);
-  const sourceWorks = stored.length
-    ? stored
-    : mergeRelationshipWorks(fallbackWorks);
-  const works = mergeRelationshipWorks(sourceWorks).slice(0, maximum);
+  // Stored relationship selections are already canonical. Re-running the
+  // union/identity merge here made every pane visit pay the full matching cost
+  // for hundreds or thousands of already-deduplicated neighbours.
+  const works = stored.length
+    ? stored.slice(0, maximum)
+    : mergeRelationshipWorks(fallbackWorks).slice(0, maximum);
   const reportedCount =
     direction === "references"
       ? (record?.referenceCount ?? node.referenceCount)
@@ -427,16 +429,15 @@ export function relationshipStatusText(
   const relationship = `${snapshot.relationshipLabel}${total === 1 ? "" : "s"}`;
   const retrieved = snapshot.hasRetrievedWorks
     ? filtered
-      ? `${formatCount(shownCount)} shown of ${formatCount(total)} retrieved ${relationship}`
-      : `${formatCount(total)} retrieved ${relationship}`
+      ? `${formatCount(shownCount)} shown of ${formatCount(total)} unique ${relationship} retrieved across providers`
+      : `${formatCount(total)} unique ${relationship} retrieved across providers`
     : `${formatCount(total)} linked library ${relationship}`;
-  const provider = snapshot.reportedCountProvider
-    ? ` by ${getProviderLabel(snapshot.reportedCountProvider)}`
-    : "";
   const reported =
     snapshot.reportedCount === null
       ? ""
-      : ` · ${formatCount(snapshot.reportedCount)} reported${provider}`;
+      : snapshot.reportedCountProvider
+        ? ` · ${getProviderLabel(snapshot.reportedCountProvider)} reports ${formatCount(snapshot.reportedCount)}`
+        : ` · Reported total ${formatCount(snapshot.reportedCount)}`;
   return searching
     ? `${retrieved}${reported} · ${relationshipUpdateText(snapshot.direction)}`
     : `${retrieved}${reported}`;
