@@ -14,7 +14,6 @@ declare namespace _ZoteroTypes {
       "providerInspireEnabled": boolean;
       "providerOpenAlexEnabled": boolean;
       "providerNASAADSEnabled": boolean;
-      "externalRequestsEnabled": boolean;
       "openAlexAPIKey": string;
       "semanticScholarAPIKey": string;
       "showMetricTooltips": boolean;

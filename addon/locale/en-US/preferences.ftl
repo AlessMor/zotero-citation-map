@@ -63,11 +63,8 @@ pref-update-new-items-text = Update newly added entries
 pref-update-modified-items-text = Update modified entries
 pref-check-stale-startup-text = Check for stale entries when Zotero starts
 
-pref-external-requests =
-    .label = Allow requests to external scholarly-data providers
-pref-external-requests-help = Requests send paper identifiers and, when title matching is enabled, titles to the selected providers and DataCite. PDFs and notes are not uploaded. This permission applies to manual and automatic requests; existing cached data remain available when it is off.
 
 pref-provider-ads = NASA ADS
 pref-ads-api-key = API token - required
-pref-ads-api-key-help = Required for NASA ADS. The token is stored in Zotero's login manager and is sent only to api.adsabs.harvard.edu. External requests must also be enabled.
+pref-ads-api-key-help = Required for NASA ADS. The token is stored in Zotero's login manager and is sent only to api.adsabs.harvard.edu.
 pref-ads-create-key = Open your NASA ADS token page.

@@ -1,4 +1,3 @@
-pref("extensions.zotero.citationmap.externalRequestsEnabled", false);
 pref("extensions.zotero.citationmap.providerAutomatic", true);
 pref("extensions.zotero.citationmap.providerCrossrefEnabled", true);
 pref("extensions.zotero.citationmap.providerSemanticScholarEnabled", true);

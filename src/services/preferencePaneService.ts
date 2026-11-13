@@ -2,11 +2,6 @@ import {
   providerCredentialIsConfigured,
   saveProviderCredential,
 } from "./providerCredentialService";
-import {
-  cancelPendingCitationRequests,
-  resetCitationRequestCancellation,
-} from "../providers/http";
-import { getExternalRequestsEnabled } from "./citationPreferences";
 import { config } from "../../package.json";
 import { uniquePositiveIntegers } from "../domain/valueNormalization";
 import { clearOpenAlexProviderCache } from "../providers/openAlexProvider";
@@ -190,18 +185,6 @@ export async function registerCitationMapPreferencePane(): Promise<void> {
     image: `chrome://${config.addonRef}/content/icons/network.svg`,
   } as any);
   observerIDs.push(
-    Zotero.Prefs.registerObserver(
-      `${config.prefsPrefix}.externalRequestsEnabled`,
-      () => {
-        if (getExternalRequestsEnabled()) resetCitationRequestCancellation();
-        else {
-          cancelActiveCitationUpdate();
-          cancelPendingCitationRequests();
-        }
-        refreshProviderConfiguration();
-      },
-      true,
-    ),
     Zotero.Prefs.registerObserver(
       `${config.prefsPrefix}.showMetricTooltips`,
       syncMetricTooltipPreference,
