@@ -19,22 +19,6 @@ interface CredentialLoginManager {
   modifyLogin?: (previous: nsILoginInfo, login: nsILoginInfo) => void;
 }
 
-interface CredentialLoginManager {
-  initializationPromise: Promise<void>;
-  searchLoginsAsync(query: {
-    origin: string;
-    httpRealm: string;
-  }): Promise<nsILoginInfo[]>;
-  addLoginAsync(login: nsILoginInfo): Promise<unknown>;
-  removeLoginAsync?: (login: nsILoginInfo) => Promise<void>;
-  modifyLoginAsync?: (
-    previous: nsILoginInfo,
-    login: nsILoginInfo,
-  ) => Promise<void>;
-  removeLogin?: (login: nsILoginInfo) => void;
-  modifyLogin?: (previous: nsILoginInfo, login: nsILoginInfo) => void;
-}
-
 interface CredentialLogin extends nsILoginInfo {
   init(
     origin: string,
