@@ -13,8 +13,8 @@ const identifiers: WorkIdentifiers = {
   pmid: null,
   arxiv: "2401.12345v2",
   isbn: null,
-  title: "A test paper",
-  normalizedTitle: "a test paper",
+  title: "A distinctive astronomy paper for matching",
+  normalizedTitle: "a distinctive astronomy paper for matching",
   year: 2024,
   authors: ["Smith, Alice"],
   sourceTitle: null,
@@ -22,7 +22,7 @@ const identifiers: WorkIdentifiers = {
 
 const record: NASAADSRecord = {
   bibcode: "2024ApJ...900....1S",
-  title: ["A test paper"],
+  title: ["A distinctive astronomy paper for matching"],
   doi: ["10.1000/wanted"],
   identifier: ["arXiv:2401.12345"],
   author: ["Smith, Alice"],
