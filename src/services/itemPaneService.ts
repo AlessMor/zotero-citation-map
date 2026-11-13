@@ -1309,7 +1309,10 @@ async function renderRelations(
       const renderPage = (): void => {
         if (!list.isConnected) return;
         clear(list);
-        const pageCount = Math.max(1, Math.ceil(ordered.length / RELATION_PAGE_SIZE));
+        const pageCount = Math.max(
+          1,
+          Math.ceil(ordered.length / RELATION_PAGE_SIZE),
+        );
         page = Math.max(0, Math.min(page, pageCount - 1));
         const start = page * RELATION_PAGE_SIZE;
         const end = Math.min(ordered.length, start + RELATION_PAGE_SIZE);
